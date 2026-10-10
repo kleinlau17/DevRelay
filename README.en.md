@@ -121,6 +121,8 @@ Acceptance commands are trusted project code. A zero exit code does not establis
 
 ## Develop
 
+This repository's `.devrelay/config.toml` enables self-maintenance: approved GitHub Issues are implemented in isolated worktrees, verified with the full test suite, submitted as draft PRs, and reviewed in fresh read-only AI sessions. Automatic merge is disabled; run `devrelay merge ID` after merging to perform post-merge acceptance and cleanup.
+
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 git diff --check

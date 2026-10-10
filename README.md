@@ -135,6 +135,8 @@ devrelay submit fix-1 --local
 
 ## 开发与验证
 
+本仓库的 `.devrelay/config.toml` 已配置自维护：经授权的 GitHub Issues 在独立工作树中实现，运行完整测试并创建 draft PR，再进行独立只读 AI 审查。自动合并关闭；合并后的验收与清理可通过 `devrelay merge ID` 执行。
+
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 git diff --check

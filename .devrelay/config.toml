@@ -1,0 +1,46 @@
+# Self-maintenance: implement approved Issues, verify, open draft PRs and review.
+[project]
+provider = "github"
+base_branch = "main"
+remote = "origin"
+branch_prefix = "devrelay/task-"
+repository = "kleinlau17/DevRelay"
+
+[queue]
+approval_label = "auto:approved"
+priorities = ["priority:P0", "priority:P1", "priority:P2"]
+blockers = ["blocked", "needs-input"]
+
+[codex]
+executable = "codex"
+sandbox = "workspace-write"
+timeout_seconds = 1800
+max_attempts = 2
+
+[delivery]
+auto_review = true
+auto_merge = false
+required_checks = []
+allow_no_ci = false
+cleanup_branches = true
+cleanup_worktrees = true
+
+[[setup]]
+id = "venv"
+argv = ["python3", "-m", "venv", ".venv"]
+timeout_seconds = 600
+
+[[setup]]
+id = "install-python"
+argv = [".venv/bin/python", "-m", "pip", "install", "-e", "."]
+timeout_seconds = 600
+
+[[checks]]
+id = "test"
+argv = [".venv/bin/python", "-m", "unittest", "discover", "-s", "tests", "-v"]
+timeout_seconds = 600
+
+[[checks]]
+id = "diff-check"
+argv = ["git", "diff", "--check"]
+timeout_seconds = 60
