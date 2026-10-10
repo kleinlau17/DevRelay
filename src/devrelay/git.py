@@ -9,9 +9,9 @@ import tempfile
 from .errors import RelayError
 
 
-def command(argv, cwd, *, input=None, env=None, timeout=60):
+def command(argv, cwd, *, input=None, env=None, timeout=60, text=True):
     try:
-        result = subprocess.run(argv, cwd=cwd, input=input, env=env, text=True,
+        result = subprocess.run(argv, cwd=cwd, input=input, env=env, text=text,
                                 capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RelayError(f"Cannot run {argv[0]}: {error}") from error
@@ -92,9 +92,20 @@ def _submodule_content_matches_head(root):
             continue
         metadata, _, path = entry.partition("\t")
         mode, _, object_id = metadata.split()
+        target = root / path
+        if mode == "120000":
+            if not target.is_symlink():
+                return False
+            try:
+                link_target = os.readlink(os.fsencode(target))
+            except OSError as error:
+                raise RelayError(f"Cannot read submodule symlink {path}: {error}") from error
+            if git(root, "hash-object", "--no-filters", "--stdin", input=link_target,
+                   text=False) != object_id.encode("ascii"):
+                return False
+            continue
         if mode not in ("100644", "100755"):
             continue
-        target = root / path
         if target.is_symlink() or not target.is_file():
             return False
         if git(root, "hash-object", "--no-filters", "--", path) != object_id:

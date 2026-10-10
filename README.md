@@ -155,6 +155,7 @@ devrelay submit fix-1 --local
 - 对已检出的子模块递归检查已跟踪修改和未忽略的新文件；隔离索引比较会忽略 `assume-unchanged`、`skip-worktree` 与 `core.fileMode=false` 等掩码，并覆盖 `submodule.*.ignore`、`.gitmodules` ignore 和隐藏未跟踪文件的状态配置。任一子模块不干净都会使验收、提交及自动审查/合并门禁失败，且 DevRelay 不会提交、清理、重置或更新子模块。
 - 子模块未跟踪文件检测只应用 `.gitignore`，不会读取本地 `info/exclude` 或 `core.excludesFile`。已暂存内容使用只读索引比较，生成源码证据时不重建真实子模块索引的缓存树，也禁用可选的索引刷新写入。
 - 子模块已跟踪的普通文件还会绕过 attributes 和 clean filters，将原始字节与 HEAD blob 比较，防止本地转换隐藏未交付内容。支持边界是工作树字节必须与提交一致；依赖换行规范化、编码转换或 smudge filters 才能匹配提交的子模块会阻止验收。
+- 子模块已提交的符号链接必须保留符号链接类型，且 `readlink` 原始目标字节必须与 HEAD blob 一致。`core.symlinks=false` 将链接检出或替换成普通文件时会阻止验收；需要在支持符号链接的工作树中验证。
 - 干净且已提交的子模块 HEAD 变更通过父仓库 gitlink 纳入源码树并可正常交付；提交时会显式暂存已检出的 gitlink，不受子模块 ignore 配置影响。未初始化的子模块路径必须不存在或为空，残留文件会阻止验收；若验收命令需要子模块内容，应由项目的 `[[setup]]` 显式初始化。
 - 检查过程中改变代码、HEAD、base、配置或任务要求，或提交时证据已过期，均拒绝提交。目标 base 前进后，先将其集成到任务分支，再运行检查；DevRelay 不自动解决冲突或重置工作。
 - 验证结果、命令日志、执行时间和 Codex JSON 事件保存在 Git common directory 下的 `devrelay/`，跨工作树共享 SQLite 状态和单 worker 锁。每次使用新的记录目录。

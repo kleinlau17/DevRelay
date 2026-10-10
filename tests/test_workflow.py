@@ -285,6 +285,62 @@ class SubmoduleWorkflowTests(RepositoryTest):
     def test_skip_worktree_cannot_hide_tracked_submodule_content(self):
         self._assert_index_mask_cannot_hide_tracked_submodule_change("--skip-worktree")
 
+    def _prepare_symlink_dependency(self, checks=None, *, link_target="dependency.txt"):
+        (self.dependency_source / "link.txt").symlink_to(link_target)
+        self.git("-c", "core.symlinks=true", "add", "link.txt", cwd=self.dependency_source)
+        self.git("commit", "-qm", "add dependency symlink", cwd=self.dependency_source)
+        worktree, dependency = self._prepare(checks)
+        self.git("config", "core.symlinks", "false", cwd=dependency)
+        self.assertTrue((dependency / "link.txt").is_symlink())
+        return worktree, dependency
+
+    def test_core_symlinks_false_cannot_hide_replacement_between_source_snapshots(self):
+        worktree, dependency = self._prepare_symlink_dependency()
+        source_tree(worktree)
+        link = dependency / "link.txt"
+        link.unlink()
+        link.write_text("dependency.txt")
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), "dependency.txt")
+
+    def test_core_symlinks_false_cannot_hide_replacement_before_verification(self):
+        _, dependency = self._prepare_symlink_dependency([[sys.executable, "-c",
+            "from pathlib import Path; assert Path('vendor/dependency/link.txt').read_text() == 'dependency.txt'"]])
+        link = dependency / "link.txt"
+        link.unlink()
+        link.write_text("dependency.txt")
+        index = self._git_metadata_path(dependency, "index")
+        original = index.read_bytes()
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual(index.read_bytes(), original)
+        self.assertEqual(link.read_text(), "dependency.txt")
+
+    def test_core_symlinks_false_cannot_hide_replacement_after_verification(self):
+        _, dependency = self._prepare_symlink_dependency([[sys.executable, "-c",
+            "from pathlib import Path; assert Path('vendor/dependency/link.txt').read_text() == 'broken\\n'"]])
+        with self.state.lock():
+            verify(self.config, self.state, "fix-1")
+        link = dependency / "link.txt"
+        link.unlink()
+        link.write_text("dependency.txt")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            submit(self.config, self.state, "fix-1", local=True)
+        self.assertEqual(link.read_text(), "dependency.txt")
+
+    def test_submodule_symlink_targets_are_compared_as_raw_bytes(self):
+        original_target = b"missing-\xff \n"
+        worktree, dependency = self._prepare_symlink_dependency(link_target=os.fsdecode(original_target))
+        source_tree(worktree)
+        link = dependency / "link.txt"
+        link.unlink()
+        link.symlink_to(os.fsdecode(original_target.rstrip()))
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+        self.assertEqual(os.readlink(os.fsencode(link)), original_target.rstrip())
+
     def _install_masking_clean_filter(self, dependency, *, info_attributes=False):
         if info_attributes:
             attributes = Path(self.git("rev-parse", "--git-path", "info/attributes", cwd=dependency))

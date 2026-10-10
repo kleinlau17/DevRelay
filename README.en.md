@@ -145,6 +145,8 @@ Untracked submodule files are detected using only `.gitignore` rules, without lo
 
 Tracked regular files in submodules also have their raw bytes compared against HEAD blobs, bypassing attributes and clean filters so local transformations cannot hide undelivered content. Submodule worktree bytes must match the commit; checkouts that require line-ending normalization, encoding conversion or smudge filters to match committed blobs block acceptance.
 
+Committed symlinks in submodules must remain symlinks, and their raw `readlink` target bytes must match HEAD blobs. Acceptance blocks when `core.symlinks=false` materializes a link as a regular file or hides such a replacement; verify in a worktree that supports symlinks.
+
 Clean committed submodule HEAD changes are included in the source tree through the parent gitlink and can be delivered normally; submission explicitly stages checked-out gitlinks independently of submodule ignore configuration. An uninitialized submodule path must be absent or empty; residual files block acceptance. Projects whose checks need submodule contents should initialize them explicitly in `[[setup]]`. Source/history/base/configuration/requirements drift invalidates evidence. Integrate a newer base manually and rerun checks; existing work is never reset automatically.
 
 SQLite state, a repository-wide worker lock, command logs, resource receipts, verification and Codex JSON events live under `devrelay/` in the Git common directory. Every attempt gets a new directory. `devrelay resume ID` uses that task's exact session ID, never `--last`. Timeouts terminate process groups; surviving descendants prevent another worker from starting until they finish.
