@@ -13,7 +13,7 @@ blockers = ["blocked", "needs-input"]
 
 [codex]
 executable = "codex"
-model = "gpt-5.6-sol"
+model = "gpt-6.1-sol"
 sandbox = "workspace-write"
 timeout_seconds = 1800
 max_attempts = 2

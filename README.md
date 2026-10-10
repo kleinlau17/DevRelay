@@ -161,6 +161,8 @@ devrelay submit fix-1 --local
 
 本仓库的 `.devrelay/config.toml` 已配置自维护：经授权的 GitHub Issues 在独立工作树中实现，运行完整测试并创建 draft PR，再进行独立只读 AI 审查。自动合并关闭；合并后的验收与清理可通过 `devrelay merge ID` 执行。
 
+自维护执行器固定使用 `gpt-6.1-sol`，已用 Codex CLI `0.162.1` 验证。若旧 CLI 拒绝此模型，先升级 CLI；修改模型配置后，已有任务需要重新验收与审查。
+
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 git diff --check
