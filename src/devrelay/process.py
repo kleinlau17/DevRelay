@@ -11,6 +11,11 @@ from .errors import RelayError
 from .state import group_alive, now
 
 
+_TERMINATE_GRACE_SECONDS = 3
+_KILL_GRACE_SECONDS = 3
+_GROUP_POLL_SECONDS = 0.05
+
+
 def execute(state, argv, cwd, log, timeout, *, input=None, env=None):
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -48,14 +53,26 @@ def execute(state, argv, cwd, log, timeout, *, input=None, env=None):
 
 
 def terminate(process):
-    for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 3)):
+    for sig, wait in ((signal.SIGTERM, _TERMINATE_GRACE_SECONDS),
+                      (signal.SIGKILL, _KILL_GRACE_SECONDS)):
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
             pass
-        try:
-            process.communicate(timeout=wait)
+        if _wait_for_group(process, wait):
             return
-        except subprocess.TimeoutExpired:
-            continue
     raise RelayError(f"Cannot stop process group {process.pid}; recovery will remain blocked")
+
+
+def _wait_for_group(process, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        # Reap the direct child when possible, but completion is determined by
+        # every non-zombie member of the controlled process group.
+        process.poll()
+        if not group_alive(process.pid):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_GROUP_POLL_SECONDS, remaining))
