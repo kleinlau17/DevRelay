@@ -285,6 +285,64 @@ class SubmoduleWorkflowTests(RepositoryTest):
     def test_skip_worktree_cannot_hide_tracked_submodule_content(self):
         self._assert_index_mask_cannot_hide_tracked_submodule_change("--skip-worktree")
 
+    def _install_masking_clean_filter(self, dependency, *, info_attributes=False):
+        if info_attributes:
+            attributes = Path(self.git("rev-parse", "--git-path", "info/attributes", cwd=dependency))
+            if not attributes.is_absolute():
+                attributes = dependency / attributes
+            attributes.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            attributes = Path(self.temporary.name) / "local-attributes"
+            self.git("config", "core.attributesFile", str(attributes), cwd=dependency)
+        attributes.write_text("dependency.txt filter=mask\n")
+        self.git("config", "filter.mask.clean", "printf 'broken\\n'", cwd=dependency)
+        self.git("config", "filter.mask.required", "true", cwd=dependency)
+
+    def test_local_attributes_clean_filter_cannot_hide_source_during_verification(self):
+        _, dependency = self._prepare([[sys.executable, "-c",
+            "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').read_text() == 'fixed\\n'"]])
+        self._install_masking_clean_filter(dependency)
+        (dependency / "dependency.txt").write_text("fixed\n")
+        self.assertEqual(self.git("hash-object", "--path=dependency.txt", "dependency.txt", cwd=dependency),
+                         self.git("rev-parse", "HEAD:dependency.txt", cwd=dependency))
+        index = Path(self.git("rev-parse", "--git-path", "index", cwd=dependency))
+        if not index.is_absolute():
+            index = dependency / index
+        original_index = index.read_bytes()
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual(index.read_bytes(), original_index)
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+
+    def test_local_attributes_clean_filter_after_verification_blocks_submission(self):
+        _, dependency = self._prepare()
+        with self.state.lock():
+            verify(self.config, self.state, "fix-1")
+        self._install_masking_clean_filter(dependency)
+        (dependency / "dependency.txt").write_text("fixed\n")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            submit(self.config, self.state, "fix-1", local=True)
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+
+    def test_info_attributes_clean_filter_cannot_hide_changes_between_source_snapshots(self):
+        worktree, dependency = self._prepare()
+        self._install_masking_clean_filter(dependency, info_attributes=True)
+        source_tree(worktree)
+        (dependency / "dependency.txt").write_text("fixed\n")
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+
+    def test_line_ending_conversion_cannot_hide_submodule_content(self):
+        worktree, dependency = self._prepare()
+        self.git("config", "core.autocrlf", "true", cwd=dependency)
+        (dependency / "dependency.txt").write_bytes(b"broken\r\n")
+        self.assertEqual(self.git("hash-object", "--path=dependency.txt", "dependency.txt", cwd=dependency),
+                         self.git("rev-parse", "HEAD:dependency.txt", cwd=dependency))
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+        self.assertEqual((dependency / "dependency.txt").read_bytes(), b"broken\r\n")
+
     def test_filemode_configuration_cannot_hide_submodule_mode_change(self):
         checks = [[sys.executable, "-c",
                    "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').stat().st_mode & 0o111"]]

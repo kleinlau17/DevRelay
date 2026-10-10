@@ -86,6 +86,22 @@ def _submodule_heads(root, paths):
     return heads
 
 
+def _submodule_content_matches_head(root):
+    for entry in git(root, "ls-tree", "-r", "-z", "HEAD").split("\0"):
+        if not entry:
+            continue
+        metadata, _, path = entry.partition("\t")
+        mode, _, object_id = metadata.split()
+        if mode not in ("100644", "100755"):
+            continue
+        target = root / path
+        if target.is_symlink() or not target.is_file():
+            return False
+        if git(root, "hash-object", "--no-filters", "--", path) != object_id:
+            return False
+    return True
+
+
 def _submodule_snapshot(root, paths, prefix=Path(), seen=None):
     heads, dirty = {}, []
     seen = set() if seen is None else seen
@@ -101,7 +117,8 @@ def _submodule_snapshot(root, paths, prefix=Path(), seen=None):
         seen.add(checkout)
         heads[display] = git(checkout, "rev-parse", "HEAD")
         head_tree = git(checkout, "rev-parse", "HEAD^{tree}")
-        if (git(checkout, "write-tree") != head_tree
+        if (not _submodule_content_matches_head(checkout)
+                or git(checkout, "write-tree") != head_tree
                 or _isolated_source_tree(checkout, inspect_submodules=False,
                                          neutralize_config=True) != head_tree):
             dirty.append(display)
