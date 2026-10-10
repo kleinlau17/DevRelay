@@ -14,7 +14,7 @@ from devrelay.config import load
 from devrelay.delivery import post_merge
 from devrelay.errors import RelayError
 from devrelay.git import _gitlink_paths, _isolated_source_tree, source_tree
-from devrelay.process import execute
+from devrelay.process import execute, terminate
 from devrelay.providers import add_local, queue_report, snapshot
 from devrelay.runner import complete_local, run_task, start, submit, verify
 from devrelay.state import State
@@ -1192,6 +1192,145 @@ os._exit(0)
             process.wait(timeout=5)
         with self.state.lock():
             self.assertIsNone(self.state.metadata("active_process"))
+
+    def test_execute_after_termination_failure_preserves_live_group_marker(self):
+        log = self.state.directory / "termination-failure.log"
+        retry_log = self.state.directory / "blocked-retry.log"
+        retry_output = Path(self.temporary.name) / "retry-started"
+        process = None
+
+        def fail_termination(command):
+            nonlocal process
+            process = command
+            raise RelayError("Cannot stop process group; recovery will remain blocked")
+
+        try:
+            # Stay inside the same lock, as runner's automatic retry does.
+            with self.state.lock():
+                with (patch("devrelay.process.terminate", side_effect=fail_termination),
+                      self.assertRaisesRegex(RelayError, "Cannot stop process group")):
+                    execute(self.state, [sys.executable, "-c", "import time; time.sleep(30)"],
+                            self.root, log, 0.1)
+                active = self.state.metadata("active_process")
+                self.assertEqual(active["group"], process.pid)
+                with self.assertRaisesRegex(RelayError, "Previous command still runs"):
+                    execute(self.state,
+                            [sys.executable, "-c",
+                             "from pathlib import Path; import sys; Path(sys.argv[1]).touch()", str(retry_output)],
+                            self.root, retry_log, 5)
+                self.assertEqual(self.state.metadata("active_process"), active)
+                self.assertFalse(retry_log.exists())
+                self.assertFalse(retry_output.exists())
+                process.kill()
+                process.wait(timeout=5)
+                # A retry becomes safe once the original group is confirmed gone.
+                execute(self.state, [sys.executable, "-c", "print('recovered')"],
+                        self.root, retry_log, 5)
+                self.assertIsNone(self.state.metadata("active_process"))
+        finally:
+            if process is not None:
+                process.kill()
+                process.wait(timeout=5)
+
+
+    def test_timeout_kills_descendant_that_ignores_sigterm(self):
+        log = self.state.directory / "stubborn-descendant.log"
+        marker = Path(self.temporary.name) / "stubborn-descendant"
+        child = ("import signal,time; "
+                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                 "print('ready', flush=True); time.sleep(30)")
+        parent = ("import os,subprocess,sys,time; "
+                  "child=subprocess.Popen([sys.executable, '-c', sys.argv[2]], "
+                  "stdout=subprocess.PIPE, text=True); "
+                  "assert child.stdout.readline() == 'ready\\n'; "
+                  "marker=open(sys.argv[1], 'w'); "
+                  "marker.write(f'{os.getpgrp()} {child.pid}'); marker.close(); "
+                  "time.sleep(30)")
+        group = None
+        try:
+            with (patch("devrelay.process._TERMINATE_GRACE_SECONDS", 1),
+                  patch("devrelay.process._KILL_GRACE_SECONDS", 2)):
+                with self.state.lock(), self.assertRaisesRegex(RelayError, "timed out"):
+                    execute(self.state, [sys.executable, "-c", parent, str(marker), child],
+                            self.root, log, 1)
+            group, child_pid = (int(value) for value in marker.read_text().split())
+            self.assertNotEqual(group, child_pid)
+            self.assertFalse(group_alive(group))
+            receipt = json.loads(log.with_suffix(".log.receipt.json").read_text())
+            self.assertTrue(receipt["timed_out"])
+            self.assertEqual(receipt["returncode"], -signal.SIGTERM)
+            self.assertIsNone(self.state.metadata("active_process"))
+            with self.state.lock():
+                self.assertIsNone(self.state.metadata("active_process"))
+        finally:
+            if group is None and marker.exists():
+                try:
+                    group = int(marker.read_text().split()[0])
+                except (OSError, ValueError, IndexError):
+                    pass
+            if group is None:
+                active = self.state.metadata("active_process")
+                if active:
+                    group = active["group"]
+            if group is not None:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 5
+                try:
+                    while group_alive(group) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                except (OSError, RelayError):
+                    # SIGKILL above is the cleanup guarantee; an environment
+                    # that forbids ps cannot confirm it here.
+                    pass
+
+
+    def test_hung_process_group_probe_is_bounded_and_keeps_recovery_marker(self):
+        fake_bin = Path(self.temporary.name) / "fake-bin"
+        fake_bin.mkdir()
+        fake_ps = fake_bin / "ps"
+        fake_ps.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+        fake_ps.chmod(0o755)
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                   start_new_session=True)
+        self.state.set_metadata("active_process", {"group": process.pid})
+        try:
+            with (patch.dict(os.environ, {"PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]}),
+                  patch("devrelay.process._TERMINATE_GRACE_SECONDS", 0.2),
+                  patch("devrelay.process._KILL_GRACE_SECONDS", 0.2),
+                  patch("devrelay.state._GROUP_PROBE_TIMEOUT_SECONDS", 0.2),
+                  patch("devrelay.process.os.killpg") as kill_group):
+                started = time.monotonic()
+                with self.assertRaisesRegex(RelayError, "inspection timed out"):
+                    terminate(process)
+                self.assertLess(time.monotonic() - started, 1)
+                self.assertEqual(kill_group.call_args_list,
+                                 [call(process.pid, signal.SIGTERM), call(process.pid, signal.SIGKILL)])
+                recovery_started = time.monotonic()
+                with self.assertRaisesRegex(RelayError, "inspection timed out"):
+                    with self.state.lock():
+                        self.fail("an uninspectable group must keep recovery blocked")
+                self.assertLess(time.monotonic() - recovery_started, 1)
+                self.assertEqual(self.state.metadata("active_process")["group"], process.pid)
+                active = self.state.metadata("active_process")
+                retry_log = self.state.directory / "uninspectable-retry.log"
+                retry_output = Path(self.temporary.name) / "uninspectable-retry-started"
+                retry_started = time.monotonic()
+                with self.assertRaisesRegex(RelayError, "inspection timed out"):
+                    execute(self.state,
+                            [sys.executable, "-c",
+                             "from pathlib import Path; import sys; Path(sys.argv[1]).touch()", str(retry_output)],
+                            self.root, retry_log, 5)
+                self.assertLess(time.monotonic() - retry_started, 1)
+                self.assertEqual(self.state.metadata("active_process"), active)
+                self.assertFalse(retry_log.exists())
+                self.assertFalse(retry_output.exists())
+        finally:
+            process.kill()
+            process.wait(timeout=5)
+
 
 
 if __name__ == "__main__":

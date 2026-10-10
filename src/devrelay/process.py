@@ -12,6 +12,11 @@ from .errors import RelayError
 from .state import group_alive, now
 
 
+_TERMINATE_GRACE_SECONDS = 3
+_KILL_GRACE_SECONDS = 3
+_GROUP_POLL_SECONDS = 0.05
+
+
 def _read_output(reader, pending, on_output_line, *, final=False):
     pending += reader.read()
     # JSONL uses LF, not the Unicode separators recognized by str.splitlines().
@@ -66,19 +71,30 @@ def _stream_output(process, log, timeout, started, input, on_output_line):
 
 
 def execute(state, argv, cwd, log, timeout, *, input=None, env=None, on_output_line=None):
+    # Retries can execute under the same worker lock after termination fails.
+    # Do not replace the previous group's recovery marker until it is gone.
+    active = state.metadata("active_process")
+    if active:
+        if group_alive(active["group"]):
+            raise RelayError(f"Previous command still runs in process group {active['group']}; wait for it to finish")
+        state.set_metadata("active_process", None)
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     process = None
     timed_out = False
     stderr_log = log.with_suffix(log.suffix + ".stderr.log") if on_output_line is not None else None
+    termination_failed = False
     with log.open("x") as stream:
         diagnostics = stderr_log.open("x") if stderr_log is not None else None
         try:
-            process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                                       stdout=stream, stderr=diagnostics or subprocess.STDOUT,
-                                       text=on_output_line is None, env=env,
-                                       start_new_session=True)
+            try:
+                process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                                           stdout=stream, stderr=diagnostics or subprocess.STDOUT,
+                                           text=on_output_line is None, env=env,
+                                           start_new_session=True)
+            except OSError as error:
+                raise RelayError(f"Cannot start {argv[0]}: {error}") from error
             state.set_metadata("active_process", {"group": process.pid, "argv": argv, "started_at": now()})
             try:
                 if on_output_line is None:
@@ -86,21 +102,27 @@ def execute(state, argv, cwd, log, timeout, *, input=None, env=None, on_output_l
                 else:
                     timed_out = _stream_output(process, log, timeout, started, input, on_output_line)
                     if timed_out:
-                        terminate(process)
+                        raise subprocess.TimeoutExpired(argv, timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                terminate(process)
+                try:
+                    terminate(process)
+                except BaseException:
+                    termination_failed = True
+                    raise
             except BaseException:
-                terminate(process)
+                try:
+                    terminate(process)
+                except BaseException:
+                    termination_failed = True
+                    raise
                 raise
-        except OSError as error:
-            raise RelayError(f"Cannot start {argv[0]}: {error}") from error
         finally:
             if diagnostics is not None:
                 diagnostics.close()
             if process is not None and process.stdin is not None:
                 _close_stdin(process)
-            if process is not None and process.poll() is not None:
+            if not termination_failed and process is not None and process.poll() is not None:
                 if group_alive(process.pid):
                     # Keep evidence of detached foreground descendants; don't claim a clean finish.
                     raise RelayError(f"Command left live descendants in process group {process.pid}")
@@ -116,14 +138,42 @@ def execute(state, argv, cwd, log, timeout, *, input=None, env=None, on_output_l
 
 
 def terminate(process):
-    for sig, wait in ((signal.SIGTERM, 3), (signal.SIGKILL, 3)):
+    inspection_error = None
+    for sig, wait in ((signal.SIGTERM, _TERMINATE_GRACE_SECONDS),
+                      (signal.SIGKILL, _KILL_GRACE_SECONDS)):
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
             pass
+        except OSError as error:
+            raise RelayError(f"Cannot signal process group {process.pid} with {sig.name}: {error}; "
+                             "recovery will remain blocked") from error
         try:
-            process.communicate(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+            if _wait_for_group(process, wait):
+                return
+            inspection_error = None
+        except RelayError as error:
+            # An unknown state is treated as alive so SIGTERM inspection
+            # failure still escalates to SIGKILL.
+            inspection_error = error
+    if inspection_error is not None:
+        raise RelayError(f"Cannot confirm process group {process.pid} stopped: {inspection_error}; "
+                         "recovery will remain blocked") from inspection_error
     raise RelayError(f"Cannot stop process group {process.pid}; recovery will remain blocked")
+
+
+def _wait_for_group(process, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        # Reap the direct child when possible, but completion is determined by
+        # every non-zombie member of the controlled process group.
+        process.poll()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if not group_alive(process.pid, timeout=remaining):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_GROUP_POLL_SECONDS, remaining))
