@@ -258,7 +258,7 @@ def submit(config, state, identifier, *, local=False):
     authorized(config, state, identifier)
     if base_commit(config) != record["base_sha"]:
         raise RelayError("Base changed before push; integrate it and rerun verification")
-    push_url = validate_remote(config)
+    push_url = validate_remote(config, path)
     ref = "refs/heads/" + task["branch"]
     # Push the exact validated endpoint. A remote name could fan out to a
     # second pushurl added after validation.

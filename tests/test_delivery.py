@@ -133,6 +133,30 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
             )
             self.assertNotIn(branch, refs)
 
+    def test_worktree_conditional_rewrite_is_rejected_before_real_push(self):
+        task = self.implement()
+        extra = Path(self.temporary.name) / "conditional-extra.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(extra)], check=True)
+        included = Path(self.temporary.name) / "task-transport.gitconfig"
+        self.git("config", "--file", str(included), f"url.{extra}.insteadOf", str(self.remote))
+        self.git("config", "includeIf.onbranch:devrelay/task-*.path", str(included))
+        self.assertEqual(self.git("ls-remote", "--get-url", str(self.remote)), str(self.remote))
+        self.assertEqual(self.git("ls-remote", "--get-url", str(self.remote), cwd=task["worktree"]),
+                         str(extra))
+
+        def validate_transport(config, root=None):
+            return str(self.remote) if root is None else real_validate_remote(config, root)
+
+        with (patch("devrelay.runner.validate_remote", side_effect=validate_transport),
+              self.state.lock(), self.assertRaisesRegex(RelayError, "URL rewrite")):
+            submit(self.config, self.state, "12")
+        branch = "refs/heads/devrelay/task-12"
+        for remote in (self.remote, extra):
+            refs = subprocess.check_output(
+                ["git", "--git-dir", str(remote), "for-each-ref", "--format=%(refname)"], text=True
+            )
+            self.assertNotIn(branch, refs)
+
 
 if __name__ == "__main__":
     unittest.main()

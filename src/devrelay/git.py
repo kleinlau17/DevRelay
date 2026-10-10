@@ -75,24 +75,29 @@ def _config_values(root, key):
     return result.stdout.splitlines()
 
 
-def validate_remote(config):
+def validate_remote(config, root=None):
     if config.provider != "github":
         return None
-    raw_fetch = _config_values(config.root, f"remote.{config.remote}.url")
-    raw_push = _config_values(config.root, f"remote.{config.remote}.pushurl") or raw_fetch
+    root = Path(root or config.root)
+    raw_fetch = _config_values(root, f"remote.{config.remote}.url")
+    raw_push = _config_values(root, f"remote.{config.remote}.pushurl") or raw_fetch
     raw_urls = {"fetch": raw_fetch, "push": raw_push}
     urls = {}
     for kind, argv in (("fetch", ("remote", "get-url", "--all", config.remote)),
                        ("push", ("remote", "get-url", "--push", "--all", config.remote))):
         # `remote get-url` expands url.*.insteadOf and pushInsteadOf, so these
         # are the endpoints Git would actually use rather than just raw config.
-        urls[kind] = git(config.root, *argv).splitlines()
+        urls[kind] = git(root, *argv).splitlines()
     if any(len(items) != 1 for group in (raw_urls, urls) for items in group.values()):
         raise RelayError(
             "Git remote must resolve to exactly one fetch URL and one push URL; "
             "multiple URLs and push fan-out are not allowed"
         )
-    if raw_urls != urls:
+    # Submission passes the validated URL literally to `git push`. Resolve
+    # that exact argument in the same worktree too, so a chained or
+    # worktree-conditional rewrite cannot redirect the transport afterward.
+    literal_push_url = git(root, "ls-remote", "--get-url", urls["push"][0])
+    if raw_urls != urls or literal_push_url != urls["push"][0]:
         raise RelayError(
             "Git URL rewrites are not allowed for the configured remote; "
             "use one explicit GitHub fetch URL and push URL"

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import unittest
 
 from devrelay.config import detect, initialize, load
@@ -127,6 +128,22 @@ class ConfigurationTests(RepositoryTest):
         self.git("config", "url.https://github.com/example/other.git.insteadOf", original)
         with self.assertRaisesRegex(RelayError, "URL rewrite"):
             validate_remote(self.config)
+
+    def test_remote_validation_uses_the_transport_worktree_context(self):
+        self.configure(provider="github")
+        allowed = "https://github.com/example/project.git"
+        unapproved = "https://github.com/other/unapproved.git"
+        self.git("remote", "add", "origin", allowed)
+        worktree = Path(self.temporary.name) / "task-context"
+        self.git("worktree", "add", "-q", "-b", "devrelay/task-context", str(worktree), "main")
+        included = Path(self.temporary.name) / "task-context.gitconfig"
+        self.git("config", "--file", str(included), f"url.{unapproved}.insteadOf", allowed)
+        self.git("config", "includeIf.onbranch:devrelay/task-*.path", str(included))
+
+        self.assertEqual(validate_remote(self.config), allowed)
+        self.assertEqual(self.git("ls-remote", "--get-url", allowed, cwd=worktree), unapproved)
+        with self.assertRaisesRegex(RelayError, "URL rewrite"):
+            validate_remote(self.config, worktree)
 
     def test_fetch_and_push_protocols_may_differ_for_the_same_repository(self):
         self.configure(provider="github")

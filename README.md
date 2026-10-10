@@ -69,7 +69,7 @@ devrelay submit 12
 
 `run` 每次只处理一个任务。无 ID 时优先恢复中断任务；已有失败或阻塞任务时返回 `needs_attention`，由维护者检查并明确恢复后再派发新任务。`start` 只创建或恢复工作树。Codex 在 `.devrelay/worktrees/ID` 实现，DevRelay 执行验收。检查失败时，在配置的 `max_attempts` 范围内把失败信息交给相同 Codex 会话修复。Codex 报告外部阻塞时保存阻塞状态。
 
-`submit` 仅接受仍有效的验证证据，然后提交、推送并创建或更新 **draft PR**。`run --submit` 可串联这些步骤。GitHub 远程必须解析为唯一 fetch URL 和唯一 push URL，两者均须指向 `project.repository`；SSH 与 HTTPS 可混用。多个 fetch/push URL 会被拒绝，不会执行 Git 的 push 扇出。为了绑定实际端点，作用于该远程的 `insteadOf` / `pushInsteadOf` URL 改写也会被明确拒绝；请直接配置 GitHub URL。提交仅推送到该已校验的唯一 URL，同时保留配置远程的分支跟踪关系。默认停在 draft；可按下节开启自动审查与合并。PR 使用 `Refs #N`，不自动关闭整个 Issue，也不发布、部署或创建后台定时任务。
+`submit` 仅接受仍有效的验证证据，然后提交、推送并创建或更新 **draft PR**。`run --submit` 可串联这些步骤。GitHub 远程必须解析为唯一 fetch URL 和唯一 push URL，两者均须指向 `project.repository`；SSH 与 HTTPS 可混用。多个 fetch/push URL 会被拒绝，不会执行 Git 的 push 扇出。为了绑定实际端点，作用于该远程的 `insteadOf` / `pushInsteadOf` URL 改写也会被明确拒绝；请直接配置 GitHub URL。Git 配置会在实际传输的工作树中校验，因此 `includeIf` 的分支或路径条件不能绕过检查。提交仅推送到该已校验的唯一 URL，同时保留配置远程的分支跟踪关系。默认停在 draft；可按下节开启自动审查与合并。PR 使用 `Refs #N`，不自动关闭整个 Issue，也不发布、部署或创建后台定时任务。
 
 ## 自动审查与合并
 
