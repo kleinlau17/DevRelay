@@ -1,0 +1,542 @@
+from contextlib import ExitStack
+import json
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+
+from devrelay.config import load
+from devrelay.delivery import merge, pull_snapshot, review
+from devrelay.errors import RelayError
+from devrelay.git import git as real_git, has_ref
+from devrelay.process import execute
+from devrelay.providers import queue_report, snapshot
+from devrelay.runner import run_task, start, submit
+
+from test_delivery import GitHubDeliveryFixture
+
+
+class MergeTests(GitHubDeliveryFixture):
+    def setUp(self):
+        super().setUp()
+        self.draft = True
+        self.merged = False
+        self.merge_oid = None
+        self.merge_count = 0
+        self.ready_count = 0
+        self.request_timeout = False
+        self.request_pending = False
+        self.unexpected_tree = False
+        self.head_override = None
+        self.query_hook = None
+        self.checks = [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        self.threads = []
+        self.reviews = []
+        self.review_decision = None
+        self.merge_state = "CLEAN"
+        self.truncated = False
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch("devrelay.delivery.command", side_effect=self.query))
+        stack.enter_context(patch("devrelay.delivery.gh", side_effect=self.mutate))
+        stack.enter_context(patch("devrelay.delivery.validate_remote"))
+
+    def enable(self, **settings):
+        settings = {"auto_merge": True, **settings}
+        path = self.root / ".devrelay/config.toml"
+        text = path.read_text() + "\n[delivery]\n"
+        text += "\n".join(key + " = " + json.dumps(value) for key, value in settings.items()) + "\n"
+        path.write_text(text)
+        self.git("add", ".")
+        self.git("commit", "-qm", "delivery policy")
+        self.git("push", "-q", "origin", "main")
+        self.config = load(self.root)
+
+    def query(self, argv, cwd):
+        self.assertEqual(argv[:5], ["gh", "api", "--hostname", "github.com", "graphql"])
+        self.assertIn("owner=example", argv)
+        self.assertIn("name=project", argv)
+        self.assertIn("number=1", argv)
+        task = self.state.get("12")
+        pull = {"url": task["pr_url"], "state": "MERGED" if self.merged else "OPEN",
+                "headRefName": task["branch"], "headRefOid": self.head_override or task["head_sha"],
+                "baseRefName": "main", "baseRefOid": self.git("rev-parse", "origin/main"),
+                "isCrossRepository": False, "isDraft": self.draft, "mergeable": "MERGEABLE",
+                "mergeStateStatus": self.merge_state, "reviewDecision": self.review_decision,
+                "mergeCommit": {"oid": self.merge_oid} if self.merge_oid else None,
+                "reviewThreads": {"nodes": self.threads, "pageInfo": {"hasNextPage": self.truncated}},
+                "latestReviews": {"nodes": self.reviews, "pageInfo": {"hasNextPage": False}},
+                "commits": {"nodes": [{"commit": {"oid": self.head_override or task["head_sha"],
+                "statusCheckRollup": {"contexts": {"nodes": self.checks, "pageInfo": {"hasNextPage": False}}}}}]}}
+        if self.query_hook:
+            self.query_hook(pull)
+        return json.dumps({"data": {"repository": {"pullRequest": pull}}})
+
+    def server_merge(self):
+        server = Path(self.temporary.name) / "server-merge"
+        self.git("worktree", "add", "--detach", str(server), "origin/main")
+        self.git("merge", "--squash", self.state.get("12")["branch"], cwd=server)
+        if self.unexpected_tree:
+            (server / "unexpected.txt").write_text("unreviewed base change\n")
+            self.git("add", ".", cwd=server)
+        self.git("commit", "-qm", "server squash", cwd=server)
+        self.merge_oid = self.git("rev-parse", "HEAD", cwd=server)
+        self.git("push", "-q", "origin", "HEAD:main", cwd=server)
+        self.git("worktree", "remove", str(server))
+        self.merged = True
+
+    def mutate(self, config, *argv, input=None):
+        if argv[1] == "ready":
+            self.draft = False
+            self.ready_count += 1
+            return ""
+        self.assertEqual(argv[0:2], ("pr", "merge"))
+        self.assertIn("--squash", argv)
+        self.assertNotIn("--admin", argv)
+        self.assertNotIn("--auto", argv)
+        self.assertEqual(argv[argv.index("--match-head-commit") + 1], self.state.get("12")["head_sha"])
+        self.merge_count += 1
+        if not self.request_pending:
+            self.server_merge()
+        if self.request_timeout:
+            raise RelayError("Merge request timed out")
+        return ""
+
+    def deliver(self):
+        self.implement()
+        with self.state.lock():
+            return submit(self.config, self.state, "12")
+
+    def test_opt_in_runs_fresh_review_exact_head_merge_and_real_post_checks(self):
+        self.enable(required_checks=["test"])
+        trace = Path(self.temporary.name) / "trace.jsonl"
+        with patch.dict("os.environ", {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.deliver()
+        events = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertEqual(len(events), 2)
+        self.assertIn("read-only", events[1]["argv"])
+        self.assertNotIn("resume", events[1]["argv"])
+        self.assertNotEqual(result["session_id"], result["review"]["session_id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["post_merge"]["source_tree"], result["verification"]["source_tree"])
+        self.assertTrue(result["post_merge"]["passed"])
+        self.assertEqual(len(result["post_merge"]["checks"]), 1)
+        self.assertNotEqual(result["merge_sha"], result["head_sha"])
+        self.assertEqual(self.merge_count, 1)
+        self.assertEqual(self.ready_count, 1)
+        self.assertEqual((self.root / "value.txt").read_text(), "broken\n")
+        self.assertNotIn("post_merge_worktree", result)
+        with self.state.lock():
+            again = merge(self.config, self.state, "12")
+        self.assertEqual(again["merge_sha"], result["merge_sha"])
+        self.assertEqual(self.merge_count, 1)
+
+    def test_merge_disabled_by_default_and_manual_review_allowed(self):
+        task = self.deliver()
+        self.assertEqual(task["status"], "pr_open")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "disabled"):
+            merge(self.config, self.state, "12")
+        with self.state.lock():
+            result = review(self.config, self.state, "12")
+        self.assertEqual(result["status"], "reviewed")
+        self.assertEqual(self.ready_count, 0)
+        self.assertEqual(self.merge_count, 0)
+
+    def test_auto_review_only_retains_draft(self):
+        self.enable(auto_merge=False, auto_review=True)
+        result = self.deliver()
+        self.assertEqual(result["status"], "reviewed")
+        self.assertTrue(self.draft)
+        self.assertEqual(self.merge_count, 0)
+
+    def test_negative_review_blocks_merge_and_new_dispatch(self):
+        self.enable()
+        with patch.dict("os.environ", {"DEVRELAY_TEST_REVIEW": "changes_requested"}):
+            result = self.deliver()
+        self.assertEqual(result["status"], "review_blocked")
+        self.assertEqual(self.merge_count, 0)
+        self.assertEqual(self.ready_count, 0)
+        with self.state.lock():
+            pending = run_task(self.config, self.state)
+        self.assertEqual(pending["status"], "needs_attention")
+        self.assertEqual(pending["tasks"], ["12"])
+
+    def test_invalid_or_incomplete_review_never_merges(self):
+        self.enable()
+        self.implement()
+        # Retain the submitted PR while retrying independent review reports.
+        for mode in ("invalid", "inconsistent", "same-session", "incomplete", "failure"):
+            with self.subTest(mode=mode), patch.dict("os.environ", {"DEVRELAY_TEST_REVIEW": mode}):
+                with self.state.lock(), self.assertRaises(RelayError):
+                    submit(self.config, self.state, "12")
+                self.assertEqual(self.state.get("12")["status"], "review_blocked")
+                self.assertIsNone(self.state.get("12")["review"])
+        self.assertEqual(self.merge_count, 0)
+
+    def test_read_only_review_source_mutation_invalidates_evidence(self):
+        self.enable()
+        with patch.dict("os.environ", {"DEVRELAY_TEST_REVIEW": "modify"}):
+            with self.assertRaisesRegex(RelayError, "stale"):
+                self.deliver()
+        self.assertEqual(self.merge_count, 0)
+
+    def test_ci_waiting_reuses_review_then_completes_without_reimplementation(self):
+        self.enable(required_checks=["test"])
+        self.checks[0]["status"] = "IN_PROGRESS"
+        trace = Path(self.temporary.name) / "trace.jsonl"
+        with patch.dict("os.environ", {"DEVRELAY_TEST_TRACE": str(trace)}):
+            waiting = self.deliver()
+            self.assertEqual(waiting["status"], "merge_waiting")
+            self.assertEqual(self.merge_count, 0)
+            self.checks[0]["status"] = "COMPLETED"
+            with self.state.lock():
+                result = run_task(self.config, self.state, submit_after=True)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(trace.read_text().splitlines()), 2)
+        self.assertEqual(self.ready_count, 1)
+
+    def test_ci_failures_missing_names_and_github_reviews_block(self):
+        self.enable(required_checks=["test"])
+        self.checks[0]["conclusion"] = "FAILURE"
+        self.deliver()
+        scenarios = [([], [], [], None, "CLEAN"),
+                     (self.checks, [], [], None, "CLEAN"),
+                     ([{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SKIPPED"}], [], [], None, "CLEAN"),
+                     ([{"__typename": "StatusContext", "context": "test", "state": "SUCCESS"}], [{"isResolved": False}], [], None, "CLEAN"),
+                     ([{"__typename": "StatusContext", "context": "test", "state": "SUCCESS"}], [], [{"state": "CHANGES_REQUESTED"}], None, "CLEAN"),
+                     ([{"__typename": "StatusContext", "context": "test", "state": "SUCCESS"}], [], [], "REVIEW_REQUIRED", "CLEAN"),
+                     ([{"__typename": "StatusContext", "context": "test", "state": "SUCCESS"}], [], [], None, "BLOCKED")]
+        for checks, threads, reviews, decision, state in scenarios:
+            self.checks, self.threads, self.reviews = checks, threads, reviews
+            self.review_decision, self.merge_state = decision, state
+            with self.state.lock():
+                result = merge(self.config, self.state, "12")
+            self.assertEqual(result["status"], "merge_waiting")
+        self.assertEqual(self.merge_count, 0)
+
+    def test_no_ci_requires_explicit_allowance(self):
+        self.enable(allow_no_ci=True)
+        self.checks = []
+        self.assertEqual(self.deliver()["status"], "completed")
+
+    def test_required_names_still_apply_when_no_ci_allowed(self):
+        self.enable(allow_no_ci=True, required_checks=["test"])
+        self.checks = []
+        self.assertEqual(self.deliver()["status"], "merge_waiting")
+        self.assertEqual(self.merge_count, 0)
+
+    def test_truncated_or_graphql_error_data_is_rejected(self):
+        self.deliver()
+        self.truncated = True
+        with self.assertRaisesRegex(RelayError, "incomplete"):
+            pull_snapshot(self.config, self.state.get("12"))
+        with patch("devrelay.delivery.command", return_value=json.dumps({"errors": [{"message": "denied"}]})):
+            with self.assertRaisesRegex(RelayError, "incomplete"):
+                pull_snapshot(self.config, self.state.get("12"))
+
+    def test_changed_remote_head_never_merges(self):
+        self.enable()
+        self.head_override = "0" * 40
+        with self.assertRaisesRegex(RelayError, "HEAD differs"):
+            self.deliver()
+        self.assertEqual(self.merge_count, 0)
+
+    def test_base_or_issue_changes_after_review_block_merge(self):
+        self.enable()
+        self.checks[0]["status"] = "IN_PROGRESS"
+        self.deliver()
+        self.issue["body"] += "\nChanged acceptance"
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "stale"):
+            merge(self.config, self.state, "12")
+        self.issue["body"] = self.state.get("12")["body"]
+        (self.root / "base.txt").write_text("advanced\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "advance base")
+        self.git("push", "-q", "origin", "main")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "base changed"):
+            merge(self.config, self.state, "12")
+        self.assertEqual(self.merge_count, 0)
+
+    def test_authorization_withdrawn_after_review_blocks_merge(self):
+        self.enable()
+        self.checks[0]["status"] = "IN_PROGRESS"
+        self.deliver()
+        self.issue["labels"] = [{"name": "priority:P1"}]
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "not eligible"):
+            merge(self.config, self.state, "12")
+        self.assertEqual(self.merge_count, 0)
+
+    def test_timeout_after_remote_merge_recovers_readback_once(self):
+        self.enable()
+        self.request_timeout = True
+        self.assertEqual(self.deliver()["status"], "completed")
+        self.assertEqual(self.merge_count, 1)
+
+    def test_queued_merge_is_pending_until_remote_readback(self):
+        self.enable()
+        self.request_pending = True
+        result = self.deliver()
+        self.assertEqual(result["status"], "merge_waiting")
+        self.server_merge()
+        with self.state.lock():
+            result = merge(self.config, self.state, "12")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.merge_count, 1)
+
+    def test_post_merge_check_failure_preserves_merged_state_and_retry_does_not_merge_again(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        def fail_post(state, argv, cwd, log, timeout, **kwargs):
+            if "-post-" in str(cwd):
+                raise RelayError("Post-merge environment unavailable")
+            return execute(state, argv, cwd, log, timeout, **kwargs)
+        with patch("devrelay.delivery.execute", side_effect=fail_post), self.assertRaisesRegex(RelayError, "environment"):
+            self.deliver()
+        failed = self.state.get("12")
+        self.assertEqual(failed["status"], "post_merge_failed")
+        self.assertTrue(failed["merge_sha"])
+        self.assertFalse(failed["post_merge"]["passed"])
+        self.assertTrue(Path(failed["post_merge_worktree"]).exists())
+        self.assertTrue(Path(failed["worktree"]).exists())
+        self.assertTrue(has_ref(self.root, failed["branch"]))
+        self.assertTrue(self.git("--git-dir", str(self.remote), "rev-parse", failed["branch"]))
+        with self.state.lock():
+            result = merge(self.config, self.state, "12")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.merge_count, 1)
+        self.assertTrue(Path(failed["post_merge_worktree"]).exists())
+        self.assertIn(failed["post_merge_worktree"], result["retained_worktrees"])
+        self.assertFalse(Path(failed["worktree"]).exists())
+
+    def test_unexpected_merged_tree_is_not_reported_complete(self):
+        self.enable()
+        self.unexpected_tree = True
+        with self.assertRaisesRegex(RelayError, "Merged tree differs"):
+            self.deliver()
+        failed = self.state.get("12")
+        self.assertEqual(failed["status"], "post_merge_failed")
+        self.assertFalse(failed["post_merge"]["passed"])
+        self.assertEqual(self.merge_count, 1)
+
+    def test_configuration_changes_invalidate_review(self):
+        self.enable()
+        self.checks[0]["status"] = "IN_PROGRESS"
+        self.deliver()
+        path = self.root / ".devrelay/config.toml"
+        path.write_text(path.read_text().replace("auto_merge = true", "auto_merge = false"))
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "configuration changed"):
+            merge(self.config, self.state, "12")
+        self.assertEqual(self.merge_count, 0)
+
+    def test_ci_regression_during_last_gate_read_prevents_mutation(self):
+        self.enable()
+        def regress(pull):
+            if self.state.get("12")["status"] == "merging":
+                pull["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][0]["conclusion"] = "FAILURE"
+        self.query_hook = regress
+        result = self.deliver()
+        self.assertEqual(result["status"], "merge_waiting")
+        self.assertEqual(self.merge_count, 0)
+        self.assertIn("CI check", result["error"])
+
+    def test_lost_api_readback_after_merge_is_recovered_without_second_mutation(self):
+        self.enable()
+        def fail_readback(pull):
+            if self.merged:
+                raise RelayError("Readback unavailable")
+        self.query_hook = fail_readback
+        with self.assertRaisesRegex(RelayError, "Readback unavailable"):
+            self.deliver()
+        self.assertEqual(self.state.get("12")["status"], "merge_blocked")
+        self.query_hook = None
+        with self.state.lock():
+            result = merge(self.config, self.state, "12")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.merge_count, 1)
+
+    def test_completed_pr_identity_is_rechecked(self):
+        self.enable()
+        self.deliver()
+        self.head_override = "0" * 40
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "readback differs"):
+            merge(self.config, self.state, "12")
+        self.assertEqual(self.state.get("12")["status"], "post_merge_failed")
+        self.assertEqual(self.merge_count, 1)
+
+    def test_cleanup_is_disabled_by_default(self):
+        self.enable()
+        result = self.deliver()
+        self.assertTrue(Path(result["worktree"]).exists())
+        self.assertTrue(has_ref(self.root, result["branch"]))
+        self.assertTrue(self.git("--git-dir", str(self.remote), "rev-parse", result["branch"]))
+        self.assertEqual([step["id"] for step in result["cleanup"]["steps"]], ["acceptance_worktree"])
+
+    def test_successful_cleanup_removes_owned_trees_and_both_branches_and_is_idempotent(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        result = self.deliver()
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["post_merge"]["passed"])
+        self.assertEqual(result["cleanup"]["status"], "completed")
+        self.assertFalse(Path(result["worktree"]).exists())
+        self.assertFalse(has_ref(self.root, result["branch"]))
+        self.assertFalse(has_ref(self.root, "refs/remotes/origin/" + result["branch"]))
+        self.assertEqual(self.git("--git-dir", str(self.remote), "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/" + result["branch"]), "")
+        self.assertTrue(has_ref(self.root, "main"))
+        self.assertEqual((self.root / "value.txt").read_text(), "broken\n")
+        self.assertTrue(Path(result["verification_path"]).exists())
+        self.assertTrue(Path(result["review_path"]).exists())
+        self.assertTrue(Path(result["post_merge_path"]).exists())
+        self.assertTrue(Path(result["cleanup_path"]).exists())
+        with self.state.lock(), patch("devrelay.delivery.execute") as checks:
+            again = merge(self.config, self.state, "12")
+            resumed = run_task(self.config, self.state, "12", resume=True, submit_after=True)
+            submitted = submit(self.config, self.state, "12")
+        checks.assert_not_called()
+        self.assertEqual(again["status"], "completed")
+        self.assertEqual(resumed["status"], "completed")
+        self.assertEqual(submitted["status"], "completed")
+        self.assertEqual(self.merge_count, 1)
+        # Refs preserves the issue scope. Removing its worktree must not re-dispatch the same open issue.
+        self.assertIsNone(queue_report(self.config, snapshot(self.config, self.state))["selected"])
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "already completed"):
+            start(self.config, self.state, "12")
+
+    def test_worktree_only_cleanup_keeps_branches(self):
+        self.enable(cleanup_worktrees=True)
+        result = self.deliver()
+        self.assertFalse(Path(result["worktree"]).exists())
+        self.assertTrue(has_ref(self.root, result["branch"]))
+        self.assertTrue(self.git("--git-dir", str(self.remote), "rev-parse", result["branch"]))
+
+    def test_cleanup_waits_for_merge_and_post_merge_acceptance(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        self.checks[0]["status"] = "IN_PROGRESS"
+        result = self.deliver()
+        self.assertEqual(result["status"], "merge_waiting")
+        self.assertNotIn("cleanup", result)
+        self.assertTrue(Path(result["worktree"]).exists())
+        self.assertTrue(has_ref(self.root, result["branch"]))
+
+    def after_acceptance(self, action):
+        def execute_then_change(state, argv, cwd, log, timeout, **kwargs):
+            result = execute(state, argv, cwd, log, timeout, **kwargs)
+            if "-post-" in str(cwd):
+                action()
+            return result
+        return patch("devrelay.delivery.execute", side_effect=execute_then_change)
+
+    def test_dirty_task_worktree_is_retained_and_cleanup_can_resume_without_reverification(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        def edit():
+            task = self.state.get("12")
+            (Path(task["worktree"]) / "personal.txt").write_text("preserve this untracked work\n")
+        with self.after_acceptance(edit), self.assertRaisesRegex(RelayError, "new changes"):
+            self.deliver()
+        failed = self.state.get("12")
+        self.assertEqual(failed["status"], "cleanup_failed")
+        self.assertTrue(failed["post_merge"]["passed"])
+        self.assertTrue(Path(failed["post_merge_worktree"]).exists())
+        self.assertTrue(has_ref(self.root, failed["branch"]))
+        with self.state.lock():
+            self.assertEqual(run_task(self.config, self.state)["status"], "needs_attention")
+        (Path(failed["worktree"]) / "personal.txt").unlink()
+        with self.state.lock(), patch("devrelay.delivery.execute") as checks:
+            result = merge(self.config, self.state, "12")
+        checks.assert_not_called()
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(Path(result["worktree"]).exists())
+        self.assertEqual(self.merge_count, 1)
+
+    def test_advanced_remote_branch_is_preserved_before_any_cleanup(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        def advance():
+            task = self.state.get("12")
+            self.git("--git-dir", str(self.remote), "update-ref", "refs/heads/" + task["branch"], self.merge_oid)
+        with self.after_acceptance(advance), self.assertRaisesRegex(RelayError, "Remote task branch advanced"):
+            self.deliver()
+        failed = self.state.get("12")
+        self.assertEqual(failed["status"], "cleanup_failed")
+        self.assertTrue(Path(failed["worktree"]).exists())
+        self.assertTrue(has_ref(self.root, failed["branch"]))
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", failed["branch"]), self.merge_oid)
+
+    def test_advanced_local_branch_is_preserved(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        def advance():
+            self.git("commit", "--allow-empty", "-qm", "new local work", cwd=self.state.get("12")["worktree"])
+        with self.after_acceptance(advance), self.assertRaisesRegex(RelayError, "HEAD changed"):
+            self.deliver()
+        failed = self.state.get("12")
+        self.assertTrue(Path(failed["worktree"]).exists())
+        self.assertNotEqual(self.git("rev-parse", failed["branch"]), failed["head_sha"])
+
+    def test_remote_delete_lease_blocks_a_concurrent_branch_update_and_partial_cleanup_recovers(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        def race(root, *argv, **kwargs):
+            if argv[0] == "push":
+                task = self.state.get("12")
+                self.git("--git-dir", str(self.remote), "update-ref", "refs/heads/" + task["branch"], self.merge_oid)
+            return real_git(root, *argv, **kwargs)
+        with patch("devrelay.cleanup.git", side_effect=race), self.assertRaises(RelayError):
+            self.deliver()
+        failed = self.state.get("12")
+        self.assertEqual(failed["status"], "cleanup_failed")
+        self.assertFalse(Path(failed["worktree"]).exists())
+        self.assertTrue(has_ref(self.root, failed["branch"]))
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", failed["branch"]), self.merge_oid)
+        self.git("--git-dir", str(self.remote), "update-ref", "refs/heads/" + failed["branch"], failed["head_sha"])
+        with self.state.lock(), patch("devrelay.delivery.execute") as checks:
+            result = merge(self.config, self.state, "12")
+        checks.assert_not_called()
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(has_ref(self.root, result["branch"]))
+        self.assertEqual(self.merge_count, 1)
+
+    def test_remote_deletion_timeout_is_read_back_before_retry(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        def timeout(root, *argv, **kwargs):
+            result = real_git(root, *argv, **kwargs)
+            if argv[0] == "push":
+                raise RelayError("Delete timed out after the remote accepted it")
+            return result
+        with patch("devrelay.cleanup.git", side_effect=timeout):
+            result = self.deliver()
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(has_ref(self.root, result["branch"]))
+
+    def test_remote_branch_already_deleted_by_github_is_idempotent(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        def remove_remote():
+            self.git("--git-dir", str(self.remote), "update-ref", "-d", "refs/heads/" + self.state.get("12")["branch"])
+        with self.after_acceptance(remove_remote):
+            result = self.deliver()
+        self.assertEqual(result["status"], "completed")
+        remote = next(step for step in result["cleanup"]["steps"] if step["id"] == "remote_branch")
+        self.assertEqual(remote["status"], "already_absent")
+        self.assertFalse(has_ref(self.root, result["branch"]))
+
+    def test_locked_worktree_is_preserved(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        def lock():
+            self.git("worktree", "lock", self.state.get("12")["worktree"])
+        with self.after_acceptance(lock), self.assertRaisesRegex(RelayError, "locked"):
+            self.deliver()
+        failed = self.state.get("12")
+        self.assertTrue(Path(failed["worktree"]).exists())
+        self.assertTrue(has_ref(self.root, failed["branch"]))
+        self.git("worktree", "unlock", failed["worktree"])
+
+    def test_branch_used_in_another_worktree_is_preserved(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        other = Path(self.temporary.name) / "other-worktree"
+        def reuse():
+            self.git("worktree", "add", "--force", str(other), self.state.get("12")["branch"])
+        with self.after_acceptance(reuse), self.assertRaisesRegex(RelayError, "another worktree"):
+            self.deliver()
+        failed = self.state.get("12")
+        self.assertTrue(Path(failed["worktree"]).exists())
+        self.assertTrue(other.exists())
+        self.assertTrue(has_ref(self.root, failed["branch"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

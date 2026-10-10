@@ -1,0 +1,46 @@
+# Node project example. Review the actual commands before using it.
+[project]
+provider = "github"
+repository = "owner/project"
+base_branch = "main"
+remote = "origin"
+branch_prefix = "devrelay/task-"
+
+[queue]
+approval_label = "auto:approved"
+priorities = ["priority:P0", "priority:P1", "priority:P2"]
+blockers = ["blocked", "needs-input"]
+
+[codex]
+executable = "codex"
+sandbox = "workspace-write"
+timeout_seconds = 1800
+max_attempts = 2
+# model = "your-configured-model"
+# profile = "your-codex-profile"
+
+[delivery]
+auto_review = false
+auto_merge = false
+cleanup_worktrees = false
+# Removes local, remote and remote-tracking task branches; requires cleanup_worktrees=true.
+cleanup_branches = false
+# Set actual GitHub check names before enabling automatic merge.
+required_checks = ["test", "build"]
+# Only enable this explicitly for projects with no GitHub CI.
+allow_no_ci = false
+
+[[setup]]
+id = "install"
+argv = ["npm", "ci"]
+timeout_seconds = 600
+
+[[checks]]
+id = "test"
+argv = ["npm", "test", "--", "--run"]
+timeout_seconds = 600
+
+[[checks]]
+id = "build"
+argv = ["npm", "run", "build"]
+timeout_seconds = 600

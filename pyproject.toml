@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devrelay"
+version = "0.3.0"
+description = "Issue-to-PR development workflows powered by Codex"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+devrelay = "devrelay.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
