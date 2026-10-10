@@ -1194,6 +1194,12 @@ os._exit(0)
             self.assertIsNone(self.state.metadata("active_process"))
 
     def test_execute_after_termination_failure_preserves_live_group_marker(self):
+        self._assert_termination_failure_preserves_live_group_marker()
+
+    def test_streaming_termination_failure_preserves_live_group_marker(self):
+        self._assert_termination_failure_preserves_live_group_marker(on_output_line=lambda line: None)
+
+    def _assert_termination_failure_preserves_live_group_marker(self, on_output_line=None):
         log = self.state.directory / "termination-failure.log"
         retry_log = self.state.directory / "blocked-retry.log"
         retry_output = Path(self.temporary.name) / "retry-started"
@@ -1210,7 +1216,7 @@ os._exit(0)
                 with (patch("devrelay.process.terminate", side_effect=fail_termination),
                       self.assertRaisesRegex(RelayError, "Cannot stop process group")):
                     execute(self.state, [sys.executable, "-c", "import time; time.sleep(30)"],
-                            self.root, log, 0.1)
+                            self.root, log, 0.1, on_output_line=on_output_line)
                 active = self.state.metadata("active_process")
                 self.assertEqual(active["group"], process.pid)
                 with self.assertRaisesRegex(RelayError, "Previous command still runs"):
@@ -1234,6 +1240,14 @@ os._exit(0)
 
 
     def test_timeout_kills_descendant_that_ignores_sigterm(self):
+        self._assert_timeout_kills_descendant_that_ignores_sigterm()
+
+    def test_streaming_timeout_kills_descendant_that_ignores_sigterm(self):
+        seen = []
+        self._assert_timeout_kills_descendant_that_ignores_sigterm(on_output_line=seen.append)
+        self.assertEqual(seen, ["started"])
+
+    def _assert_timeout_kills_descendant_that_ignores_sigterm(self, on_output_line=None):
         log = self.state.directory / "stubborn-descendant.log"
         marker = Path(self.temporary.name) / "stubborn-descendant"
         child = ("import signal,time; "
@@ -1245,6 +1259,7 @@ os._exit(0)
                   "assert child.stdout.readline() == 'ready\\n'; "
                   "marker=open(sys.argv[1], 'w'); "
                   "marker.write(f'{os.getpgrp()} {child.pid}'); marker.close(); "
+                  "print('started', flush=True); "
                   "time.sleep(30)")
         group = None
         try:
@@ -1252,7 +1267,7 @@ os._exit(0)
                   patch("devrelay.process._KILL_GRACE_SECONDS", 2)):
                 with self.state.lock(), self.assertRaisesRegex(RelayError, "timed out"):
                     execute(self.state, [sys.executable, "-c", parent, str(marker), child],
-                            self.root, log, 1)
+                            self.root, log, 1, on_output_line=on_output_line)
             group, child_pid = (int(value) for value in marker.read_text().split())
             self.assertNotEqual(group, child_pid)
             self.assertFalse(group_alive(group))
