@@ -95,6 +95,8 @@ devrelay submit 12
 
 `submit` 仅接受仍有效的验证证据，然后提交、推送并创建或更新 **draft PR**。`run --submit` 可串联这些步骤。GitHub 远程必须解析为唯一 fetch URL 和唯一 push URL，两者均须指向 `project.repository`；SSH 与 HTTPS 可混用。多个 fetch/push URL 会被拒绝，不会执行 Git 的 push 扇出。为了绑定实际端点，作用于该远程的 `insteadOf` / `pushInsteadOf` URL 改写也会被明确拒绝；请直接配置 GitHub URL。Git 配置会在实际传输的工作树中校验，因此 `includeIf` 的分支或路径条件不能绕过检查。实际传输在同一 Git 调用中固定该 URL，校验后新增的改写也无法重定向。提交仅推送到该已校验的唯一 URL，并直接保留配置远程的分支跟踪设置，不依赖 fetch refspec 是否覆盖任务分支。默认停在 draft；可按下节开启自动审查与合并。PR 使用 `Refs #N`，不自动关闭整个 Issue，也不发布、部署或创建后台定时任务。
 
+远程指向其他仓库时，错误会指出 fetch 或 push URL，并包含 `does not match project.repository`；修正该远程后再重试 GitHub 操作。
+
 ## 自动审查与合并
 
 在项目 `.devrelay/config.toml` 中配置，并在运行任务前纳入版本管理：

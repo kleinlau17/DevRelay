@@ -152,7 +152,7 @@ def validate_remote(config, root=None):
         slug = github_slug(items[0])
         if slug.casefold() != config.repo.casefold():
             raise RelayError(
-                f"Git {kind} URL does not resolve to project.repository; "
+                f"Git {kind} URL does not match project.repository; "
                 "correct the remote or URL rewrite before proceeding"
             )
     return urls["push"][0]

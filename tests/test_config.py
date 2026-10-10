@@ -99,11 +99,11 @@ class ConfigurationTests(RepositoryTest):
         self.git("remote", "add", "origin", "https://github.com/example/project.git")
         self.assertEqual(validate_remote(self.config), "https://github.com/example/project.git")
         self.git("remote", "set-url", "--push", "origin", "https://github.com/example/wrong-project.git")
-        with self.assertRaisesRegex(RelayError, "does not resolve"):
+        with self.assertRaisesRegex(RelayError, "Git push URL does not match project.repository"):
             validate_remote(self.config)
         self.git("remote", "set-url", "--push", "origin", "https://github.com/example/project.git")
         self.git("remote", "set-url", "origin", "https://github.com/example/wrong-project.git")
-        with self.assertRaisesRegex(RelayError, "Git fetch URL"):
+        with self.assertRaisesRegex(RelayError, "Git fetch URL does not match project.repository"):
             validate_remote(self.config)
 
     def test_remote_rejects_multiple_fetch_or_push_urls(self):
