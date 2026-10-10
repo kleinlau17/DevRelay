@@ -1,6 +1,7 @@
 from contextlib import ExitStack
 import json
 from pathlib import Path
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -106,6 +107,20 @@ class MergeTests(GitHubDeliveryFixture):
         with self.state.lock():
             return submit(self.config, self.state, "12")
 
+    def add_dependency_submodule(self):
+        source = Path(self.temporary.name) / "review-dependency"
+        source.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+        subprocess.run(["git", "config", "user.name", "DevRelay Test"], cwd=source, check=True)
+        subprocess.run(["git", "config", "user.email", "devrelay@example.invalid"], cwd=source, check=True)
+        (source / "dependency.txt").write_text("delivered\n")
+        subprocess.run(["git", "add", "."], cwd=source, check=True)
+        subprocess.run(["git", "commit", "-qm", "dependency"], cwd=source, check=True)
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+                        str(source), "vendor/dependency"], cwd=self.root, check=True)
+        self.git("commit", "-qam", "add dependency")
+        self.git("push", "-q", "origin", "main")
+
     def test_opt_in_runs_fresh_review_exact_head_merge_and_real_post_checks(self):
         self.enable(required_checks=["test"])
         trace = Path(self.temporary.name) / "trace.jsonl"
@@ -178,6 +193,19 @@ class MergeTests(GitHubDeliveryFixture):
             with self.assertRaisesRegex(RelayError, "stale"):
                 self.deliver()
         self.assertEqual(self.merge_count, 0)
+
+    def test_dirty_submodule_blocks_review_gate(self):
+        self.add_dependency_submodule()
+        task = self.deliver()
+        worktree = Path(task["worktree"])
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init",
+                        "--recursive"], cwd=worktree, check=True)
+        dependency = worktree / "vendor/dependency/dependency.txt"
+        dependency.write_text("not delivered\n")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree"):
+            review(self.config, self.state, "12")
+        self.assertEqual(self.state.get("12")["status"], "review_blocked")
+        self.assertEqual(dependency.read_text(), "not delivered\n")
 
     def test_ci_waiting_reuses_review_then_completes_without_reimplementation(self):
         self.enable(required_checks=["test"])
@@ -400,6 +428,47 @@ class MergeTests(GitHubDeliveryFixture):
         with self.state.lock(), self.assertRaisesRegex(RelayError, "already completed"):
             start(self.config, self.state, "12")
 
+    def test_cleanup_removes_the_custom_fetch_mapped_tracking_ref(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        self.git("config", "--replace-all", "remote.origin.fetch",
+                 "+refs/heads/main:refs/remotes/origin/main")
+        self.git("config", "--add", "remote.origin.fetch",
+                 "+refs/heads/devrelay/*:refs/remotes/custom/*")
+
+        def check_upstream():
+            task = self.state.get("12")
+            self.assertEqual(self.git("rev-parse", "@{upstream}", cwd=task["worktree"]),
+                             task["head_sha"])
+
+        with self.after_acceptance(check_upstream):
+            result = self.deliver()
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(has_ref(self.root, "refs/remotes/custom/task-12"))
+        self.assertFalse(has_ref(self.root, "refs/remotes/origin/" + result["branch"]))
+        self.assertTrue(has_ref(self.root, "refs/remotes/origin/main"))
+
+    def test_cleanup_removes_tracking_ref_excluded_by_negative_fetch_refspec(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        self.git("config", "--replace-all", "remote.origin.fetch",
+                 "+refs/heads/main:refs/remotes/origin/main")
+        self.git("config", "--add", "remote.origin.fetch",
+                 "+refs/heads/devrelay/*:refs/remotes/custom/*")
+        self.git("config", "--add", "remote.origin.fetch", "^refs/heads/devrelay/*")
+
+        def check_upstream():
+            task = self.state.get("12")
+            self.assertEqual(self.git("rev-parse", "@{upstream}", cwd=task["worktree"]),
+                             task["head_sha"])
+            self.assertEqual(self.git("rev-parse", "refs/remotes/custom/task-12"), task["head_sha"])
+
+        with self.after_acceptance(check_upstream):
+            result = self.deliver()
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(has_ref(self.root, "refs/remotes/custom/task-12"))
+        self.assertEqual(self.git("--git-dir", str(self.remote), "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/" + result["branch"]), "")
+        self.assertTrue(has_ref(self.root, "refs/remotes/origin/main"))
+
     def test_worktree_only_cleanup_keeps_branches(self):
         self.enable(cleanup_worktrees=True)
         result = self.deliver()
@@ -502,6 +571,65 @@ class MergeTests(GitHubDeliveryFixture):
             result = self.deliver()
         self.assertEqual(result["status"], "completed")
         self.assertFalse(has_ref(self.root, result["branch"]))
+
+    def test_rewrite_added_after_validation_cannot_redirect_remote_deletion(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        extra = Path(self.temporary.name) / "cleanup-race-extra.git"
+        self.git("init", "--bare", "-q", str(extra))
+        validation_calls = 0
+
+        def validate_then_rewrite(config, root=None):
+            nonlocal validation_calls
+            validation_calls += 1
+            if validation_calls == 2:
+                self.git("config", f"url.{extra}.pushInsteadOf", str(self.remote))
+            return str(self.remote)
+
+        def seed_extra():
+            task = self.state.get("12")
+            self.git("push", "-q", str(extra), task["branch"], cwd=task["worktree"])
+
+        with (patch("devrelay.cleanup.validate_remote", side_effect=validate_then_rewrite),
+              self.after_acceptance(seed_extra)):
+            result = self.deliver()
+        self.assertEqual(validation_calls, 2)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/" + result["branch"]), "")
+        self.assertEqual(self.git("--git-dir", str(extra), "rev-parse", result["branch"]),
+                         result["head_sha"])
+
+    def test_url_named_alias_added_after_validation_cannot_redirect_cleanup(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        extras = [Path(self.temporary.name) / f"cleanup-alias-extra-{index}.git" for index in range(2)]
+        for extra in extras:
+            self.git("init", "--bare", "-q", str(extra))
+        url = self.remote.as_uri()
+        validation_calls = 0
+
+        def validate_then_alias(config, root=None):
+            nonlocal validation_calls
+            validation_calls += 1
+            if validation_calls == 2:
+                self.git("config", f"remote.{url}.url", str(extras[0]))
+                for extra in extras:
+                    self.git("config", "--add", f"remote.{url}.pushurl", str(extra))
+            return url
+
+        def seed_extras():
+            task = self.state.get("12")
+            for extra in extras:
+                self.git("push", "-q", str(extra), task["branch"], cwd=task["worktree"])
+
+        with (patch("devrelay.cleanup.validate_remote", side_effect=validate_then_alias),
+              self.after_acceptance(seed_extras)):
+            result = self.deliver()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(validation_calls, 2)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/" + result["branch"]), "")
+        for extra in extras:
+            self.assertEqual(self.git("--git-dir", str(extra), "rev-parse", result["branch"]),
+                             result["head_sha"])
 
     def test_remote_branch_already_deleted_by_github_is_idempotent(self):
         self.enable(cleanup_branches=True, cleanup_worktrees=True)

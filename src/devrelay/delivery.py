@@ -203,9 +203,13 @@ def post_merge(config, state, task, pull):
         task["post_merge_worktree"] = str(path)
         state.save(task)
         for phase in ("setup", "checks"):
+            if phase == "checks" and (source_tree(path) != tree or git(path, "rev-parse", "HEAD") != oid):
+                raise RelayError("Source or HEAD changed during post-merge setup")
             for entry in config.data[phase]:
                 receipt = execute(state, entry["argv"], path, directory / (phase + "-" + entry["id"] + ".log"), entry["timeout_seconds"])
                 record[phase].append({"id": entry["id"], **receipt})
+                if phase == "checks" and (source_tree(path) != tree or git(path, "rev-parse", "HEAD") != oid):
+                    raise RelayError("Source or HEAD changed during post-merge acceptance")
         assert_config(config)
         if source_tree(path) != tree or git(path, "rev-parse", "HEAD") != oid:
             raise RelayError("Source or HEAD changed during post-merge acceptance")

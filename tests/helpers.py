@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -27,6 +29,20 @@ class RepositoryTest(unittest.TestCase):
         return subprocess.check_output(["git", *args], cwd=cwd or self.root, text=True,
                                        stderr=subprocess.PIPE).strip()
 
+    def write_filename_fixture(self, root, filename, content):
+        path = root / os.fsdecode(filename)
+        try:
+            path.write_bytes(content)
+        except OSError as error:
+            if error.errno == errno.EILSEQ:
+                try:
+                    filename.decode("utf-8")
+                except UnicodeDecodeError:
+                    self.skipTest(f"Filesystem rejects non-UTF-8 filename {filename!r} with EILSEQ; "
+                                  "filesystem end-to-end case unavailable")
+            raise
+        return path
+
     def configure(self, *, provider="local", checks=None, setup=None, executable="codex", attempts=2):
         directory = self.root / ".devrelay"
         directory.mkdir(exist_ok=True)
@@ -49,7 +65,7 @@ class RepositoryTest(unittest.TestCase):
     def fake_codex(self):
         executable = Path(self.temporary.name) / "fake-codex"
         executable.write_text('''#!/usr/bin/env python3
-import json, os, sys
+import json, os, signal, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 if args == ['login', 'status']:
@@ -80,9 +96,28 @@ if 'verdict' in schema['properties']:
     if review_mode != 'incomplete':
         print(json.dumps({'type': 'turn.completed'}), flush=True)
     raise SystemExit(0)
-session = args[args.index('resume') + 1] if 'resume' in args else 'exact-test-session'
+session = (args[args.index('resume') + 1] if 'resume' in args else
+           'started-session' if mode == 'controller-crash' else 'exact-test-session')
+if mode == 'stderr-command-failure':
+    print('ordinary CLI diagnostic', file=sys.stderr, flush=True)
+if mode == 'controller-crash' and 'resume' not in args:
+    os.kill(os.getppid(), signal.SIGSTOP)
 print(json.dumps({'type': 'thread.started', 'thread_id': session}), flush=True)
-if mode == 'command-failure':
+if mode == 'unicode-chunks':
+    message = json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message',
+                         'text': 'first\\u0085second\\u2028third\\u2029last'}}, ensure_ascii=False)
+    boundary = message.index('\\u2028') + 1
+    sys.stdout.write(message[:boundary])
+    sys.stdout.flush()
+    time.sleep(0.15)
+    sys.stdout.write(message[boundary:] + '\\n')
+    sys.stdout.flush()
+if mode == 'controller-crash' and 'resume' not in args:
+    time.sleep(30)
+if mode == 'interrupt':
+    os.kill(os.getppid(), signal.SIGINT)
+    time.sleep(30)
+if mode in ('command-failure', 'stderr-command-failure', 'unicode-chunks'):
     print(json.dumps({'type': 'turn.failed'}))
     raise SystemExit(9)
 if mode != 'blocked':

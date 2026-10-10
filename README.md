@@ -93,7 +93,13 @@ devrelay submit 12
 
 `run` 每次只处理一个任务。无 ID 时优先恢复中断任务；已有失败或阻塞任务时返回 `needs_attention`，由维护者检查并明确恢复后再派发新任务。`start` 只创建或恢复工作树。Codex 在 `.devrelay/worktrees/ID` 实现，DevRelay 执行验收。检查失败时，在配置的 `max_attempts` 范围内把失败信息交给相同 Codex 会话修复。Codex 报告外部阻塞时保存阻塞状态。
 
-`submit` 仅接受仍有效的验证证据，然后提交、推送并创建或更新 **draft PR**。`run --submit` 可串联这些步骤。默认停在 draft；可按下节开启自动审查与合并。PR 使用 `Refs #N`，不自动关闭整个 Issue，也不发布、部署或创建后台定时任务。
+`submit` 仅接受仍有效的验证证据，然后提交、推送并创建或更新 **draft PR**。`run --submit` 可串联这些步骤。GitHub 远程必须解析为唯一 fetch URL 和唯一 push URL，两者均须指向 `project.repository`；SSH 与 HTTPS 可混用。多个 fetch/push URL 会被拒绝，不会执行 Git 的 push 扇出。为了绑定实际端点，作用于该远程的 `insteadOf` / `pushInsteadOf` URL 改写也会被明确拒绝；请直接配置 GitHub URL。Git 配置会在实际传输的工作树中校验，因此 `includeIf` 的分支或路径条件不能绕过检查。提交和清理使用不能解析为远端名称的绝对路径传输参数，在同次 Git 调用中绑定已校验 URL；校验后新增的改写或 URL 同名远端别名都无法重定向或扇出，原有凭据和 CA 设置仍保留。提交直接保留配置远程的分支跟踪设置，兼容单分支克隆，并按现有 fetch refspec 更新跟踪引用，不假定其位于 `refs/remotes/<remote>/<branch>`；清理使用相同映射。默认停在 draft；可按下节开启自动审查与合并。PR 使用 `Refs #N`，不自动关闭整个 Issue，也不发布、部署或创建后台定时任务。
+
+远程指向其他仓库时，错误会指出 fetch 或 push URL，并包含 `does not match project.repository`；修正该远程后再重试 GitHub 操作。
+
+推送后的跟踪引用更新和跟踪引用清理使用首个匹配的正 fetch refspec。负 fetch refspec 仅限制抓取，不会取消这一跟踪映射。
+
+传输保留 Git 对 `GIT_CONFIG_NOSYSTEM` 的布尔值规则：`0`/`false` 保留原有系统设置，`1`/`true` 禁用它们。其他 Git 布尔值写法同样支持；无效值会停止传输。
 
 ## 自动审查与合并
 
@@ -152,10 +158,22 @@ devrelay submit fix-1 --local
 ## 验证与恢复
 
 - 验证绑定源码树、HEAD、目标 base、项目配置和任务要求。源码哈希包括已跟踪修改与未忽略新文件，使用临时 Git 索引，保留原索引。
+- 所有源码证据 Git 操作均禁用本地 replacement refs，检查实际提交对象，不修改用户的替换引用。NUL 分隔的文件路径按字节解析，支持文件系统可表示的非 UTF-8 和含回车的文件名。
+- 对已检出的子模块递归检查已跟踪修改和未忽略的新文件；隔离索引比较会忽略 `assume-unchanged`、`skip-worktree` 与 `core.fileMode=false` 等掩码，并覆盖 `submodule.*.ignore`、`.gitmodules` ignore 和隐藏未跟踪文件的状态配置。任一子模块不干净都会使验收、提交及自动审查/合并门禁失败，且 DevRelay 不会提交、清理、重置或更新子模块。
+- 子模块未跟踪文件检测只应用 `.gitignore`，不会读取本地 `info/exclude` 或 `core.excludesFile`。检测与隔离索引比较强制使用 `core.ignoreCase=false`，因此 `build/` 等规则不能隐藏 `BuIlD/undelivered.txt`，且不修改用户配置。已暂存内容使用只读索引比较，生成源码证据时不重建真实子模块索引的缓存树，也禁用可选的索引刷新写入。
+- 子模块已跟踪的普通文件还会绕过 attributes 和 clean filters，将原始字节与 HEAD blob 比较，防止本地转换隐藏未交付内容。支持边界是工作树字节必须与提交一致；依赖换行规范化、编码转换或 smudge filters 才能匹配提交的子模块会阻止验收。
+- 子模块已提交的符号链接必须保留符号链接类型，且 `readlink` 原始目标字节必须与 HEAD blob 一致。`core.symlinks=false` 将链接检出或替换成普通文件时会阻止验收；需要在支持符号链接的工作树中验证。
+- 干净且已提交的子模块 HEAD 变更通过父仓库 gitlink 纳入源码树并可正常交付；提交时会显式暂存已检出的 gitlink，不受子模块 ignore 配置影响。未初始化的子模块路径必须不存在或为空，残留文件会阻止验收；若验收命令需要子模块内容，应由项目的 `[[setup]]` 显式初始化。
 - 检查过程中改变代码、HEAD、base、配置或任务要求，或提交时证据已过期，均拒绝提交。目标 base 前进后，先将其集成到任务分支，再运行检查；DevRelay 不自动解决冲突或重置工作。
 - 验证结果、命令日志、执行时间和 Codex JSON 事件保存在 Git common directory 下的 `devrelay/`，跨工作树共享 SQLite 状态和单 worker 锁。每次使用新的记录目录。
-- `devrelay resume ID` 保留工作树并继续该任务记录的明确 Codex 会话；不使用 `--last`。超时会终止命令进程组；检测到残留进程时阻止新 worker，直到进程结束。
+- DevRelay 在启动 Codex 前保存本次运行目录和事件日志位置，并在首次收到有效 `thread.started` 时立即保存该任务的会话 ID。`devrelay resume ID` 会在调用 Codex 前校验已保存 ID 的格式及跨任务归属，并核对上次日志，再用该明确 ID 继续同一会话，绝不使用 `--last`；空的启动前日志可安全重试，而不完整、无效或冲突的会话事件会阻止恢复。
+- Ctrl+C 或控制器崩溃不会把恢复静默切换到新会话。超时或中断会先向整个命令进程组发送 SIGTERM，宽限期后仍有非僵尸成员则发送 SIGKILL 并有界等待。确认进程组退出后才清除 `active_process`；无法终止时保留标记并阻止新 worker。每次启动命令（包括同一 worker 内的自动重试）前也会检查旧标记；旧组仍存活或有界探测无法确认退出时拒绝启动，保留原标记。
+- 会话归属包括已保存 ID、各任务运行目录中留存的实现事件（包括控制器崩溃后尚未保存到状态的 ID）以及审查回执和事件；验收或审查失效后也不会遗忘归属。实现恢复拒绝其他任务的会话，也拒绝本任务或其他任务的审查会话；证据越界或不可读取时阻止恢复，不读取仓库所属运行目录之外的文件。
+- 归属提取保留所有已知会话，但不对其他任务做完整回合验收：明确识别为非会话消息的截断尾部不会阻止无关任务恢复，损坏或含义不明的会话事件仍会阻止恢复。恢复任务自身的日志仍完整校验，不会绕过不完整或冲突事件。
+- Codex JSONL 事件只按 LF 换行分割，分块输出也会保留消息内的 Unicode 分隔符；stderr 诊断单独留存，不作为 JSON 事件解析。
+- 新的实现运行在启动前记录 `events.jsonl.format.json`，恢复时仍严格解析 stdout JSONL。没有格式标记和独立 stderr 日志的旧日志可包含普通 stderr 诊断；恢复时忽略这些文字，但仍拒绝损坏的 JSON/会话事件和冲突 ID。旧日志若只有诊断且没有已保存会话，会阻止恢复而不是静默创建新会话。
 - 项目验收命令是信任边界。不要把“命令退出 0”当作业务正确或独立审查。官方引擎、评分规则和发布条件由项目自己的约定控制。
+- 每条验收命令结束后、运行下一条命令之前及最终收尾时，均重新检查源码、HEAD 和递归子模块洁净状态；合并后验收在 setup 完成后及逐条验收命令之间采用同样检查。子模块变脏会立即使验证失败，保留修改与命令证据，不允许后续命令恢复文件来掩盖变更。这是命令边界的快照检查，不会持续监控在同一条命令内部修改后又恢复的内容。
 
 ## 开发与验证
 
@@ -169,5 +187,7 @@ git diff --check
 ```
 
 测试使用临时真实 Git 仓库与假的 Codex CLI，覆盖工作树隔离、失败修复、精确会话恢复、源码与 base 漂移、提交门禁、审查、CI 等待、squash 合并和合并后验收。PR 测试向临时本地 bare 仓库真实推送，以测试替身模拟 GitHub API、请求超时与恢复。它们不调用模型、不推送公开仓库；真实项目还需要自己的运行验收。
+
+非 UTF-8 文件名端到端测试在支持的文件系统上运行；只有创建无效 UTF-8 名称明确返回 `EILSEQ` 时才报告平台 skip，不代表产品验收通过。Git tree/index 字节路径回归无需检出这些名称，始终运行；权限错误和产品错误仍会使测试失败。
 
 实现说明见 [架构](docs/architecture.md)。Codex 接口依据 [OpenAI 官方非交互执行文档](https://developers.openai.com/codex/noninteractive)。

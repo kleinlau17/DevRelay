@@ -7,7 +7,8 @@ import uuid
 from . import codex
 from .config import load
 from .errors import RelayError
-from .git import git, has_ref, is_ancestor, source_tree, validate_remote, worktrees
+from .git import (git, has_ref, is_ancestor, pinned_transport, remote_tracking_ref,
+                  source_tree, stage_submodule_gitlinks, validate_remote, worktrees)
 from .process import execute
 from .providers import authorized, gh, gh_json, queue_report, snapshot, task_id
 from .state import now
@@ -112,6 +113,8 @@ def verify(config, state, identifier):
         for entry in config.data["checks"]:
             receipt = execute(state, entry["argv"], path, directory / (entry["id"] + ".log"), entry["timeout_seconds"])
             results.append({"id": entry["id"], **receipt})
+            if source_tree(path) != before or git(path, "rev-parse", "HEAD") != head:
+                raise RelayError("Source or HEAD changed during verification; rerun the checks")
         assert_config(config)
         if source_tree(path) != before or git(path, "rev-parse", "HEAD") != head:
             raise RelayError("Source or HEAD changed during verification; rerun the checks")
@@ -120,6 +123,8 @@ def verify(config, state, identifier):
         latest = authorized(config, state, identifier)
         if latest["body"] != fresh["body"] or latest["title"] != fresh["title"]:
             raise RelayError("Task requirements changed during verification; resume and revalidate")
+        if source_tree(path) != before or git(path, "rev-parse", "HEAD") != head:
+            raise RelayError("Source or HEAD changed while finalizing verification; rerun the checks")
     except RelayError as error:
         task.update(status="failed", error=str(error))
         state.save(task)
@@ -189,7 +194,6 @@ def run_task(config, state, identifier=None, *, resume=False, submit_after=False
             before_head = git(task["worktree"], "rev-parse", "HEAD")
             result = codex.implement(config, state, task, directory, feedback)
             task["summary"] = result["summary"]
-            task["last_run"] = str(directory)
             if git(task["worktree"], "rev-parse", "HEAD") != before_head:
                 raise RelayError("Codex changed Git history; preserve its work and review before continuing")
             assert_config(config)
@@ -241,12 +245,13 @@ def submit(config, state, identifier, *, local=False):
     if current != record["head_sha"] and current != task.get("head_sha"):
         raise RelayError("HEAD changed since verification; rerun checks")
     git(path, "add", "-A")
+    stage_submodule_gitlinks(path)
     if git(path, "write-tree") != record["source_tree"]:
         raise RelayError("Staged source differs from verified source")
-    if git(path, "diff", "--cached", "--name-only"):
+    if git(path, "diff", "--cached", "--name-only", "--ignore-submodules=none"):
         git(path, "commit", "-m", f"devrelay: {fresh['title']} ({identifier})")
     head = git(path, "rev-parse", "HEAD")
-    if git(path, "rev-parse", "HEAD^{tree}") != record["source_tree"]:
+    if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD^{tree}") != record["source_tree"]:
         raise RelayError("Commit hooks changed verified content; rerun checks")
     if not int(git(path, "rev-list", "--count", f"{config.base_ref}..HEAD")):
         raise RelayError("No implementation commit to submit")
@@ -258,7 +263,23 @@ def submit(config, state, identifier, *, local=False):
     authorized(config, state, identifier)
     if base_commit(config) != record["base_sha"]:
         raise RelayError("Base changed before push; integrate it and rerun verification")
-    git(path, "push", "--set-upstream", config.remote, task["branch"])
+    if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
+        raise RelayError("Source or HEAD changed before push; rerun verification")
+    push_url = validate_remote(config, path)
+    ref = "refs/heads/" + task["branch"]
+    # Pin the exact validated endpoint in the transport invocation. A remote
+    # name could fan out, while a later rewrite could redirect a plain URL.
+    tracking_ref = remote_tracking_ref(path, config.remote, task["branch"])
+    with pinned_transport(path, push_url) as (target, env):
+        git(path, "push", target, ref + ":" + ref, env=env)
+    if tracking_ref is not None:
+        git(path, "update-ref", tracking_ref, head)
+    # Match `push --set-upstream` without requiring the task branch to be
+    # covered by remote.<name>.fetch (single-branch clones commonly are not).
+    git(path, "config", "branch." + task["branch"] + ".remote", config.remote)
+    git(path, "config", "branch." + task["branch"] + ".merge", ref)
+    if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
+        raise RelayError("Source or HEAD changed during push; rerun verification before opening a PR")
     summary = task.get("summary") or "Implementation verified by configured project checks."
     check_lines = "\n".join(f"- `{item['id']}`: exit {item['returncode']}" for item in record["checks"])
     body = (f"{summary}\n\nVerification\n\n{check_lines}\n\n"

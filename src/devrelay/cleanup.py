@@ -6,7 +6,8 @@ import re
 import uuid
 
 from .errors import RelayError
-from .git import git, has_ref, is_ancestor, source_tree, validate_remote, worktrees
+from .git import (git, has_ref, is_ancestor, pinned_transport, remote_tracking_ref,
+                  source_tree, validate_remote, worktrees)
 from .runner import assert_config, base_commit
 from .state import now
 
@@ -32,8 +33,8 @@ def _tree(config, path, head, branch=None):
     return True
 
 
-def _remote_head(config, url, ref):
-    output = git(config.root, "ls-remote", url, ref)
+def _remote_head(config, url, ref, *, env=None):
+    output = git(config.root, "ls-remote", url, ref, env=env)
     if not output:
         return None
     fields = output.split()
@@ -71,7 +72,7 @@ def run(config, state, task):
     save()
     try:
         assert_config(config)
-        validate_remote(config)
+        push_url = validate_remote(config)
         base_commit(config)
         if (not is_ancestor(config.root, task["merge_sha"], config.base_ref)
                 or git(config.root, "rev-parse", task["merge_sha"] + "^{tree}") != proof["source_tree"]):
@@ -98,9 +99,8 @@ def run(config, state, task):
                       and Path(item["worktree"]).resolve() != task_path.resolve()]
             if others:
                 raise RelayError("Task branch is checked out in another worktree; preserved")
-            # A URL targets exactly one validated push endpoint, even with multiple push URLs configured.
-            push_url = git(config.root, "remote", "get-url", "--push", config.remote)
-            remote_head = _remote_head(config, push_url, ref)
+            with pinned_transport(config.root, push_url) as (target, env):
+                remote_head = _remote_head(config, target, ref, env=env)
             if remote_head is not None and remote_head != task["head_sha"]:
                 raise RelayError("Remote task branch advanced; preserved")
 
@@ -121,19 +121,21 @@ def run(config, state, task):
         if policy["cleanup_branches"]:
             def remote():
                 assert_config(config)
-                validate_remote(config)
-                current = _remote_head(config, push_url, ref)
-                if current is None:
-                    return "already_absent"
-                if current != task["head_sha"]:
-                    raise RelayError("Remote task branch advanced; preserved")
-                failure = None
-                try:
-                    git(config.root, "push", "--force-with-lease=" + ref + ":" + task["head_sha"], push_url, ":" + ref)
-                except RelayError as error:
-                    failure = error
-                if _remote_head(config, push_url, ref) is not None:
-                    raise failure or RelayError("Remote task branch still exists after deletion")
+                current_push_url = validate_remote(config)
+                with pinned_transport(config.root, current_push_url) as (target, env):
+                    current = _remote_head(config, target, ref, env=env)
+                    if current is None:
+                        return "already_absent"
+                    if current != task["head_sha"]:
+                        raise RelayError("Remote task branch advanced; preserved")
+                    failure = None
+                    try:
+                        git(config.root, "push", "--force-with-lease=" + ref + ":" + task["head_sha"],
+                            target, ":" + ref, env=env)
+                    except RelayError as error:
+                        failure = error
+                    if _remote_head(config, target, ref, env=env) is not None:
+                        raise failure or RelayError("Remote task branch still exists after deletion")
                 return "removed"
             step("remote_branch", remote)
 
@@ -150,8 +152,8 @@ def run(config, state, task):
 
             def tracking():
                 assert_config(config)
-                tracking_ref = "refs/remotes/" + config.remote + "/" + branch
-                if not has_ref(config.root, tracking_ref):
+                tracking_ref = remote_tracking_ref(config.root, config.remote, branch)
+                if tracking_ref is None or not has_ref(config.root, tracking_ref):
                     return "already_absent"
                 git(config.root, "update-ref", "--no-deref", "-d", tracking_ref, task["head_sha"])
                 return "removed"

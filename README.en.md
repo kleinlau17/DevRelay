@@ -83,7 +83,13 @@ devrelay submit 12
 
 `next` explains selection and exclusions without claiming work; it reads GitHub and fetches the base. `start` creates or recovers a worktree. `run` handles one task, recovering interrupted work first when no ID is given; failed or blocked work returns `needs_attention` until explicitly addressed. Codex implements in `.devrelay/worktrees/ID`; DevRelay runs configured checks. Failed checks feed back into the same saved Codex session within `max_attempts`. External blockers are retained.
 
-`submit` requires current verification evidence, commits, pushes and creates or updates a **draft PR**. `run --submit` combines the steps. By default delivery stops at draft; opt into review and merge below. PRs use `Refs #N`, preserving issue scope. DevRelay does not close whole issues, release, deploy or create background schedules.
+`submit` requires current verification evidence, commits, pushes and creates or updates a **draft PR**. `run --submit` combines the steps. A GitHub remote must resolve to exactly one fetch URL and one push URL, both targeting `project.repository`; SSH and HTTPS may be mixed. Multiple fetch/push URLs are rejected instead of allowing Git push fan-out. To bind the actual endpoint, `insteadOf` / `pushInsteadOf` URL rewrites affecting that remote are also rejected explicitly; configure the GitHub URLs directly. Git configuration is validated from the worktree that performs each transport, so branch- or path-conditional `includeIf` configuration cannot bypass the check. Submission and cleanup use an absolute-path transport argument that cannot select a named remote, bound to the validated URL in the same Git invocation. Neither a rewrite nor a URL-named remote alias added after validation can redirect or fan out the transport; existing credential and CA settings remain available. Submission records the configured remote/merge tracking settings directly even for single-branch clones, and updates the tracking reference selected by the existing fetch refspec rather than assuming `refs/remotes/<remote>/<branch>`. Cleanup uses the same mapping. By default delivery stops at draft; opt into review and merge below. PRs use `Refs #N`, preserving issue scope. DevRelay does not close whole issues, release, deploy or create background schedules.
+
+When a remote targets a different repository, the error identifies the fetch or push URL with `does not match project.repository`; correct that remote before retrying GitHub operations.
+
+Tracking updates after push and tracking cleanup use the first matching positive fetch refspec. Negative fetch refspecs restrict fetching, but do not cancel this tracking mapping.
+
+Transport preserves Git's `GIT_CONFIG_NOSYSTEM` boolean policy: `0`/`false` keeps the original system settings, while `1`/`true` disables them. Other Git boolean spellings are supported; invalid values stop the transport.
 
 ## Automatic review and merge
 
@@ -139,11 +145,33 @@ Adding a local task explicitly approves it; a missing dependency declaration bec
 
 ## Evidence and recovery
 
-Verification binds source tree, HEAD, target base, configuration and task requirements. Temporary Git indexes hash tracked changes and non-ignored new files without modifying the original index. Source/history/base/configuration/requirements drift invalidates evidence. Integrate a newer base manually and rerun checks; existing work is never reset automatically.
+Verification binds source tree, HEAD, target base, configuration and task requirements. Temporary Git indexes hash tracked changes and non-ignored new files without modifying the original index. Checked-out submodules are inspected recursively for tracked changes and non-ignored untracked files. Isolated-index comparisons neutralize `assume-unchanged`, `skip-worktree`, `core.fileMode=false`, `submodule.*.ignore`, `.gitmodules` ignore settings and status configuration that could hide those changes. Any dirty submodule blocks acceptance, submission and automatic review/merge gates. DevRelay never commits, cleans, resets or updates submodule work.
 
-SQLite state, a repository-wide worker lock, command logs, resource receipts, verification and Codex JSON events live under `devrelay/` in the Git common directory. Every attempt gets a new directory. `devrelay resume ID` uses that task's exact session ID, never `--last`. Timeouts terminate process groups; surviving descendants prevent another worker from starting until they finish.
+All Git operations that generate source evidence disable local replacement refs and inspect actual commit objects, leaving replacement refs untouched. NUL-delimited paths are parsed as bytes, supporting non-UTF-8 filenames and carriage returns where the filesystem permits them.
+
+Untracked submodule files are detected using only `.gitignore` rules, without local `info/exclude` or `core.excludesFile` rules. Detection and isolated-index comparisons force `core.ignoreCase=false`, so a rule such as `build/` cannot hide `BuIlD/undelivered.txt`; user configuration is left unchanged. Staged content is compared using a read-only index operation; source evidence does not rebuild cache trees in real submodule indexes and disables optional index refresh writes.
+
+Tracked regular files in submodules also have their raw bytes compared against HEAD blobs, bypassing attributes and clean filters so local transformations cannot hide undelivered content. Submodule worktree bytes must match the commit; checkouts that require line-ending normalization, encoding conversion or smudge filters to match committed blobs block acceptance.
+
+Committed symlinks in submodules must remain symlinks, and their raw `readlink` target bytes must match HEAD blobs. Acceptance blocks when `core.symlinks=false` materializes a link as a regular file or hides such a replacement; verify in a worktree that supports symlinks.
+
+Clean committed submodule HEAD changes are included in the source tree through the parent gitlink and can be delivered normally; submission explicitly stages checked-out gitlinks independently of submodule ignore configuration. An uninitialized submodule path must be absent or empty; residual files block acceptance. Projects whose checks need submodule contents should initialize them explicitly in `[[setup]]`. Source/history/base/configuration/requirements drift invalidates evidence. Integrate a newer base manually and rerun checks; existing work is never reset automatically.
+
+SQLite state, a repository-wide worker lock, command logs, resource receipts, verification and Codex JSON events live under `devrelay/` in the Git common directory. Every attempt gets a new directory. DevRelay records that directory and event-log path before launching Codex, then persists the task's session ID as soon as it receives a valid `thread.started`. Before invoking Codex, `devrelay resume ID` validates the saved ID's format and cross-task ownership as well as the previous log, then resumes that exact session, never `--last`. An empty pre-launch log is safe to retry; incomplete, invalid or conflicting session events block recovery.
+
+Ctrl+C and controller crashes cannot silently switch recovery to a new session. On timeout or interruption, DevRelay sends SIGTERM to the entire command process group, then sends SIGKILL if non-zombie members survive the bounded grace period and waits a bounded time for exit. It clears `active_process` only after the group is gone; a group that cannot be stopped retains the marker and blocks another worker. Every command launch, including automatic retries within the same worker, checks the previous marker. If that group is alive or a bounded inspection cannot confirm its exit, the launch is refused and the original marker is preserved.
+
+Session ownership includes saved IDs, retained implementation events (including uncheckpointed IDs after a controller crash), and review receipts/events under each task's run directory, even after acceptance or review is invalidated. Implementation recovery rejects other tasks' sessions and review sessions, including its own; unsafe or unreadable evidence blocks recovery without reading outside the repository's owned run directories.
+
+Ownership harvesting retains every known session reservation without validating other tasks' entire turns. A clearly identified truncated non-session message does not block unrelated recovery; damaged or ambiguous session events still block it. The recovering task's own log remains fully validated, so its incomplete or conflicting events cannot be bypassed.
+
+Codex JSONL events are separated only at LF boundaries, preserving Unicode separators inside messages even with chunked output. Stderr diagnostics are retained separately and are not parsed as JSON events.
+
+New implementation runs record `events.jsonl.format.json` before launch and retain strict stdout JSONL parsing during recovery. Older unmarked logs without a separate stderr log may contain ordinary stderr diagnostics; recovery ignores that text but still rejects malformed JSON/session events and conflicting IDs. A diagnostics-only legacy log without a saved session blocks recovery rather than silently starting a new session.
 
 Acceptance commands are trusted project code. A zero exit code does not establish business correctness or independent review. Projects control scoring rules, official engine requirements and delivery authorization.
+
+Source, HEAD and recursive submodule cleanliness are checked after each acceptance command, before the next command can run, as well as at finalization. Post-merge acceptance applies the same checks after setup and between acceptance commands. A dirty submodule fails verification immediately, retaining its changes and command evidence; a later command cannot restore it to hide the mutation. These are command-boundary snapshots, not continuous monitoring of changes restored within a single command.
 
 ## Develop
 
@@ -157,3 +185,5 @@ git diff --check
 ```
 
 Tests use real temporary Git repositories and a fake Codex CLI. Delivery tests push and squash-merge in temporary repositories, run fresh post-merge checks, and mock GitHub review/CI APIs and timeout recovery. They do not call models or push public repositories. Real target projects still require their own acceptance. See [architecture](docs/architecture.md) and [official Codex non-interactive documentation](https://developers.openai.com/codex/noninteractive).
+
+Non-UTF-8 filename end-to-end cases run on supporting filesystems. Only fixture creation that explicitly rejects an invalid UTF-8 name with `EILSEQ` reports a platform skip, which is not successful product acceptance. Git tree/index byte-path regressions run without checking out these names on every platform; permission and product errors remain test failures.
