@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from devrelay.codex import build_command
 from devrelay.config import load
@@ -17,7 +17,7 @@ from devrelay.git import _gitlink_paths, _isolated_source_tree, source_tree
 from devrelay.process import execute, terminate
 from devrelay.providers import add_local, queue_report, snapshot
 from devrelay.runner import complete_local, run_task, start, submit, verify
-from devrelay.state import State
+from devrelay.state import State, group_alive
 
 from helpers import RepositoryTest
 
