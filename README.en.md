@@ -4,7 +4,7 @@ English | [简体中文](README.md)
 
 Move explicit development tasks to verified pull requests and optional automatic merges with Codex and a small project configuration.
 
-DevRelay owns task selection, Git worktrees, Codex execution, acceptance evidence and PR delivery. Projects own setup commands and acceptance rules. Version 0.3 supports macOS / Linux, Python 3.11+ and Git, with no third-party runtime dependencies.
+DevRelay owns task selection, Git worktrees, Codex execution, acceptance evidence and PR delivery. Projects own setup commands and acceptance rules. Version 0.4 supports macOS / Linux, Python 3.11+ and Git, with no third-party runtime dependencies.
 
 ## Install and onboard
 
@@ -25,7 +25,7 @@ devrelay --project /path/to/project doctor
 
 Initialization detects GitHub origin, the default branch, Node package managers and common scripts, Python installation, Cargo and Go checks. It creates TOML configuration and appends runtime ignores (including Python environments and installation artifacts) without overwriting existing configuration or AGENTS.md. It does not install packages or call a model. Review watch modes, service requirements and actual business acceptance. Python test frameworks are not guessed; configure the real runner.
 
-Commands use argument arrays, with no shell expansion. Setup runs in the task worktree. At least one acceptance command is required before run/check/submit. Commit the project configuration and ignore rules. Empty repositories need an initial commit. Codex uses the user's default model unless `codex.model` or `codex.profile` is set. See [configuration](examples/config.toml).
+Commands use argument arrays, with no shell expansion. Setup runs in the task worktree. At least one acceptance command is required before run/check/submit. Commit the project configuration, ignore rules and generated issue templates. Empty repositories need an initial commit. Codex uses the user's default model unless `codex.model` or `codex.profile` is set. See [configuration](examples/config.toml).
 
 ```toml
 [project]
@@ -43,6 +43,32 @@ argv = ["python3", "-m", "unittest", "discover", "-s", "tests"]
 ```
 
 ## GitHub queue
+
+### Labels and issue templates
+
+For GitHub projects, first-time `init` uses authenticated `gh` to create missing repository labels and generates `.github/ISSUE_TEMPLATE/devrelay-{bug,task,experiment,plan}.md`. Label creation requires the corresponding repository permission. Local onboarding remains offline. Labels are created on GitHub immediately; templates are local files and appear in GitHub's issue chooser after being committed to the repository default branch. Initialization does not commit or push files.
+
+Defaults follow DexLab's management rules:
+
+| Dimension | Labels |
+|---|---|
+| Primary work type | `bug`, `enhancement`, `documentation`, `experiment`, `infrastructure` |
+| Relevant area | `area:backend`, `area:benchmark`, `area:cloth`, `area:contact`, `area:evaluation`, `area:hardware` |
+| Exactly one priority | `priority:P0` (urgent fixes), `priority:P1` (core delivery), `priority:P2` (extensions) |
+| Authorization | `auto:approved` |
+| Blockers | `blocked`, `needs-input` |
+
+Templates record evidence, scope, acceptance commands, one `Depends on: none` declaration, resources and recovery conditions. Bug, task and experiment templates pre-apply only the work type. The plan template tracks bounded child deliveries and explicitly excludes execution authorization on the parent. **Generated templates never automatically apply `auto:approved`, a configured authorization label, or a priority to new issues.** Creating a repository label does not authorize an issue. Maintainers separately select one priority and grant execution authorization after confirming the scope and acceptance; dependencies and blockers still apply.
+
+Existing label names, colors and descriptions, template files and other forms are preserved. Preserved project templates retain their own defaults and should be reviewed separately. Add project-specific area labels as needed. For already-onboarded projects or recovery after network/permission errors:
+
+```bash
+devrelay --project /path/to/project init --sync-github
+```
+
+This uses existing configuration without overwriting configuration, ignore rules or templates, adding only missing items. Custom `[queue]` authorization, priority and blocker labels are honored and described in generated templates; a type label reused as a queue control is not pre-applied. Uncertain creation responses are read back before continuing. Only complete template files are published, so interrupted writes can recover missing files. Required archived labels or queue-label spelling mismatches require a maintainer to restore the label or align configuration.
+
+### Selection and delivery
 
 Tasks must be open, carry `auto:approved`, exactly one `priority:P0/P1/P2`, no `blocked` / `needs-input`, and exactly one declaration: `Depends on: none` or `Depends on: #12, #27`. Dependencies must be closed and linked to merged PRs whose merge commits are ancestors of the refreshed target branch. Existing worktrees and explicitly associated open PRs prevent duplicate claims.
 

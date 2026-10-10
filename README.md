@@ -4,7 +4,7 @@
 
 通过少量项目配置，让 Codex 从明确任务推进到经过验证、可审查的 PR，并按项目授权自动合并。
 
-DevRelay 管理任务队列、隔离工作树、Codex 执行、验收记录和 PR 提交。项目负责定义安装命令与验收规则。首版支持 macOS / Linux、Python 3.11+ 和 Git；核心没有第三方运行依赖。
+DevRelay 管理任务队列、隔离工作树、Codex 执行、验收记录和 PR 提交。项目负责定义安装命令与验收规则。0.4 版支持 macOS / Linux、Python 3.11+ 和 Git；核心没有第三方运行依赖。
 
 ## 安装
 
@@ -44,7 +44,31 @@ id = "test"
 argv = ["python3", "-m", "unittest", "discover", "-s", "tests"]
 ```
 
-将项目配置与必要忽略规则纳入项目版本管理，再从主 checkout 使用 DevRelay。新建的空仓库需要先有初始提交。模型默认沿用用户 Codex 配置，可显式设置 `codex.model` / `codex.profile`。
+将项目配置、必要忽略规则及生成的 Issue 模板纳入项目版本管理，再从主 checkout 使用 DevRelay。新建的空仓库需要先有初始提交。模型默认沿用用户 Codex 配置，可显式设置 `codex.model` / `codex.profile`。
+
+### GitHub 标签与 Issue 模板
+
+GitHub 项目首次 `init` 会使用已认证的 `gh` 补齐仓库标签，并生成 `.github/ISSUE_TEMPLATE/devrelay-{bug,task,experiment,plan}.md`。需要对该仓库创建标签的权限；本地模式仍完全离线。标签直接创建在 GitHub，模板写入本地，提交到仓库默认分支后才会出现在新建 Issue 页面。初始化不会替你提交或推送文件。
+
+默认标签沿用 DexLab 的管理规则：
+
+| 维度 | 标签 |
+|---|---|
+| 主要任务类型 | `bug`、`enhancement`、`documentation`、`experiment`、`infrastructure` |
+| 相关范围 | `area:backend`、`area:benchmark`、`area:cloth`、`area:contact`、`area:evaluation`、`area:hardware` |
+| 唯一优先级 | `priority:P0`（首要修复）、`priority:P1`（当前核心交付）、`priority:P2`（后续扩展） |
+| 执行授权 | `auto:approved` |
+| 阻塞 | `blocked`、`needs-input` |
+
+模板包含问题与证据、交付范围、验收与命令、唯一的 `Depends on: none` 声明、资源与恢复条件。Bug、工程任务、实验模板只预设类型标签；总体计划模板用于拆分和跟踪子任务，明确要求不给父任务执行授权。**任何生成的模板都不自动给新 Issue 加 `auto:approved` 或配置的授权标签，也不自动设优先级。** 创建仓库标签本身不授权任何 Issue；维护者确认任务后另行设置一个优先级及授权。依赖、阻塞和验收仍需满足。
+
+已有标签保留名称、颜色和描述，已有模板文件与其他表单不覆盖；保留的项目模板继续使用项目自己的默认标签，维护者应单独核对。可以自行添加项目领域标签。对于已经接入的项目或网络/权限错误后的补齐，运行：
+
+```bash
+devrelay --project /path/to/project init --sync-github
+```
+
+该命令使用已有配置，不覆盖配置、忽略规则或模板；仅补齐缺失项。若自定义了 `[queue]`，按配置补齐授权、优先级及阻塞标签，并在模板中说明；类型标签与队列控制标签重名时不预设该类型。调用中断后先回读标签再恢复，避免重复创建或覆盖；模板只发布完整文件，写入失败后可补齐缺失文件。已归档的必需标签或大小写与队列配置不一致的名称会报告问题，交由维护者恢复标签或调整配置。
 
 ## GitHub Issue 队列
 
