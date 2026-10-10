@@ -258,7 +258,14 @@ def submit(config, state, identifier, *, local=False):
     authorized(config, state, identifier)
     if base_commit(config) != record["base_sha"]:
         raise RelayError("Base changed before push; integrate it and rerun verification")
-    git(path, "push", "--set-upstream", config.remote, task["branch"])
+    push_url = validate_remote(config)
+    ref = "refs/heads/" + task["branch"]
+    # Push the exact validated endpoint. A remote name could fan out to a
+    # second pushurl added after validation.
+    git(path, "push", push_url, ref + ":" + ref)
+    tracking_ref = "refs/remotes/" + config.remote + "/" + task["branch"]
+    git(path, "update-ref", tracking_ref, head)
+    git(path, "branch", "--set-upstream-to", config.remote + "/" + task["branch"], task["branch"])
     summary = task.get("summary") or "Implementation verified by configured project checks."
     check_lines = "\n".join(f"- `{item['id']}`: exit {item['returncode']}" for item in record["checks"])
     body = (f"{summary}\n\nVerification\n\n{check_lines}\n\n"

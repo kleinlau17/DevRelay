@@ -95,10 +95,45 @@ class ConfigurationTests(RepositoryTest):
     def test_push_remote_must_match_the_configured_repository(self):
         self.configure(provider="github")
         self.git("remote", "add", "origin", "https://github.com/example/project.git")
-        validate_remote(self.config)
+        self.assertEqual(validate_remote(self.config), "https://github.com/example/project.git")
         self.git("remote", "set-url", "--push", "origin", "https://github.com/example/wrong-project.git")
-        with self.assertRaisesRegex(RelayError, "does not match"):
+        with self.assertRaisesRegex(RelayError, "does not resolve"):
             validate_remote(self.config)
+        self.git("remote", "set-url", "--push", "origin", "https://github.com/example/project.git")
+        self.git("remote", "set-url", "origin", "https://github.com/example/wrong-project.git")
+        with self.assertRaisesRegex(RelayError, "Git fetch URL"):
+            validate_remote(self.config)
+
+    def test_remote_rejects_multiple_fetch_or_push_urls(self):
+        self.configure(provider="github")
+        self.git("remote", "add", "origin", "git@github.com:example/project.git")
+        self.git("remote", "set-url", "--add", "--push", "origin",
+                 "https://github.com/example/project.git")
+        self.git("remote", "set-url", "--add", "--push", "origin",
+                 "git@github.com:example/project.git")
+        with self.assertRaisesRegex(RelayError, "exactly one.*push fan-out"):
+            validate_remote(self.config)
+        self.git("remote", "set-url", "--delete", "--push", "origin",
+                 "git@github.com:example/project.git")
+        self.git("remote", "set-url", "--add", "origin",
+                 "https://github.com/example/project.git")
+        with self.assertRaisesRegex(RelayError, "exactly one"):
+            validate_remote(self.config)
+
+    def test_remote_validates_resolved_url_rewrites(self):
+        self.configure(provider="github")
+        original = "https://github.com/example/project.git"
+        self.git("remote", "add", "origin", original)
+        self.git("config", "url.https://github.com/example/other.git.insteadOf", original)
+        with self.assertRaisesRegex(RelayError, "URL rewrite"):
+            validate_remote(self.config)
+
+    def test_fetch_and_push_protocols_may_differ_for_the_same_repository(self):
+        self.configure(provider="github")
+        self.git("remote", "add", "origin", "git@github.com:example/project.git")
+        self.git("remote", "set-url", "--push", "origin",
+                 "https://github.com/example/project.git")
+        self.assertEqual(validate_remote(self.config), "https://github.com/example/project.git")
 
     def test_delivery_configuration_is_strict_and_github_only(self):
         self.configure()

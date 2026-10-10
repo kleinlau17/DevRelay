@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from devrelay.errors import RelayError
+from devrelay.git import validate_remote as real_validate_remote
 from devrelay.runner import run_task, submit
 
 from helpers import RepositoryTest
@@ -33,8 +34,8 @@ class GitHubDeliveryFixture(RepositoryTest):
         # Git transport is real and confined to the temporary bare repository.
         # Mock only the GitHub control plane and its production hostname check.
         stack.enter_context(patch("devrelay.providers.validate_remote"))
-        stack.enter_context(patch("devrelay.runner.validate_remote"))
-        stack.enter_context(patch("devrelay.cleanup.validate_remote"))
+        stack.enter_context(patch("devrelay.runner.validate_remote", return_value=str(self.remote)))
+        stack.enter_context(patch("devrelay.cleanup.validate_remote", return_value=str(self.remote)))
         stack.enter_context(patch("devrelay.providers.gh_json", side_effect=self.inventory))
         stack.enter_context(patch("devrelay.runner.gh_json", side_effect=self.pull_read))
         stack.enter_context(patch("devrelay.runner.gh", side_effect=self.pull_write))
@@ -77,6 +78,12 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
         self.assertEqual(task["status"], "pr_open")
         pushed = subprocess.check_output(["git", "--git-dir", str(self.remote), "rev-parse", task["branch"]], text=True).strip()
         self.assertEqual(pushed, task["head_sha"])
+        self.assertEqual(self.git("config", "--get", "branch." + task["branch"] + ".remote",
+                                  cwd=task["worktree"]), "origin")
+        self.assertEqual(self.git("config", "--get", "branch." + task["branch"] + ".merge",
+                                  cwd=task["worktree"]), "refs/heads/" + task["branch"])
+        self.assertEqual(self.git("rev-parse", "refs/remotes/origin/" + task["branch"]),
+                         task["head_sha"])
         self.assertIn("--draft", self.create_argv)
         self.assertIn("Refs #12", self.last_body)
         self.assertIn(task["verification"]["source_tree"], self.last_body)
@@ -109,6 +116,22 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
         self.assertEqual(self.create_count, 0)
         refs = subprocess.check_output(["git", "--git-dir", str(self.remote), "for-each-ref", "--format=%(refname)"] , text=True)
         self.assertNotIn("devrelay/task-12", refs)
+
+    def test_multiple_real_push_targets_are_rejected_before_either_receives_the_branch(self):
+        self.implement()
+        extra = Path(self.temporary.name) / "extra.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(extra)], check=True)
+        self.git("remote", "set-url", "--add", "--push", "origin", str(self.remote))
+        self.git("remote", "set-url", "--add", "--push", "origin", str(extra))
+        with (patch("devrelay.runner.validate_remote", side_effect=real_validate_remote),
+              self.state.lock(), self.assertRaisesRegex(RelayError, "exactly one")):
+            submit(self.config, self.state, "12")
+        branch = "refs/heads/devrelay/task-12"
+        for remote in (self.remote, extra):
+            refs = subprocess.check_output(
+                ["git", "--git-dir", str(remote), "for-each-ref", "--format=%(refname)"], text=True
+            )
+            self.assertNotIn(branch, refs)
 
 
 if __name__ == "__main__":

@@ -61,13 +61,50 @@ def github_slug(url):
     return f"{match[1]}/{match[2]}" if match else ""
 
 
+def _config_values(root, key):
+    try:
+        result = subprocess.run(["git", "config", "--get-all", key], cwd=root, text=True,
+                                capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RelayError(f"Cannot inspect Git configuration: {error}") from error
+    if result.returncode == 1:
+        return []
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RelayError(f"git failed ({result.returncode}): {detail}")
+    return result.stdout.splitlines()
+
+
 def validate_remote(config):
     if config.provider != "github":
-        return
-    for argv in (("remote", "get-url", config.remote), ("remote", "get-url", "--push", config.remote)):
-        slug = github_slug(git(config.root, *argv))
+        return None
+    raw_fetch = _config_values(config.root, f"remote.{config.remote}.url")
+    raw_push = _config_values(config.root, f"remote.{config.remote}.pushurl") or raw_fetch
+    raw_urls = {"fetch": raw_fetch, "push": raw_push}
+    urls = {}
+    for kind, argv in (("fetch", ("remote", "get-url", "--all", config.remote)),
+                       ("push", ("remote", "get-url", "--push", "--all", config.remote))):
+        # `remote get-url` expands url.*.insteadOf and pushInsteadOf, so these
+        # are the endpoints Git would actually use rather than just raw config.
+        urls[kind] = git(config.root, *argv).splitlines()
+    if any(len(items) != 1 for group in (raw_urls, urls) for items in group.values()):
+        raise RelayError(
+            "Git remote must resolve to exactly one fetch URL and one push URL; "
+            "multiple URLs and push fan-out are not allowed"
+        )
+    if raw_urls != urls:
+        raise RelayError(
+            "Git URL rewrites are not allowed for the configured remote; "
+            "use one explicit GitHub fetch URL and push URL"
+        )
+    for kind, items in urls.items():
+        slug = github_slug(items[0])
         if slug.casefold() != config.repo.casefold():
-            raise RelayError("Git fetch/push remote does not match project.repository; correct the configuration before proceeding")
+            raise RelayError(
+                f"Git {kind} URL does not resolve to project.repository; "
+                "correct the remote or URL rewrite before proceeding"
+            )
+    return urls["push"][0]
 
 
 def worktrees(root):
