@@ -103,22 +103,51 @@ def _system_config_path(root):
 
 @contextmanager
 def pinned_transport(root, url):
-    """Pin one transport URL ahead of mutable global/local rewrite rules."""
+    """Yield an alias-proof transport argument and its pinned Git environment."""
     root = Path(root)
     system_config = _system_config_path(root)
     with tempfile.TemporaryDirectory(prefix="devrelay-transport-") as temporary:
         path = Path(temporary) / "gitconfig"
+        # Git refuses remote configuration subsections beginning with '/'.
+        # An absolute argument therefore cannot select a URL-named remote,
+        # even if one is added after validation. Bind this non-existent path
+        # to the approved endpoint in the same invocation as the transport.
+        target = str((Path(temporary) / "endpoint").resolve())
         # System configuration is read before global, local, worktree and
         # command scopes. Git keeps the first equally long rewrite match, so
         # these exact self-mappings cannot be superseded by a later mutation.
         for name in ("insteadOf", "pushInsteadOf"):
-            command(["git", "config", "--file", str(path), "--add", f"url.{url}.{name}", url], root)
+            for source in (url, target):
+                command(["git", "config", "--file", str(path), "--add",
+                         f"url.{url}.{name}", source], root)
         if system_config is not None:
             command(["git", "config", "--file", str(path), "--add", "include.path",
                      str(system_config)], root)
         env = {**os.environ, "GIT_CONFIG_SYSTEM": str(path)}
         env.pop("GIT_CONFIG_NOSYSTEM", None)
-        yield env
+        yield target, env
+
+
+def remote_tracking_ref(root, remote, branch):
+    """Map a pushed branch using Git's first matching fetch refspec policy."""
+    ref = "refs/heads/" + branch
+    specs = _config_values(root, f"remote.{remote}.fetch")
+
+    def match(pattern):
+        return re.fullmatch(re.escape(pattern).replace(r"\*", "(.*)"), ref)
+
+    if any(match(spec[1:]) for spec in specs if spec.startswith("^")):
+        return None
+    for spec in specs:
+        if spec.startswith("^"):
+            continue
+        source, separator, destination = spec.removeprefix("+").partition(":")
+        found = match(source)
+        if separator and destination and found:
+            mapped = destination.replace("*", found[1]) if "*" in source else destination
+            git(root, "check-ref-format", mapped)
+            return mapped
+    return None
 
 
 def validate_remote(config, root=None):
@@ -139,9 +168,8 @@ def validate_remote(config, root=None):
             "Git remote must resolve to exactly one fetch URL and one push URL; "
             "multiple URLs and push fan-out are not allowed"
         )
-    # Submission passes the validated URL literally to `git push`. Resolve
-    # that exact argument in the same worktree too, so a chained or
-    # worktree-conditional rewrite cannot redirect the transport afterward.
+    # Inspect the literal URL in this worktree too, rejecting chained and
+    # conditional rewrites before constructing an alias-proof transport.
     literal_push_url = git(root, "ls-remote", "--get-url", urls["push"][0])
     if raw_urls != urls or literal_push_url != urls["push"][0]:
         raise RelayError(

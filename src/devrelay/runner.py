@@ -7,7 +7,8 @@ import uuid
 from . import codex
 from .config import load
 from .errors import RelayError
-from .git import git, has_ref, is_ancestor, pinned_transport, source_tree, validate_remote, worktrees
+from .git import (git, has_ref, is_ancestor, pinned_transport, remote_tracking_ref,
+                  source_tree, validate_remote, worktrees)
 from .process import execute
 from .providers import authorized, gh, gh_json, queue_report, snapshot, task_id
 from .state import now
@@ -262,10 +263,11 @@ def submit(config, state, identifier, *, local=False):
     ref = "refs/heads/" + task["branch"]
     # Pin the exact validated endpoint in the transport invocation. A remote
     # name could fan out, while a later rewrite could redirect a plain URL.
-    with pinned_transport(path, push_url) as env:
-        git(path, "push", push_url, ref + ":" + ref, env=env)
-    tracking_ref = "refs/remotes/" + config.remote + "/" + task["branch"]
-    git(path, "update-ref", tracking_ref, head)
+    tracking_ref = remote_tracking_ref(path, config.remote, task["branch"])
+    with pinned_transport(path, push_url) as (target, env):
+        git(path, "push", target, ref + ":" + ref, env=env)
+    if tracking_ref is not None:
+        git(path, "update-ref", tracking_ref, head)
     # Match `push --set-upstream` without requiring the task branch to be
     # covered by remote.<name>.fetch (single-branch clones commonly are not).
     git(path, "config", "branch." + task["branch"] + ".remote", config.remote)

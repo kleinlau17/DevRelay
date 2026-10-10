@@ -5,7 +5,7 @@ import unittest
 
 from devrelay.config import detect, initialize, load
 from devrelay.errors import RelayError
-from devrelay.git import git, github_slug, pinned_transport, validate_remote
+from devrelay.git import git, github_slug, pinned_transport, remote_tracking_ref, validate_remote
 
 from helpers import RepositoryTest
 
@@ -136,12 +136,64 @@ class ConfigurationTests(RepositoryTest):
         for remote in (allowed, unapproved):
             subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
         self.git("config", f"url.{unapproved}.pushInsteadOf", str(allowed))
-        with pinned_transport(self.root, str(allowed)) as env:
-            git(self.root, "push", str(allowed), "refs/heads/main:refs/heads/pinned", env=env)
+        with pinned_transport(self.root, str(allowed)) as (target, env):
+            git(self.root, "push", target, "refs/heads/main:refs/heads/pinned", env=env)
         self.assertEqual(self.git("--git-dir", str(allowed), "rev-parse", "refs/heads/pinned"),
                          self.git("rev-parse", "main"))
         refs = self.git("--git-dir", str(unapproved), "for-each-ref", "--format=%(refname)")
         self.assertNotIn("refs/heads/pinned", refs)
+
+    def test_transport_pin_ignores_url_named_alias_added_before_each_transport(self):
+        allowed = Path(self.temporary.name) / "alias-allowed.git"
+        unapproved = [Path(self.temporary.name) / f"alias-extra-{index}.git" for index in range(2)]
+        for remote in (allowed, *unapproved):
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        url = allowed.as_uri()
+        ref = "refs/heads/alias-probe"
+        head = self.git("rev-parse", "main")
+        with pinned_transport(self.root, url) as (target, env):
+            # Mutate after the pin is prepared too: neither the validated URL
+            # nor the actual argument may become a fan-out remote alias.
+            for alias in (url, target):
+                self.git("config", f"remote.{alias}.url", str(unapproved[0]))
+                for remote in unapproved:
+                    self.git("config", "--add", f"remote.{alias}.pushurl", str(remote))
+                self.git("config", "--add", f"url.{unapproved[0]}.insteadOf", alias)
+                self.git("config", "--add", f"url.{unapproved[0]}.pushInsteadOf", alias)
+            git(self.root, "push", target, "refs/heads/main:" + ref, env=env)
+            self.assertEqual(git(self.root, "ls-remote", target, ref, env=env).split(), [head, ref])
+            for remote in unapproved:
+                self.assertEqual(self.git("--git-dir", str(remote), "for-each-ref"), "")
+                self.git("push", str(remote), "refs/heads/main:" + ref)
+            # Deletion and readback must use the same bound endpoint, never
+            # the URL alias's first fetch URL or its two push URLs.
+            git(self.root, "push", "--force-with-lease=" + ref + ":" + head,
+                target, ":" + ref, env=env)
+            self.assertEqual(git(self.root, "ls-remote", target, ref, env=env), "")
+        for remote in unapproved:
+            self.assertEqual(self.git("--git-dir", str(remote), "rev-parse", ref), head)
+
+    def test_tracking_ref_follows_fetch_mapping_and_actual_upstream_sha(self):
+        remote = Path(self.temporary.name) / "tracking.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("config", "--replace-all", "remote.origin.fetch",
+                 "+refs/heads/main:refs/remotes/origin/main")
+        self.git("config", "--add", "remote.origin.fetch",
+                 "+refs/heads/devrelay/*:refs/remotes/custom/*")
+        branch = "devrelay/task-tracking"
+        self.git("branch", branch)
+        self.git("config", f"branch.{branch}.remote", "origin")
+        self.git("config", f"branch.{branch}.merge", "refs/heads/" + branch)
+        tracking = remote_tracking_ref(self.root, "origin", branch)
+        self.assertEqual(tracking, "refs/remotes/custom/task-tracking")
+        with pinned_transport(self.root, str(remote)) as (target, env):
+            git(self.root, "push", target, f"refs/heads/{branch}:refs/heads/{branch}", env=env)
+        self.git("update-ref", tracking, self.git("rev-parse", branch))
+        self.assertEqual(self.git("rev-parse", branch + "@{upstream}"), self.git("rev-parse", branch))
+        self.git("config", "--add", "remote.origin.fetch", "^refs/heads/devrelay/*")
+        self.assertIsNone(remote_tracking_ref(self.root, "origin", branch))
+        self.assertIsNone(remote_tracking_ref(self.root, "origin", "unmapped"))
 
     def test_remote_validation_uses_the_transport_worktree_context(self):
         self.configure(provider="github")

@@ -115,6 +115,22 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", task["branch"]),
                          task["head_sha"])
 
+    def test_custom_fetch_refspec_updates_the_actual_upstream(self):
+        self.git("config", "--replace-all", "remote.origin.fetch",
+                 "+refs/heads/main:refs/remotes/origin/main")
+        self.git("config", "--add", "remote.origin.fetch",
+                 "+refs/heads/devrelay/*:refs/remotes/custom/*")
+        self.implement()
+        # An existing mapped ref must advance too, rather than leaving a stale upstream.
+        self.git("update-ref", "refs/remotes/custom/task-12", self.git("rev-parse", "main"))
+        with self.state.lock():
+            task = submit(self.config, self.state, "12")
+        self.assertEqual(task["status"], "pr_open")
+        self.assertEqual(self.git("rev-parse", "@{upstream}", cwd=task["worktree"]), task["head_sha"])
+        self.assertEqual(self.git("rev-parse", "--symbolic-full-name", "@{upstream}",
+                                  cwd=task["worktree"]), "refs/remotes/custom/task-12")
+        self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/" + task["branch"]), "")
+
     def test_mismatched_pr_head_is_rejected(self):
         self.implement()
         self.readback_head = "0" * 40
@@ -193,6 +209,34 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
             ["git", "--git-dir", str(extra), "for-each-ref", "--format=%(refname)"], text=True
         )
         self.assertNotIn("refs/heads/" + task["branch"], refs)
+
+    def test_url_named_remote_added_after_validation_cannot_fan_out_real_push(self):
+        self.implement()
+        extras = [Path(self.temporary.name) / f"submit-alias-extra-{index}.git" for index in range(2)]
+        for extra in extras:
+            subprocess.run(["git", "init", "--bare", "-q", str(extra)], check=True)
+        url = self.remote.as_uri()
+        changed = False
+
+        def validate_then_alias(config, root=None):
+            nonlocal changed
+            if root is not None:
+                changed = True
+                self.git("config", f"remote.{url}.url", str(extras[0]))
+                for extra in extras:
+                    self.git("config", "--add", f"remote.{url}.pushurl", str(extra))
+                return url
+            return str(self.remote)
+
+        with patch("devrelay.runner.validate_remote", side_effect=validate_then_alias), self.state.lock():
+            task = submit(self.config, self.state, "12")
+        self.assertTrue(changed)
+        self.assertEqual(task["status"], "pr_open")
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", task["branch"]),
+                         task["head_sha"])
+        self.assertEqual(self.git("rev-parse", "@{upstream}", cwd=task["worktree"]), task["head_sha"])
+        for extra in extras:
+            self.assertEqual(self.git("--git-dir", str(extra), "for-each-ref"), "")
 
 
 if __name__ == "__main__":
