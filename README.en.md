@@ -151,6 +151,8 @@ Acceptance commands are trusted project code. A zero exit code does not establis
 
 This repository's `.devrelay/config.toml` enables self-maintenance: approved GitHub Issues are implemented in isolated worktrees, verified with the full test suite, submitted as draft PRs, and reviewed in fresh read-only AI sessions. Automatic merge is disabled; run `devrelay merge ID` after merging to perform post-merge acceptance and cleanup.
 
+The self-maintenance executor is pinned to `gpt-6.1-sol`, verified with Codex CLI `0.162.1`. Upgrade an older CLI if it rejects this model. Changing the model configuration requires fresh acceptance and review of existing tasks.
+
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 git diff --check
