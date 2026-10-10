@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ from unittest.mock import patch
 from devrelay.codex import build_command
 from devrelay.config import load
 from devrelay.errors import RelayError
-from devrelay.git import source_tree
+from devrelay.git import _gitlink_paths, source_tree
 from devrelay.process import execute
 from devrelay.providers import add_local, queue_report, snapshot
 from devrelay.runner import complete_local, run_task, start, submit, verify
@@ -151,6 +152,37 @@ class WorkflowTests(RepositoryTest):
         self.git("add", "-A")
         self.assertEqual(self.git("write-tree"), computed)
 
+    def _assert_source_snapshot_accepts_parent_filename(self, filename):
+        self.write_filename_fixture(self.root, filename, b"delivered\n")
+        self.git("add", "--", os.fsdecode(filename))
+        self.git("commit", "-qm", "add filename fixture")
+        index = self.root / ".git/index"
+        original = index.read_bytes()
+        self.assertEqual(source_tree(self.root), self.git("rev-parse", "HEAD^{tree}"))
+        self.assertEqual(index.read_bytes(), original)
+
+    def test_source_snapshot_accepts_non_utf8_parent_filenames(self):
+        self._assert_source_snapshot_accepts_parent_filename(b"parent-\xff.txt")
+
+    def test_source_snapshot_accepts_carriage_returns_in_parent_filenames(self):
+        self._assert_source_snapshot_accepts_parent_filename(b"parent-\r.txt")
+
+    def test_non_utf8_fixture_reports_eilseq_as_platform_skip(self):
+        with patch.object(Path, "write_bytes", side_effect=OSError(errno.EILSEQ, "Illegal byte sequence")):
+            with self.assertRaisesRegex(unittest.SkipTest, "EILSEQ.*end-to-end case unavailable"):
+                self.write_filename_fixture(self.root, b"parent-\xff.txt", b"delivered\n")
+
+    def test_filename_fixture_does_not_skip_permission_or_valid_utf8_errors(self):
+        for filename, error_number in ((b"parent-\xff.txt", errno.EPERM),
+                                       (b"parent-\xff.txt", errno.EACCES),
+                                       (b"parent-\r.txt", errno.EILSEQ)):
+            with self.subTest(filename=filename, errno=error_number):
+                error = OSError(error_number, "fixture creation failed")
+                with patch.object(Path, "write_bytes", side_effect=error):
+                    with self.assertRaises(OSError) as raised:
+                        self.write_filename_fixture(self.root, filename, b"delivered\n")
+                self.assertIs(raised.exception, error)
+
     def test_command_builder_preserves_configured_model_and_profile(self):
         self.config.data["codex"].update(model="requested-model", profile="requested-profile")
         command = build_command(self.config, Path("/log directory"), "session-for-this-task")
@@ -268,6 +300,105 @@ class SubmoduleWorkflowTests(RepositoryTest):
         with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
             verify(self.config, self.state, "fix-1")
         self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+
+    def _install_submodule_replacement(self, dependency):
+        original = self.git("rev-parse", "HEAD", cwd=dependency)
+        (dependency / "dependency.txt").write_text("fixed\n")
+        self.git("add", "dependency.txt", cwd=dependency)
+        self.git("commit", "-qm", "replacement content", cwd=dependency)
+        replacement = self.git("rev-parse", "HEAD", cwd=dependency)
+        self.git("checkout", "--detach", "-q", original, cwd=dependency)
+        self.git("replace", original, replacement, cwd=dependency)
+        self.git("read-tree", replacement, cwd=dependency)
+        (dependency / "dependency.txt").write_text("fixed\n")
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=dependency), original)
+        return original, replacement
+
+    def test_replacement_refs_cannot_hide_undelivered_submodule_source(self):
+        worktree, dependency = self._prepare([[sys.executable, "-c",
+            "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').read_text() == 'fixed\\n'"]])
+        original, replacement = self._install_submodule_replacement(dependency)
+        self.assertEqual(self.git("status", "--porcelain", cwd=dependency), "")
+        index = self._git_metadata_path(dependency, "index")
+        original_index = index.read_bytes()
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual(index.read_bytes(), original_index)
+        self.assertEqual(self.git("rev-parse", f"refs/replace/{original}", cwd=dependency), replacement)
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+
+    def test_replacement_refs_do_not_change_clean_submodule_evidence(self):
+        worktree, dependency = self._prepare()
+        before = source_tree(worktree)
+        original, replacement = self._install_submodule_replacement(dependency)
+        self.git("--no-replace-objects", "read-tree", original, cwd=dependency)
+        (dependency / "dependency.txt").write_text("broken\n")
+        self.assertEqual(source_tree(worktree), before)
+        self.assertEqual(self.git("rev-parse", f"refs/replace/{original}", cwd=dependency), replacement)
+
+    def test_replacement_refs_after_verification_block_submission(self):
+        _, dependency = self._prepare()
+        with self.state.lock():
+            verify(self.config, self.state, "fix-1")
+        original, replacement = self._install_submodule_replacement(dependency)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            submit(self.config, self.state, "fix-1", local=True)
+        self.assertEqual(self.git("rev-parse", f"refs/replace/{original}", cwd=dependency), replacement)
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+
+    def _assert_source_snapshot_accepts_submodule_filename(self, filename):
+        path = os.fsdecode(filename)
+        self.write_filename_fixture(self.dependency_source, filename, b"delivered\n")
+        self.git("add", "--", path, cwd=self.dependency_source)
+        self.git("commit", "-qm", "add filename fixture", cwd=self.dependency_source)
+        worktree, dependency = self._prepare()
+        index = self._git_metadata_path(dependency, "index")
+        original_index = index.read_bytes()
+        self.assertEqual(source_tree(worktree), self.git("rev-parse", "HEAD^{tree}", cwd=worktree))
+        self.assertEqual(index.read_bytes(), original_index)
+        (dependency / path).write_bytes(b"undelivered\n")
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+
+    def test_source_snapshot_accepts_non_utf8_submodule_filenames(self):
+        self._assert_source_snapshot_accepts_submodule_filename(b"dependency-\xff.txt")
+
+    def test_source_snapshot_accepts_carriage_returns_in_submodule_filenames(self):
+        self._assert_source_snapshot_accepts_submodule_filename(b"dependency-\r.txt")
+
+    def test_gitlink_index_paths_preserve_non_utf8_and_carriage_return_bytes(self):
+        worktree, dependency = self._prepare()
+        head = self.git("rev-parse", "HEAD", cwd=dependency)
+        blob = self.git("rev-parse", "HEAD:value.txt", cwd=worktree)
+        self.git("update-index", "--add", "--cacheinfo", "100644", blob,
+                 os.fsdecode(b"parent-\xff.txt"), cwd=worktree)
+        paths = [b"vendor/dependency-\xff", b"vendor/dependency-\r"]
+        for path in paths:
+            self.git("update-index", "--add", "--cacheinfo", "160000", head, os.fsdecode(path), cwd=worktree)
+        self.assertCountEqual([os.fsencode(path) for path in _gitlink_paths(worktree)],
+                              [b"vendor/dependency", *paths])
+
+    def test_submodule_tree_byte_paths_are_inspected_without_checkout(self):
+        worktree, dependency = self._prepare()
+        head = self.git("rev-parse", "HEAD", cwd=dependency)
+        blob = self.git("rev-parse", "HEAD:dependency.txt", cwd=dependency)
+        link_paths = [b"child-\xff", b"child-\r"]
+        entries = b"".join(b"100644 blob " + blob.encode("ascii") + b"\t" + path + b"\0"
+                           for path in (b"dependency.txt", b"missing-\xff.txt", b"missing-\r.txt"))
+        entries += b"".join(b"160000 commit " + head.encode("ascii") + b"\t" + path + b"\0"
+                            for path in link_paths)
+        tree = subprocess.check_output(["git", "mktree", "-z"], input=entries, cwd=dependency).strip().decode("ascii")
+        commit = self.git("commit-tree", tree, "-p", head, "-m", "byte paths without checkout", cwd=dependency)
+        self.git("update-ref", "HEAD", commit, cwd=dependency)
+        self.git("read-tree", tree, cwd=dependency)
+        self.assertCountEqual([os.fsencode(path) for path in _gitlink_paths(dependency)], link_paths)
+        index = self._git_metadata_path(dependency, "index")
+        original = index.read_bytes()
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+        self.assertEqual(index.read_bytes(), original)
 
     def _assert_index_mask_cannot_hide_tracked_submodule_change(self, flag):
         checks = [[sys.executable, "-c",

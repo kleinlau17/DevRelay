@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -26,6 +28,20 @@ class RepositoryTest(unittest.TestCase):
     def git(self, *args, cwd=None):
         return subprocess.check_output(["git", *args], cwd=cwd or self.root, text=True,
                                        stderr=subprocess.PIPE).strip()
+
+    def write_filename_fixture(self, root, filename, content):
+        path = root / os.fsdecode(filename)
+        try:
+            path.write_bytes(content)
+        except OSError as error:
+            if error.errno == errno.EILSEQ:
+                try:
+                    filename.decode("utf-8")
+                except UnicodeDecodeError:
+                    self.skipTest(f"Filesystem rejects non-UTF-8 filename {filename!r} with EILSEQ; "
+                                  "filesystem end-to-end case unavailable")
+            raise
+        return path
 
     def configure(self, *, provider="local", checks=None, setup=None, executable="codex", attempts=2):
         directory = self.root / ".devrelay"

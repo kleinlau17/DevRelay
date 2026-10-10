@@ -152,6 +152,7 @@ devrelay submit fix-1 --local
 ## 验证与恢复
 
 - 验证绑定源码树、HEAD、目标 base、项目配置和任务要求。源码哈希包括已跟踪修改与未忽略新文件，使用临时 Git 索引，保留原索引。
+- 所有源码证据 Git 操作均禁用本地 replacement refs，检查实际提交对象，不修改用户的替换引用。NUL 分隔的文件路径按字节解析，支持文件系统可表示的非 UTF-8 和含回车的文件名。
 - 对已检出的子模块递归检查已跟踪修改和未忽略的新文件；隔离索引比较会忽略 `assume-unchanged`、`skip-worktree` 与 `core.fileMode=false` 等掩码，并覆盖 `submodule.*.ignore`、`.gitmodules` ignore 和隐藏未跟踪文件的状态配置。任一子模块不干净都会使验收、提交及自动审查/合并门禁失败，且 DevRelay 不会提交、清理、重置或更新子模块。
 - 子模块未跟踪文件检测只应用 `.gitignore`，不会读取本地 `info/exclude` 或 `core.excludesFile`。已暂存内容使用只读索引比较，生成源码证据时不重建真实子模块索引的缓存树，也禁用可选的索引刷新写入。
 - 子模块已跟踪的普通文件还会绕过 attributes 和 clean filters，将原始字节与 HEAD blob 比较，防止本地转换隐藏未交付内容。支持边界是工作树字节必须与提交一致；依赖换行规范化、编码转换或 smudge filters 才能匹配提交的子模块会阻止验收。
@@ -174,5 +175,7 @@ git diff --check
 ```
 
 测试使用临时真实 Git 仓库与假的 Codex CLI，覆盖工作树隔离、失败修复、精确会话恢复、源码与 base 漂移、提交门禁、审查、CI 等待、squash 合并和合并后验收。PR 测试向临时本地 bare 仓库真实推送，以测试替身模拟 GitHub API、请求超时与恢复。它们不调用模型、不推送公开仓库；真实项目还需要自己的运行验收。
+
+非 UTF-8 文件名端到端测试在支持的文件系统上运行；只有创建无效 UTF-8 名称明确返回 `EILSEQ` 时才报告平台 skip，不代表产品验收通过。Git tree/index 字节路径回归无需检出这些名称，始终运行；权限错误和产品错误仍会使测试失败。
 
 实现说明见 [架构](docs/architecture.md)。Codex 接口依据 [OpenAI 官方非交互执行文档](https://developers.openai.com/codex/noninteractive)。
