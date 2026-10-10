@@ -110,6 +110,28 @@ class WorkflowTests(RepositoryTest):
         self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1], "exact-test-session")
         self.assertNotIn("--last", invocation["argv"])
 
+    def test_upgrade_from_legacy_mixed_log_resumes_exact_session(self):
+        with self.state.lock():
+            task = start(self.config, self.state, "fix-1")
+        directory = self.state.directory / "runs" / task["id"] / "legacy-codex"
+        directory.mkdir(parents=True)
+        log = directory / "events.jsonl"
+        log.write_text("ordinary CLI diagnostic\n" +
+                       json.dumps({"type": "thread.started", "thread_id": "legacy-session"}) + "\n" +
+                       "2026-01-01 WARN ordinary CLI diagnostic\n")
+        task.update(status="interrupted", setup_fingerprint=self.config.fingerprint, session_id="legacy-session",
+                    last_run=str(directory), event_log=str(log))
+        self.state.save(task)
+        trace = Path(self.temporary.name) / "upgrade-trace.jsonl"
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocation = json.loads(trace.read_text().split("\n")[0])
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1], "legacy-session")
+        self.assertNotIn("--last", invocation["argv"])
+        marker = Path(result["event_log"]).with_suffix(".jsonl.format.json")
+        self.assertEqual(json.loads(marker.read_text()), {"format": "stdout-jsonl-v1"})
+
     def test_interrupt_after_thread_started_resumes_the_exact_session(self):
         trace = Path(self.temporary.name) / "interrupt-trace.jsonl"
         with (patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "interrupt", "DEVRELAY_TEST_TRACE": str(trace)}),

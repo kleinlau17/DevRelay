@@ -82,6 +82,69 @@ class CodexOwnershipTests(RepositoryTest):
         self.assertNotIn("session_id", self.task)
         self.assertIsNone(self.state.get(self.task["id"]).get("session_id"))
 
+    def retain_implementation(self, owner, *, historical=False, legacy=False):
+        session = owner["id"] + "-uncheckpointed-session"
+        directory = self.state.directory / "runs" / owner["id"] / "crashed-codex"
+        directory.mkdir(parents=True)
+        log = directory / "events.jsonl"
+        log.write_text(("ordinary CLI diagnostic\n" if legacy else "") +
+                       json.dumps({"type": "thread.started", "thread_id": session}) + "\n")
+        owner.update(last_run=str(directory), event_log=str(log), status="implementing")
+        owner.pop("session_id", None)
+        if historical:
+            latest = directory.parent / "latest-codex"
+            latest.mkdir()
+            owner.update(last_run=str(latest), event_log=str(latest / "events.jsonl"))
+        self.state.save(owner)
+        return session
+
+    def test_foreign_uncheckpointed_implementation_id_is_rejected_before_cli_launch(self):
+        session = self.retain_implementation(self.state.get("fix-other"))
+        self.task["session_id"] = session
+        self.state.save(self.task)
+        self.assert_resume_rejected("another task's implementation log")
+        self.assertIsNone(self.state.get("fix-other").get("session_id"))
+
+    def test_foreign_uncheckpointed_thread_in_previous_log_is_rejected_before_cli_launch(self):
+        session = self.retain_implementation(self.state.get("fix-other"))
+        directory = self.state.directory / "runs" / self.task["id"] / "crashed-codex"
+        directory.mkdir(parents=True)
+        log = directory / "events.jsonl"
+        log.write_text(json.dumps({"type": "thread.started", "thread_id": session}) + "\n")
+        self.task.update(last_run=str(directory), event_log=str(log))
+        self.state.save(self.task)
+        self.assert_resume_rejected("another task's implementation log")
+        self.assertIsNone(self.state.get(self.task["id"]).get("session_id"))
+
+    def test_live_foreign_uncheckpointed_thread_is_rejected(self):
+        session = self.retain_implementation(self.state.get("fix-other"))
+        with self.assertRaisesRegex(RelayError, "another task's implementation log"):
+            _observe_line(self.state, self.task, json.dumps({"type": "thread.started", "thread_id": session}),
+                          self.state.directory / "events.jsonl")
+        self.assertNotIn("session_id", self.task)
+        self.assertIsNone(self.state.get(self.task["id"]).get("session_id"))
+
+    def test_historical_and_legacy_implementation_events_still_reserve_foreign_sessions(self):
+        for historical, legacy in ((True, False), (False, True), (True, True)):
+            with self.subTest(historical=historical, legacy=legacy):
+                identifier = f"owner-{int(historical)}-{int(legacy)}"
+                add_local(self.config, self.state, identifier, "Recovery", "Depends on: none", "priority:P1")
+                session = self.retain_implementation(self.state.get(identifier), historical=historical, legacy=legacy)
+                self.task["session_id"] = session
+                self.state.save(self.task)
+                self.assert_resume_rejected("another task's implementation log")
+
+    def test_foreign_implementation_log_cannot_widen_evidence_scope(self):
+        outside = Path(self.temporary.name) / "outside-codex"
+        outside.mkdir()
+        (outside / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": "outside-session"}))
+        other = self.state.get("fix-other")
+        other.update(last_run=str(outside), event_log=str(outside / "events.jsonl"))
+        self.state.save(other)
+        self.task["session_id"] = "implementation-session"
+        self.state.save(self.task)
+        self.assert_resume_rejected("outside this task's run directory")
+
     def test_implementation_session_remains_usable_alongside_review_records(self):
         self.retain_review(self.task, "current")
         self.retain_review(self.state.get("fix-other"), "old-receipt")

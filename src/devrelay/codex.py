@@ -41,6 +41,118 @@ def _valid_session(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value)
 
 
+EVENT_LOG_FORMAT = "stdout-jsonl-v1"
+
+
+def _run_root(state, task, role):
+    runs = state.directory / "runs"
+    if runs.is_symlink():
+        raise RelayError(f"Saved Codex {role} runs are outside the owned run directory; refusing recovery")
+    runs = runs.resolve()
+    root = runs / task["id"]
+    if root.is_symlink():
+        raise RelayError(f"Saved Codex {role} evidence is outside this task's run directory; refusing recovery")
+    root = root.resolve()
+    if root.parent != runs or root.name != task["id"]:
+        raise RelayError(f"Saved Codex {role} evidence is outside this task's run directory; refusing recovery")
+    return root
+
+
+def _run_children(root, role):
+    try:
+        return list(root.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise RelayError(f"Cannot inspect saved Codex {role} runs; inspect {root}") from error
+
+
+def _legacy_event_log(log):
+    """Only unmarked, pre-streaming logs may contain mixed stderr diagnostics."""
+    marker = log.with_suffix(log.suffix + ".format.json")
+    diagnostics = log.with_suffix(log.suffix + ".stderr.log")
+    if marker.is_symlink() or diagnostics.is_symlink():
+        raise RelayError("Saved Codex log metadata is outside its run directory; refusing recovery")
+    try:
+        record = json.loads(marker.read_text())
+    except FileNotFoundError:
+        return not diagnostics.exists()
+    except (OSError, ValueError) as error:
+        raise RelayError(f"Cannot read Codex event log format; inspect {marker}") from error
+    if record != {"format": EVENT_LOG_FORMAT}:
+        raise RelayError(f"Unknown Codex event log format; inspect {marker}")
+    return False
+
+
+def _parse_event(line, log, *, legacy=False):
+    if not line.strip():
+        return None
+    try:
+        event = json.loads(line)
+    except ValueError as error:
+        # Legacy stderr text is not an event. Never discard JSON-shaped data or
+        # damaged session events, even in a mixed pre-upgrade log.
+        if (legacy and not line.lstrip().startswith(("{", "[", '"'))
+                and "thread.started" not in line and "thread_id" not in line):
+            return None
+        raise RelayError(f"Codex event log is incomplete or invalid; inspect {log}") from error
+    if not isinstance(event, dict):
+        raise RelayError(f"Codex event log contains an invalid event; inspect {log}")
+    return event
+
+
+def _event_lines(log):
+    if log.is_symlink():
+        raise RelayError("Saved Codex event log is outside its run directory; refusing recovery")
+    try:
+        with log.open(errors="replace", newline="") as stream:
+            return stream.read().split("\n")
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise RelayError(f"Cannot read Codex event log; inspect {log}") from error
+
+
+def _implementation_sessions(state, task):
+    """Reserve IDs written before a crashed controller could checkpoint them."""
+    root = _run_root(state, task, "implementation")
+
+    def scoped(directory):
+        resolved = directory.resolve()
+        if directory.is_symlink() or resolved.parent != root or resolved.name.endswith("-review"):
+            raise RelayError("Saved Codex implementation evidence is outside this task's run directory; refusing recovery")
+        return resolved
+
+    directories = {scoped(path) for path in _run_children(root, "implementation")
+                   if path.name.endswith("-codex")}
+    if task.get("last_run"):
+        directory = scoped(Path(task["last_run"]))
+        if task.get("event_log") and Path(task["event_log"]).absolute() != directory / "events.jsonl":
+            raise RelayError("Saved Codex event log conflicts with the run directory; refusing recovery")
+        directories.add(directory)
+    elif task.get("event_log"):
+        path = Path(task["event_log"])
+        if path.name != "events.jsonl":
+            raise RelayError("Saved Codex event log path is invalid; refusing recovery")
+        directories.add(scoped(path.parent))
+    sessions = set()
+    for directory in directories:
+        log = directory / "events.jsonl"
+        legacy = _legacy_event_log(log)
+        run_sessions = set()
+        for line in _event_lines(log):
+            event = _parse_event(line, log, legacy=legacy)
+            if event and event.get("type") == "thread.started":
+                session = event.get("thread_id")
+                if not _valid_session(session):
+                    raise RelayError("Saved Codex implementation session ID is invalid; refusing recovery")
+                run_sessions.add(session)
+        if len(run_sessions) > 1:
+            raise RelayError(f"Saved Codex implementation log has conflicting session IDs; inspect {log}")
+        sessions.update(run_sessions)
+    return sessions
+
+
 def _review_sessions(state, task):
     """Retain review ownership even after the current acceptance/review is invalidated."""
     sessions = set()
@@ -56,16 +168,7 @@ def _review_sessions(state, task):
             raise RelayError("Saved Codex review record is invalid; refusing recovery")
         record(review.get("session_id"))
 
-    runs = state.directory / "runs"
-    if runs.is_symlink():
-        raise RelayError("Saved Codex review runs are outside the owned run directory; refusing recovery")
-    runs = runs.resolve()
-    root = runs / task["id"]
-    if root.is_symlink():
-        raise RelayError("Saved Codex review evidence is outside this task's run directory; refusing recovery")
-    root = root.resolve()
-    if root.parent != runs or root.name != task["id"]:
-        raise RelayError("Saved Codex review evidence is outside this task's run directory; refusing recovery")
+    root = _run_root(state, task, "review")
 
     def scoped(directory):
         resolved = directory.resolve()
@@ -73,13 +176,7 @@ def _review_sessions(state, task):
             raise RelayError("Saved Codex review evidence is outside this task's run directory; refusing recovery")
         return resolved
 
-    try:
-        candidates = list(root.iterdir())
-    except FileNotFoundError:
-        candidates = []
-    except OSError as error:
-        raise RelayError(f"Cannot inspect saved Codex review runs; inspect {root}") from error
-    directories = {scoped(path) for path in candidates if path.name.endswith("-review")}
+    directories = {scoped(path) for path in _run_children(root, "review") if path.name.endswith("-review")}
     for key in ("review_run", "review_path"):
         if task.get(key):
             path = Path(task[key])
@@ -123,6 +220,8 @@ def _check_session_owner(state, task, session):
         foreign = item["id"] != task["id"]
         if foreign and item.get("session_id") == session:
             raise RelayError("Codex session ID belongs to another task; refusing cross-task recovery")
+        if foreign and session in _implementation_sessions(state, item):
+            raise RelayError("Codex session ID belongs to another task's implementation log; refusing cross-task recovery")
         if session in _review_sessions(state, item):
             if foreign:
                 raise RelayError("Codex session ID belongs to another task's review; refusing cross-task recovery")
@@ -144,37 +243,27 @@ def _record_session(state, task, event):
 
 
 def _observe_line(state, task, line, log):
-    if not line.strip():
-        return
-    try:
-        event = json.loads(line)
-    except ValueError as error:
-        raise RelayError(f"Codex event log is incomplete or invalid; inspect {log}") from error
-    if not isinstance(event, dict):
-        raise RelayError(f"Codex event log contains an invalid event; inspect {log}")
-    _record_session(state, task, event)
+    event = _parse_event(line, log)
+    if event is not None:
+        _record_session(state, task, event)
 
 
 def _read_events(state, task, log, *, recovering=False):
     completed, failed, saw_event = False, False, False
-    if not log.exists():
-        return completed, failed, saw_event
-    with log.open(errors="replace", newline="") as stream:
-        content = stream.read()
-    for line in content.split("\n"):
+    legacy = recovering and _legacy_event_log(log)
+    saw_output = False
+    for line in _event_lines(log):
         if not line.strip():
             continue
-        try:
-            event = json.loads(line)
-        except ValueError as error:
-            raise RelayError(f"Codex event log is incomplete or invalid; inspect {log}") from error
-        if not isinstance(event, dict):
-            raise RelayError(f"Codex event log contains an invalid event; inspect {log}")
+        saw_output = True
+        event = _parse_event(line, log, legacy=legacy)
+        if event is None:
+            continue
         saw_event = True
         _record_session(state, task, event)
         completed |= event.get("type") == "turn.completed"
         failed |= event.get("type") == "turn.failed"
-    if recovering and saw_event and not task.get("session_id"):
+    if recovering and saw_output and not task.get("session_id"):
         raise RelayError(f"Previous Codex run has events but no valid thread.started; inspect {log}")
     return completed, failed, saw_event
 
@@ -188,12 +277,11 @@ def _recover_previous_run(state, task):
     previous = task.get("last_run")
     if not previous:
         return
-    directory = Path(previous).resolve()
-    expected = (state.directory / "runs" / task["id"]).resolve()
-    try:
-        directory.relative_to(expected)
-    except ValueError as error:
-        raise RelayError("Saved Codex run is outside this task's run directory; refusing recovery") from error
+    path = Path(previous)
+    directory = path.resolve()
+    expected = _run_root(state, task, "implementation")
+    if path.is_symlink() or directory.parent != expected:
+        raise RelayError("Saved Codex run is outside this task's run directory; refusing recovery")
     log = directory / "events.jsonl"
     if task.get("event_log") and Path(task["event_log"]).resolve() != log:
         raise RelayError("Saved Codex event log conflicts with the run directory; refusing recovery")
@@ -226,6 +314,7 @@ Previous verification feedback:
 {feedback or 'None'}
 """
     (directory / "prompt.txt").write_text(prompt)
+    (directory / "events.jsonl.format.json").write_text(json.dumps({"format": EVENT_LOG_FORMAT}) + "\n")
     task["last_run"] = str(directory)
     task["event_log"] = str(directory / "events.jsonl")
     state.save(task)  # Persist the recovery index before starting Codex.

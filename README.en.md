@@ -145,9 +145,11 @@ SQLite state, a repository-wide worker lock, command logs, resource receipts, ve
 
 Ctrl+C and controller crashes cannot silently switch recovery to a new session. Timeouts terminate process groups; `active_process` and the repository lock prevent recovery while the previous process group or any surviving descendants are still running.
 
-Session ownership includes saved review IDs and retained review receipts/events under each task's run directory, even after acceptance or review is invalidated. Implementation recovery rejects other tasks' sessions and review sessions, including its own; unsafe or unreadable review evidence blocks recovery without reading outside the repository's owned run directories.
+Session ownership includes saved IDs, retained implementation events (including uncheckpointed IDs after a controller crash), and review receipts/events under each task's run directory, even after acceptance or review is invalidated. Implementation recovery rejects other tasks' sessions and review sessions, including its own; unsafe or unreadable evidence blocks recovery without reading outside the repository's owned run directories.
 
 Codex JSONL events are separated only at LF boundaries, preserving Unicode separators inside messages even with chunked output. Stderr diagnostics are retained separately and are not parsed as JSON events.
+
+New implementation runs record `events.jsonl.format.json` before launch and retain strict stdout JSONL parsing during recovery. Older unmarked logs without a separate stderr log may contain ordinary stderr diagnostics; recovery ignores that text but still rejects malformed JSON/session events and conflicting IDs. A diagnostics-only legacy log without a saved session blocks recovery rather than silently starting a new session.
 
 Acceptance commands are trusted project code. A zero exit code does not establish business correctness or independent review. Projects control scoring rules, official engine requirements and delivery authorization.
 
