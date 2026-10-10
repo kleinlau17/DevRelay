@@ -1,9 +1,13 @@
 import json
+import os
+from pathlib import Path
+import subprocess
 import unittest
+from unittest.mock import patch
 
 from devrelay.config import detect, initialize, load
 from devrelay.errors import RelayError
-from devrelay.git import github_slug, validate_remote
+from devrelay.git import git, github_slug, pinned_transport, remote_tracking_ref, validate_remote
 
 from helpers import RepositoryTest
 
@@ -95,10 +99,172 @@ class ConfigurationTests(RepositoryTest):
     def test_push_remote_must_match_the_configured_repository(self):
         self.configure(provider="github")
         self.git("remote", "add", "origin", "https://github.com/example/project.git")
-        validate_remote(self.config)
+        self.assertEqual(validate_remote(self.config), "https://github.com/example/project.git")
         self.git("remote", "set-url", "--push", "origin", "https://github.com/example/wrong-project.git")
-        with self.assertRaisesRegex(RelayError, "does not match"):
+        with self.assertRaisesRegex(RelayError, "Git push URL does not match project.repository"):
             validate_remote(self.config)
+        self.git("remote", "set-url", "--push", "origin", "https://github.com/example/project.git")
+        self.git("remote", "set-url", "origin", "https://github.com/example/wrong-project.git")
+        with self.assertRaisesRegex(RelayError, "Git fetch URL does not match project.repository"):
+            validate_remote(self.config)
+
+    def test_remote_rejects_multiple_fetch_or_push_urls(self):
+        self.configure(provider="github")
+        self.git("remote", "add", "origin", "git@github.com:example/project.git")
+        self.git("remote", "set-url", "--add", "--push", "origin",
+                 "https://github.com/example/project.git")
+        self.git("remote", "set-url", "--add", "--push", "origin",
+                 "git@github.com:example/project.git")
+        with self.assertRaisesRegex(RelayError, "exactly one.*push fan-out"):
+            validate_remote(self.config)
+        self.git("remote", "set-url", "--delete", "--push", "origin",
+                 "git@github.com:example/project.git")
+        self.git("remote", "set-url", "--add", "origin",
+                 "https://github.com/example/project.git")
+        with self.assertRaisesRegex(RelayError, "exactly one"):
+            validate_remote(self.config)
+
+    def test_remote_validates_resolved_url_rewrites(self):
+        self.configure(provider="github")
+        original = "https://github.com/example/project.git"
+        self.git("remote", "add", "origin", original)
+        self.git("config", "url.https://github.com/example/other.git.insteadOf", original)
+        with self.assertRaisesRegex(RelayError, "URL rewrite"):
+            validate_remote(self.config)
+
+    def test_transport_preserves_system_settings_when_nosystem_is_false(self):
+        system = Path(self.temporary.name) / "system-false.gitconfig"
+        self.git("config", "--file", str(system), "devrelay.probe", "preserved")
+        for value in ("0", "false", "no", "off", "FALSE", "", "00"):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "GIT_CONFIG_NOSYSTEM": value, "GIT_CONFIG_SYSTEM": str(system),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }):
+                self.assertEqual(git(self.root, "config", "--get", "devrelay.probe"), "preserved")
+                with pinned_transport(self.root, "https://github.com/example/project.git") as (_, env):
+                    self.assertEqual(git(self.root, "config", "--get", "devrelay.probe", env=env),
+                                     "preserved")
+
+    def test_transport_keeps_system_settings_disabled_when_nosystem_is_true(self):
+        system = Path(self.temporary.name) / "system-true.gitconfig"
+        self.git("config", "--file", str(system), "devrelay.probe", "disabled")
+        for value in ("1", "true", "yes", "on", "TRUE", "2", "-1"):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "GIT_CONFIG_NOSYSTEM": value, "GIT_CONFIG_SYSTEM": str(system),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }):
+                with pinned_transport(self.root, "https://github.com/example/project.git") as (_, env):
+                    for actual_env in (os.environ, env):
+                        result = subprocess.run(
+                            ["git", "config", "--get", "devrelay.probe"], cwd=self.root,
+                            env=actual_env, text=True, capture_output=True, timeout=60,
+                        )
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertEqual(result.stdout, "")
+
+    def test_transport_rejects_invalid_nosystem_boolean_before_yielding(self):
+        for value in ("invalid", "truthy", "0.0"):
+            with self.subTest(value=value), patch.dict(os.environ, {"GIT_CONFIG_NOSYSTEM": value}):
+                with self.assertRaisesRegex(RelayError, "GIT_CONFIG_NOSYSTEM.*Git boolean"):
+                    with pinned_transport(self.root, "https://github.com/example/project.git"):
+                        self.fail("Invalid system configuration policy must stop the transport")
+
+    def test_transport_pin_wins_over_a_later_url_rewrite(self):
+        allowed = Path(self.temporary.name) / "pin-allowed.git"
+        unapproved = Path(self.temporary.name) / "pin-unapproved.git"
+        for remote in (allowed, unapproved):
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        self.git("config", f"url.{unapproved}.pushInsteadOf", str(allowed))
+        with pinned_transport(self.root, str(allowed)) as (target, env):
+            git(self.root, "push", target, "refs/heads/main:refs/heads/pinned", env=env)
+        self.assertEqual(self.git("--git-dir", str(allowed), "rev-parse", "refs/heads/pinned"),
+                         self.git("rev-parse", "main"))
+        refs = self.git("--git-dir", str(unapproved), "for-each-ref", "--format=%(refname)")
+        self.assertNotIn("refs/heads/pinned", refs)
+
+    def test_transport_pin_ignores_url_named_alias_added_before_each_transport(self):
+        allowed = Path(self.temporary.name) / "alias-allowed.git"
+        unapproved = [Path(self.temporary.name) / f"alias-extra-{index}.git" for index in range(2)]
+        for remote in (allowed, *unapproved):
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        url = allowed.as_uri()
+        ref = "refs/heads/alias-probe"
+        head = self.git("rev-parse", "main")
+        with pinned_transport(self.root, url) as (target, env):
+            # Mutate after the pin is prepared too: neither the validated URL
+            # nor the actual argument may become a fan-out remote alias.
+            for alias in (url, target):
+                self.git("config", f"remote.{alias}.url", str(unapproved[0]))
+                for remote in unapproved:
+                    self.git("config", "--add", f"remote.{alias}.pushurl", str(remote))
+                self.git("config", "--add", f"url.{unapproved[0]}.insteadOf", alias)
+                self.git("config", "--add", f"url.{unapproved[0]}.pushInsteadOf", alias)
+            git(self.root, "push", target, "refs/heads/main:" + ref, env=env)
+            self.assertEqual(git(self.root, "ls-remote", target, ref, env=env).split(), [head, ref])
+            for remote in unapproved:
+                self.assertEqual(self.git("--git-dir", str(remote), "for-each-ref"), "")
+                self.git("push", str(remote), "refs/heads/main:" + ref)
+            # Deletion and readback must use the same bound endpoint, never
+            # the URL alias's first fetch URL or its two push URLs.
+            git(self.root, "push", "--force-with-lease=" + ref + ":" + head,
+                target, ":" + ref, env=env)
+            self.assertEqual(git(self.root, "ls-remote", target, ref, env=env), "")
+        for remote in unapproved:
+            self.assertEqual(self.git("--git-dir", str(remote), "rev-parse", ref), head)
+
+    def test_tracking_ref_follows_fetch_mapping_and_actual_upstream_sha(self):
+        remote = Path(self.temporary.name) / "tracking.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("config", "--replace-all", "remote.origin.fetch",
+                 "+refs/heads/main:refs/remotes/origin/main")
+        self.git("config", "--add", "remote.origin.fetch",
+                 "+refs/heads/devrelay/*:refs/remotes/custom/*")
+        self.git("config", "--add", "remote.origin.fetch", "^refs/heads/devrelay/*")
+        branch = "devrelay/task-tracking"
+        original = self.git("rev-parse", "main")
+        self.git("checkout", "-qb", branch)
+        self.git("commit", "--allow-empty", "-qm", "tracking update")
+        head = self.git("rev-parse", branch)
+        self.git("config", f"branch.{branch}.remote", "origin")
+        self.git("config", f"branch.{branch}.merge", "refs/heads/" + branch)
+        # Establish the oracle with a real named-remote push, not the helper:
+        # the negative fetch rule does not suppress Git's tracking update.
+        self.git("push", "origin", branch)
+        self.assertEqual(self.git("rev-parse", branch + "@{upstream}"), head)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/custom/task-tracking"), head)
+        tracking = remote_tracking_ref(self.root, "origin", branch)
+        self.assertEqual(tracking, "refs/remotes/custom/task-tracking")
+        self.git("update-ref", tracking, original)
+        with pinned_transport(self.root, str(remote)) as (target, env):
+            git(self.root, "push", target, f"refs/heads/{branch}:refs/heads/{branch}", env=env)
+        self.git("update-ref", tracking, head)
+        self.assertEqual(self.git("--git-dir", str(remote), "rev-parse", "refs/heads/" + branch), head)
+        self.assertEqual(self.git("rev-parse", branch + "@{upstream}"), head)
+        self.assertIsNone(remote_tracking_ref(self.root, "origin", "unmapped"))
+
+    def test_remote_validation_uses_the_transport_worktree_context(self):
+        self.configure(provider="github")
+        allowed = "https://github.com/example/project.git"
+        unapproved = "https://github.com/other/unapproved.git"
+        self.git("remote", "add", "origin", allowed)
+        worktree = Path(self.temporary.name) / "task-context"
+        self.git("worktree", "add", "-q", "-b", "devrelay/task-context", str(worktree), "main")
+        included = Path(self.temporary.name) / "task-context.gitconfig"
+        self.git("config", "--file", str(included), f"url.{unapproved}.insteadOf", allowed)
+        self.git("config", "includeIf.onbranch:devrelay/task-*.path", str(included))
+
+        self.assertEqual(validate_remote(self.config), allowed)
+        self.assertEqual(self.git("ls-remote", "--get-url", allowed, cwd=worktree), unapproved)
+        with self.assertRaisesRegex(RelayError, "URL rewrite"):
+            validate_remote(self.config, worktree)
+
+    def test_fetch_and_push_protocols_may_differ_for_the_same_repository(self):
+        self.configure(provider="github")
+        self.git("remote", "add", "origin", "git@github.com:example/project.git")
+        self.git("remote", "set-url", "--push", "origin",
+                 "https://github.com/example/project.git")
+        self.assertEqual(validate_remote(self.config), "https://github.com/example/project.git")
 
     def test_delivery_configuration_is_strict_and_github_only(self):
         self.configure()

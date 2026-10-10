@@ -7,7 +7,8 @@ import uuid
 from . import codex
 from .config import load
 from .errors import RelayError
-from .git import git, has_ref, is_ancestor, source_tree, stage_submodule_gitlinks, validate_remote, worktrees
+from .git import (git, has_ref, is_ancestor, pinned_transport, remote_tracking_ref,
+                  source_tree, stage_submodule_gitlinks, validate_remote, worktrees)
 from .process import execute
 from .providers import authorized, gh, gh_json, queue_report, snapshot, task_id
 from .state import now
@@ -265,7 +266,19 @@ def submit(config, state, identifier, *, local=False):
         raise RelayError("Base changed before push; integrate it and rerun verification")
     if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
         raise RelayError("Source or HEAD changed before push; rerun verification")
-    git(path, "push", "--set-upstream", config.remote, task["branch"])
+    push_url = validate_remote(config, path)
+    ref = "refs/heads/" + task["branch"]
+    # Pin the exact validated endpoint in the transport invocation. A remote
+    # name could fan out, while a later rewrite could redirect a plain URL.
+    tracking_ref = remote_tracking_ref(path, config.remote, task["branch"])
+    with pinned_transport(path, push_url) as (target, env):
+        git(path, "push", target, ref + ":" + ref, env=env)
+    if tracking_ref is not None:
+        git(path, "update-ref", tracking_ref, head)
+    # Match `push --set-upstream` without requiring the task branch to be
+    # covered by remote.<name>.fetch (single-branch clones commonly are not).
+    git(path, "config", "branch." + task["branch"] + ".remote", config.remote)
+    git(path, "config", "branch." + task["branch"] + ".merge", ref)
     if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
         raise RelayError("Source or HEAD changed during push; rerun verification before opening a PR")
     summary = task.get("summary") or "Implementation verified by configured project checks."
