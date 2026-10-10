@@ -118,7 +118,8 @@ def _submodule_snapshot(root, paths, prefix=Path(), seen=None):
         heads[display] = git(checkout, "rev-parse", "HEAD")
         head_tree = git(checkout, "rev-parse", "HEAD^{tree}")
         if (not _submodule_content_matches_head(checkout)
-                or git(checkout, "write-tree") != head_tree
+                or git(checkout, "diff-index", "--cached", "--raw", "--ignore-submodules=none", "HEAD", "--")
+                or git(checkout, "ls-files", "--others", "--exclude-per-directory=.gitignore", "-z")
                 or _isolated_source_tree(checkout, inspect_submodules=False,
                                          neutralize_config=True) != head_tree):
             dirty.append(display)
@@ -138,7 +139,7 @@ def _clean_submodule_snapshot(root, paths):
 
 def _isolated_source_tree(root, *, inspect_submodules, neutralize_config=False):
     with tempfile.TemporaryDirectory(prefix="devrelay-index-") as temporary:
-        env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index"), "GIT_OPTIONAL_LOCKS": "0"}
         git(root, "read-tree", "HEAD", env=env)
         config = (["-c", "core.fileMode=true", "-c", f"core.excludesFile={os.devnull}"]
                   if neutralize_config else [])

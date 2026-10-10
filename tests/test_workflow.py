@@ -366,6 +366,80 @@ class SubmoduleWorkflowTests(RepositoryTest):
             verify(self.config, self.state, "fix-1")
         self.assertTrue((dependency / "untracked.txt").is_file())
 
+    def _git_metadata_path(self, root, name):
+        path = Path(self.git("rev-parse", "--git-path", name, cwd=root))
+        return path if path.is_absolute() else root / path
+
+    def test_info_exclude_cannot_hide_untracked_submodule_source_between_snapshots(self):
+        worktree, dependency = self._prepare()
+        source_tree(worktree)
+        excluded = dependency / "repair.txt"
+        excluded.write_text("fixed\n")
+        exclude = self._git_metadata_path(dependency, "info/exclude")
+        exclude.write_text("repair.txt\n")
+        self.assertEqual(self.git("ls-files", "--others", "--exclude-standard", cwd=dependency), "")
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+        self.assertEqual(excluded.read_text(), "fixed\n")
+        self.assertEqual(exclude.read_text(), "repair.txt\n")
+
+    def test_info_exclude_cannot_hide_untracked_submodule_source_from_verification(self):
+        _, dependency = self._prepare([[sys.executable, "-c",
+            "from pathlib import Path; assert Path('vendor/dependency/repair.txt').read_text() == 'fixed\\n'"]])
+        (dependency / "repair.txt").write_text("fixed\n")
+        self._git_metadata_path(dependency, "info/exclude").write_text("repair.txt\n")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual((dependency / "repair.txt").read_text(), "fixed\n")
+
+    def test_info_exclude_cannot_hide_untracked_nested_submodule_source(self):
+        self._add_nested_submodule()
+        worktree, dependency = self._prepare()
+        nested = dependency / "nested/inner"
+        (nested / "repair.txt").write_text("fixed\n")
+        self._git_metadata_path(nested, "info/exclude").write_text("repair.txt\n")
+        with self.assertRaisesRegex(RelayError, "vendor/dependency/nested/inner"):
+            source_tree(worktree)
+        self.assertEqual((nested / "repair.txt").read_text(), "fixed\n")
+
+    def test_committed_gitignore_still_excludes_submodule_build_artifacts(self):
+        (self.dependency_source / ".gitignore").write_text("build/\n")
+        self.git("add", ".gitignore", cwd=self.dependency_source)
+        self.git("commit", "-qm", "ignore build artifacts", cwd=self.dependency_source)
+        worktree, dependency = self._prepare()
+        before = source_tree(worktree)
+        build = dependency / "build"
+        build.mkdir()
+        (build / "output.txt").write_text("generated\n")
+        self.assertEqual(source_tree(worktree), before)
+        self.assertEqual((build / "output.txt").read_text(), "generated\n")
+
+    def test_source_snapshot_preserves_submodule_indexes_with_invalid_cache_trees(self):
+        self._add_nested_submodule()
+        worktree, dependency = self._prepare()
+        indexes = []
+        for checkout, filename in ((dependency, "dependency.txt"), (dependency / "nested/inner", "nested.txt")):
+            object_id = self.git("rev-parse", f"HEAD:{filename}", cwd=checkout)
+            self.git("update-index", "--cacheinfo", "100644", object_id, filename, cwd=checkout)
+            index = self._git_metadata_path(checkout, "index")
+            original = index.read_bytes()
+            self.assertIn(b"\0-1 ", original)
+            indexes.append((index, original))
+        source_tree(worktree)
+        for index, original in indexes:
+            self.assertEqual(index.read_bytes(), original)
+
+    def test_staged_submodule_changes_are_rejected_without_rewriting_the_index(self):
+        worktree, dependency = self._prepare()
+        (dependency / "staged.txt").write_text("undelivered\n")
+        self.git("add", "staged.txt", cwd=dependency)
+        (dependency / "staged.txt").unlink()
+        index = self._git_metadata_path(dependency, "index")
+        original = index.read_bytes()
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+        self.assertEqual(index.read_bytes(), original)
+
     def test_uninitialized_submodule_with_files_blocks_verification(self):
         checks = [[sys.executable, "-c",
                    "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').read_text() == 'fixed\\n'"]]
