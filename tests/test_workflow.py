@@ -231,6 +231,40 @@ class WorkflowTests(RepositoryTest):
         with self.assertRaisesRegex(RelayError, "another task"):
             self.run_task(resume=True)
 
+    def test_cached_session_is_validated_before_cli_launch_without_thread_started(self):
+        add_local(self.config, self.state, "fix-other", "Other", "Depends on: none", "priority:P1")
+        other = self.state.get("fix-other")
+        other["session_id"] = "other-task-session"
+        self.state.save(other)
+        with self.state.lock():
+            original = start(self.config, self.state, "fix-1")
+        original["setup_fingerprint"] = self.config.fingerprint
+        trace = Path(self.temporary.name) / "rejected-session-trace.jsonl"
+        log_cases = ("no-run", "missing", "empty", "turn-only")
+        sessions = ("other-task-session", "--last", "", 0, ["session"])
+        for log_case in log_cases:
+            for index, session in enumerate(sessions):
+                with self.subTest(log=log_case, session=session):
+                    task = {**original, "status": "interrupted", "session_id": session}
+                    directory = self.state.directory / "runs" / task["id"] / f"{log_case}-{index}"
+                    if log_case != "no-run":
+                        directory.mkdir(parents=True)
+                        log = directory / "events.jsonl"
+                        if log_case == "empty":
+                            log.touch()
+                        elif log_case == "turn-only":
+                            log.write_text(json.dumps({"type": "turn.started"}) + "\n")
+                        task.update(last_run=str(directory), event_log=str(log))
+                    self.state.save(task)
+                    reason = "another task" if session == "other-task-session" else "session ID is invalid"
+                    with (patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}),
+                          self.assertRaisesRegex(RelayError, reason)):
+                        self.run_task(resume=True)
+                    self.assertFalse(trace.exists(), "Codex must not receive a rejected session's prompt")
+                    saved = self.state.get(task["id"])
+                    self.assertEqual(saved.get("last_run"), task.get("last_run"))
+                    self.assertEqual(saved.get("event_log"), task.get("event_log"))
+
     def test_blocked_worker_does_not_run_acceptance(self):
         with patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "blocked"}):
             task = self.run_task()

@@ -27,8 +27,8 @@ def build_command(config, directory, session=None, *, sandbox=None):
         if settings.get(option):
             argv += ["--" + option, settings[option]]
     argv += ["exec"]
-    if session:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", session):
+    if session is not None:
+        if not _valid_session(session):
             raise RelayError("Saved Codex session ID is invalid; refusing implicit session selection")
         argv += ["resume", session]
     else:
@@ -41,14 +41,18 @@ def _valid_session(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value)
 
 
+def _check_session_owner(state, task, session):
+    if any(item["id"] != task["id"] and item.get("session_id") == session for item in state.tasks()):
+        raise RelayError("Codex session ID belongs to another task; refusing cross-task recovery")
+
+
 def _record_session(state, task, event):
     if event.get("type") != "thread.started":
         return
     session = event.get("thread_id")
     if not _valid_session(session):
         raise RelayError("Codex returned an invalid session ID")
-    if any(item["id"] != task["id"] and item.get("session_id") == session for item in state.tasks()):
-        raise RelayError("Codex session ID belongs to another task; refusing cross-task recovery")
+    _check_session_owner(state, task, session)
     if task.get("session_id") and session != task["session_id"]:
         raise RelayError("Codex resumed a different session; inspect the saved run before continuing")
     if task.get("session_id") != session:
@@ -92,6 +96,11 @@ def _read_events(state, task, log, *, recovering=False):
 
 
 def _recover_previous_run(state, task):
+    session = task.get("session_id")
+    if session is not None:
+        if not _valid_session(session):
+            raise RelayError("Saved Codex session ID is invalid; refusing implicit session selection")
+        _check_session_owner(state, task, session)
     previous = task.get("last_run")
     if not previous:
         return
