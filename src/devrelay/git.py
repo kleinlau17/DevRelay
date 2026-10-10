@@ -57,10 +57,24 @@ def _gitlink_paths(root, *, env=None):
 
 
 def _submodule_checkout(root, path):
-    checkout = (root / path).resolve()
+    candidate = root / path
+    if candidate.is_symlink():
+        return None
+    checkout = candidate.resolve()
     if not checkout.is_dir() or not (checkout / ".git").exists():
         return None
     return checkout if Path(git(checkout, "rev-parse", "--show-toplevel")).resolve() == checkout else None
+
+
+def _skipped_submodule_has_content(root, path):
+    candidate = root / path
+    if candidate.is_symlink():
+        return True
+    if not candidate.exists():
+        return False
+    if not candidate.is_dir():
+        return True
+    return next(candidate.iterdir(), None) is not None
 
 
 def _submodule_heads(root, paths):
@@ -76,11 +90,15 @@ def _submodule_snapshot(root, paths, prefix=Path(), seen=None):
     heads, dirty = {}, []
     seen = set() if seen is None else seen
     for path in paths:
+        display = (prefix / path).as_posix()
         checkout = _submodule_checkout(root, path)
-        if checkout is None or checkout in seen:
+        if checkout is None:
+            if _skipped_submodule_has_content(root, path):
+                raise RelayError(f"Submodule path is not initialized but contains files: {display}")
+            continue
+        if checkout in seen:
             continue
         seen.add(checkout)
-        display = (prefix / path).as_posix()
         heads[display] = git(checkout, "rev-parse", "HEAD")
         head_tree = git(checkout, "rev-parse", "HEAD^{tree}")
         if (git(checkout, "write-tree") != head_tree

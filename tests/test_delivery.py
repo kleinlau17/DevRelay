@@ -68,6 +68,20 @@ class GitHubDeliveryFixture(RepositoryTest):
         with self.state.lock():
             return run_task(self.config, self.state, "12")
 
+    def add_dependency_submodule(self):
+        source = Path(self.temporary.name) / "delivery-dependency"
+        source.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+        subprocess.run(["git", "config", "user.name", "DevRelay Test"], cwd=source, check=True)
+        subprocess.run(["git", "config", "user.email", "devrelay@example.invalid"], cwd=source, check=True)
+        (source / "dependency.txt").write_text("delivered\n")
+        subprocess.run(["git", "add", "."], cwd=source, check=True)
+        subprocess.run(["git", "commit", "-qm", "dependency"], cwd=source, check=True)
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+                        str(source), "vendor/dependency"], cwd=self.root, check=True)
+        self.git("commit", "-qam", "add dependency")
+        self.git("push", "-q", "origin", "main")
+
 
 class GitHubDeliveryTests(GitHubDeliveryFixture):
     def test_verified_branch_is_pushed_and_draft_pr_is_read_back(self):
@@ -109,6 +123,27 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
         self.assertEqual(self.create_count, 0)
         refs = subprocess.check_output(["git", "--git-dir", str(self.remote), "for-each-ref", "--format=%(refname)"] , text=True)
         self.assertNotIn("devrelay/task-12", refs)
+
+    def test_pre_push_submodule_mutation_blocks_pr_creation(self):
+        self.add_dependency_submodule()
+        task = self.implement()
+        worktree = Path(task["worktree"])
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init",
+                        "--recursive"], cwd=worktree, check=True)
+        hooks = Path(self.temporary.name) / "push-hooks"
+        hooks.mkdir()
+        hook = hooks / "pre-push"
+        hook.write_text("#!/bin/sh\nprintf 'push mutation\\n' > vendor/dependency/from-push.txt\n")
+        hook.chmod(0o755)
+        self.git("config", "core.hooksPath", str(hooks), cwd=worktree)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree"):
+            submit(self.config, self.state, "12")
+        saved = self.state.get("12")
+        pushed = subprocess.check_output(
+            ["git", "--git-dir", str(self.remote), "rev-parse", saved["branch"]], text=True).strip()
+        self.assertEqual(pushed, saved["head_sha"])
+        self.assertEqual(self.create_count, 0)
+        self.assertEqual((worktree / "vendor/dependency/from-push.txt").read_text(), "push mutation\n")
 
 
 if __name__ == "__main__":

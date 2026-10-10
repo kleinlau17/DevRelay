@@ -263,6 +263,8 @@ def submit(config, state, identifier, *, local=False):
     if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
         raise RelayError("Source or HEAD changed before push; rerun verification")
     git(path, "push", "--set-upstream", config.remote, task["branch"])
+    if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
+        raise RelayError("Source or HEAD changed during push; rerun verification before opening a PR")
     summary = task.get("summary") or "Implementation verified by configured project checks."
     check_lines = "\n".join(f"- `{item['id']}`: exit {item['returncode']}" for item in record["checks"])
     body = (f"{summary}\n\nVerification\n\n{check_lines}\n\n"

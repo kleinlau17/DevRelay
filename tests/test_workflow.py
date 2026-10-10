@@ -239,7 +239,7 @@ class SubmoduleWorkflowTests(RepositoryTest):
         subprocess.run(["git", "commit", "-qam", "add nested dependency"],
                        cwd=self.dependency_source, check=True)
 
-    def _prepare(self, checks=None):
+    def _prepare(self, checks=None, *, initialize=True):
         subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
                         str(self.dependency_source), "vendor/dependency"], cwd=self.root, check=True)
         subprocess.run(["git", "config", "-f", ".gitmodules", "submodule.vendor/dependency.ignore", "all"],
@@ -251,11 +251,12 @@ class SubmoduleWorkflowTests(RepositoryTest):
         with self.state.lock():
             task = start(self.config, self.state, "fix-1")
         worktree = Path(task["worktree"])
-        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init",
-                        "--recursive"], cwd=worktree, check=True)
         dependency = worktree / "vendor/dependency"
-        subprocess.run(["git", "config", "user.name", "DevRelay Test"], cwd=dependency, check=True)
-        subprocess.run(["git", "config", "user.email", "devrelay@example.invalid"], cwd=dependency, check=True)
+        if initialize:
+            subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init",
+                            "--recursive"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "DevRelay Test"], cwd=dependency, check=True)
+            subprocess.run(["git", "config", "user.email", "devrelay@example.invalid"], cwd=dependency, check=True)
         return worktree, dependency
 
     def test_tracked_submodule_change_cannot_be_hidden_by_ignore_configuration(self):
@@ -305,6 +306,18 @@ class SubmoduleWorkflowTests(RepositoryTest):
         with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
             verify(self.config, self.state, "fix-1")
         self.assertTrue((dependency / "untracked.txt").is_file())
+
+    def test_uninitialized_submodule_with_files_blocks_verification(self):
+        checks = [[sys.executable, "-c",
+                   "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').read_text() == 'fixed\\n'"]]
+        worktree, dependency = self._prepare(checks, initialize=False)
+        source_tree(worktree)
+        dependency.mkdir(parents=True, exist_ok=True)
+        (dependency / "dependency.txt").write_text("fixed\n")
+        with self.state.lock(), self.assertRaisesRegex(
+                RelayError, "not initialized.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
 
     def test_dirty_nested_submodule_is_detected_recursively(self):
         self._add_nested_submodule()
