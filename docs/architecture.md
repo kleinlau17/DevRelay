@@ -5,6 +5,7 @@
 | Module | Responsibility / 职责 |
 |---|---|
 | `config` | Validated TOML, command discovery / 配置校验与命令识别 |
+| `onboarding` | Add missing GitHub labels and safe issue templates / 补齐标签与不预设执行授权的模板 |
 | `providers` | Local and GitHub snapshots, priorities, dependencies / 任务快照、优先级与依赖 |
 | `git` | Worktrees and source hashing / 工作树与源码哈希 |
 | `state` | Shared SQLite state and POSIX single-worker lock / 状态与单 worker 锁 |
@@ -35,6 +36,7 @@ State is saved before long-running phases. Main-checkout configuration controls 
 ## Boundaries / 边界
 
 - One controller, one worker per Git repository; POSIX lock, no distributed leases.
+- GitHub onboarding creates only missing repository labels and local template files under the worker lock. It never assigns issue labels or authorization. Existing files/definitions remain intact; uncertain creates are read back and `init --sync-github` repairs partial setup. Templates become public only after normal Git delivery to the default branch.
 - Each invocation has bounded attempts and command timeouts; explicit resume may grant a new bounded attempt window.
 - Default Codex sandbox is workspace-write; approval policy is never, so permission failures become actionable failures rather than unattended prompts.
 - Delivery defaults to draft PR. Project configuration may opt into fresh read-only AI review and exact-head squash merging; GitHub human approvals and protection still apply.
@@ -43,7 +45,7 @@ State is saved before long-running phases. Main-checkout configuration controls 
 - Cleanup defaults off for task resources. Successful acceptance scratch trees are removed; failed trees/evidence remain. Optional task worktree and exact-head branch cleanup checkpoints each step; recovery reads actual refs without assuming the original checkout still exists.
 - Remote deletion uses an explicit expected SHA lease; local/remote-tracking ref deletion uses compare-and-swap. Worktree removal is never forced. Git operations outside DevRelay still require coordination with the repository worker.
 - Completed GitHub tasks stay claimed in shared state even after their branches/worktrees are removed, preventing repeat dispatch of still-open scoped Issues.
-- No scheduler, remote compute adapter, automatic conflict resolution, release adapter or cross-repository transaction in version 0.3.
+- No scheduler, remote compute adapter, automatic conflict resolution, release adapter or cross-repository transaction in version 0.4.
 - Project commands may require services, credentials or hardware; DevRelay does not provision them.
 - Process markers detect remaining foreground groups after controller crashes. Commands must not daemonize or escape the group. There is a brief spawn-to-marker crash window; this is cooperative recovery, not an OS isolation guarantee.
 

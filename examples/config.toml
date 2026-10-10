@@ -7,6 +7,8 @@ remote = "origin"
 branch_prefix = "devrelay/task-"
 
 [queue]
+# init creates missing labels; templates never pre-apply authorization or priorities.
+# init --sync-github honors customized queue label names without overwriting existing labels/files.
 approval_label = "auto:approved"
 priorities = ["priority:P0", "priority:P1", "priority:P2"]
 blockers = ["blocked", "needs-input"]
