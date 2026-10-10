@@ -12,6 +12,7 @@ from .config import initialize, load
 from .delivery import merge, review
 from .errors import RelayError
 from .git import has_ref, repository_root, validate_remote, worktrees
+from .onboarding import setup_github
 from .providers import add_local, queue_report, snapshot
 from .runner import complete_local, run_task, start, submit, verify
 from .state import State
@@ -22,9 +23,11 @@ def parser():
     root.add_argument("--version", action="version", version=__version__)
     root.add_argument("--project", type=Path, default=Path.cwd(), help="Project directory (default: current directory)")
     sub = root.add_subparsers(dest="command", required=True)
-    init = sub.add_parser("init", help="Detect project commands and create .devrelay/config.toml")
+    init = sub.add_parser("init", help="Create project configuration and initialize GitHub issue management")
     init.add_argument("--provider", choices=("local", "github"))
     init.add_argument("--base", help="Target branch; detected from origin/HEAD, main, master or current branch")
+    init.add_argument("--sync-github", action="store_true",
+                      help="Add missing GitHub labels/templates using existing configuration; do not overwrite it")
     sub.add_parser("doctor", help="Check configuration, tools, login and base")
     sub.add_parser("next", help="Explain eligible tasks and exclusions; does not claim work")
     sub.add_parser("status", help="Read local task state and evidence locations")
@@ -101,8 +104,18 @@ def main(argv=None):
         state = State(root)
         root = controller(root, state)
         if args.command == "init":
-            result = initialize(root, args.provider, args.base)
-            state.set_metadata("controller_root", str(root))
+            with state.lock():
+                if args.sync_github:
+                    if args.provider or args.base:
+                        raise RelayError("--sync-github uses existing configuration; omit --provider and --base")
+                    config = load(root)
+                    result = {"config": str(root / ".devrelay/config.toml"), "provider": config.provider}
+                else:
+                    result = initialize(root, args.provider, args.base)
+                    config = load(root)
+                state.set_metadata("controller_root", str(root))
+                if config.provider == "github" or args.sync_github:
+                    result["github"] = setup_github(config)
         else:
             config = load(root)
             if args.command == "doctor":
