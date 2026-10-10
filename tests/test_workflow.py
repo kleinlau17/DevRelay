@@ -111,25 +111,65 @@ class WorkflowTests(RepositoryTest):
         self.assertNotIn("--last", invocations[1]["argv"])
 
     def test_controller_crash_log_recovers_session_before_new_codex_run(self):
-        with self.state.lock():
-            task = start(self.config, self.state, "fix-1")
-        task["setup_fingerprint"] = self.config.fingerprint
-        task["status"] = "implementing"
-        directory = self.state.directory / "runs" / task["id"] / "crashed-codex"
-        directory.mkdir(parents=True)
-        (directory / "events.jsonl").write_text(
-            json.dumps({"type": "thread.started", "thread_id": "started-session"}) + "\n")
-        task["last_run"] = str(directory)
-        task["event_log"] = str(directory / "events.jsonl")
-        self.state.save(task)
         trace = Path(self.temporary.name) / "crash-trace.jsonl"
+        source = Path(__file__).resolve().parents[1] / "src"
+        command = [sys.executable, "-c", "from devrelay.cli import main; raise SystemExit(main())",
+                   "--project", str(self.root)]
+        environment = {**os.environ, "PYTHONPATH": str(source), "DEVRELAY_TEST_TRACE": str(trace)}
+        environment.pop("DEVRELAY_TEST_MODE", None)
+        controller = subprocess.Popen([*command, "run", "fix-1"], env={**environment,
+                                      "DEVRELAY_TEST_MODE": "controller-crash"},
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        group = None
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                task = self.state.get("fix-1")
+                active = self.state.metadata("active_process")
+                if task and task.get("last_run") and task.get("event_log") and active:
+                    events = Path(task["event_log"])
+                    if events.exists() and '"thread_id": "started-session"' in events.read_text():
+                        group = active["group"]
+                        break
+                if controller.poll() is not None:
+                    output, error = controller.communicate()
+                    self.fail(f"controller exited before crash boundary: {output} {error}")
+                time.sleep(0.01)
+            else:
+                self.fail("controller did not persist its run index and first thread event")
 
-        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
-            result = self.run_task(resume=True)
-        invocation = json.loads(trace.read_text().splitlines()[0])
-        self.assertEqual(result["status"], "verified")
-        self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1], "started-session")
-        self.assertEqual(self.state.get("fix-1")["session_id"], "started-session")
+            self.assertEqual(task["event_log"], str(Path(task["last_run"]) / "events.jsonl"))
+            self.assertIsNone(task.get("session_id"))
+            controller.kill()
+            controller.communicate(timeout=5)
+            self.assertEqual(controller.returncode, -signal.SIGKILL)
+
+            blocked = subprocess.run([*command, "resume", "fix-1"], env=environment,
+                                     capture_output=True, text=True, timeout=5)
+            self.assertEqual(blocked.returncode, 1)
+            self.assertIn("still runs in process group", blocked.stderr)
+            self.assertEqual(len(trace.read_text().splitlines()), 1)
+
+            os.killpg(group, signal.SIGKILL)
+            time.sleep(0.1)
+            resumed = subprocess.run([*command, "resume", "fix-1"], env=environment,
+                                     capture_output=True, text=True, timeout=15)
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            invocations = [json.loads(line) for line in trace.read_text().splitlines()]
+            argv = invocations[1]["argv"]
+            self.assertEqual(argv[argv.index("resume") + 1], "started-session")
+            self.assertNotIn("--last", argv)
+            self.assertEqual(self.state.get("fix-1")["status"], "verified")
+        finally:
+            if controller.poll() is None:
+                controller.kill()
+                controller.communicate(timeout=5)
+            active = self.state.metadata("active_process")
+            for candidate in {group, active.get("group") if active else None} - {None}:
+                try:
+                    os.killpg(candidate, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_incomplete_or_conflicting_recovery_events_fail_closed(self):
         cases = [

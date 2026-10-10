@@ -80,10 +80,15 @@ if 'verdict' in schema['properties']:
     if review_mode != 'incomplete':
         print(json.dumps({'type': 'turn.completed'}), flush=True)
     raise SystemExit(0)
-session = args[args.index('resume') + 1] if 'resume' in args else 'exact-test-session'
+session = (args[args.index('resume') + 1] if 'resume' in args else
+           'started-session' if mode == 'controller-crash' else 'exact-test-session')
 if mode == 'stderr-command-failure':
     print('ordinary CLI diagnostic', file=sys.stderr, flush=True)
+if mode == 'controller-crash' and 'resume' not in args:
+    os.kill(os.getppid(), signal.SIGSTOP)
 print(json.dumps({'type': 'thread.started', 'thread_id': session}), flush=True)
+if mode == 'controller-crash' and 'resume' not in args:
+    time.sleep(30)
 if mode == 'interrupt':
     os.kill(os.getppid(), signal.SIGINT)
     time.sleep(30)
