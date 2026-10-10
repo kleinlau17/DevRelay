@@ -7,7 +7,7 @@ import uuid
 from . import codex
 from .config import load
 from .errors import RelayError
-from .git import git, has_ref, is_ancestor, source_tree, validate_remote, worktrees
+from .git import git, has_ref, is_ancestor, source_tree, stage_submodule_gitlinks, validate_remote, worktrees
 from .process import execute
 from .providers import authorized, gh, gh_json, queue_report, snapshot, task_id
 from .state import now
@@ -243,6 +243,7 @@ def submit(config, state, identifier, *, local=False):
     if current != record["head_sha"] and current != task.get("head_sha"):
         raise RelayError("HEAD changed since verification; rerun checks")
     git(path, "add", "-A")
+    stage_submodule_gitlinks(path)
     if git(path, "write-tree") != record["source_tree"]:
         raise RelayError("Staged source differs from verified source")
     if git(path, "diff", "--cached", "--name-only", "--ignore-submodules=none"):

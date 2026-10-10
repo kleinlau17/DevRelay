@@ -239,11 +239,12 @@ class SubmoduleWorkflowTests(RepositoryTest):
         subprocess.run(["git", "commit", "-qam", "add nested dependency"],
                        cwd=self.dependency_source, check=True)
 
-    def _prepare(self, checks=None, *, initialize=True):
+    def _prepare(self, checks=None, *, initialize=True, gitmodules_ignore=True):
         subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
                         str(self.dependency_source), "vendor/dependency"], cwd=self.root, check=True)
-        subprocess.run(["git", "config", "-f", ".gitmodules", "submodule.vendor/dependency.ignore", "all"],
-                       cwd=self.root, check=True)
+        if gitmodules_ignore:
+            subprocess.run(["git", "config", "-f", ".gitmodules",
+                            "submodule.vendor/dependency.ignore", "all"], cwd=self.root, check=True)
         self.git("commit", "-qam", "add dependency")
         self.configure(checks=checks or [[sys.executable, "-c", "pass"]])
         add_local(self.config, self.state, "fix-1", "Fix dependency", "Update the dependency.\nDepends on: none",
@@ -363,21 +364,34 @@ class SubmoduleWorkflowTests(RepositoryTest):
             submit(self.config, self.state, "fix-1", local=True)
         self.assertEqual((dependency / "from-hook.txt").read_text(), "hook mutation\n")
 
-    def test_committed_submodule_head_is_delivered_by_parent_gitlink(self):
-        worktree, dependency = self._prepare([[sys.executable, "-c",
-                                               "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').read_text() == 'fixed\\n'"]])
+    def _assert_committed_submodule_head_is_delivered(self, *, gitmodules_ignore, local_ignore):
+        worktree, dependency = self._prepare(
+            [[sys.executable, "-c",
+              "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').read_text() == 'fixed\\n'"]],
+            gitmodules_ignore=gitmodules_ignore)
         (dependency / "dependency.txt").write_text("fixed\n")
         self.git("add", "dependency.txt", cwd=dependency)
         self.git("commit", "-qm", "fix dependency", cwd=dependency)
         submodule_head = self.git("rev-parse", "HEAD", cwd=dependency)
         self.git("push", "-q", "origin", "HEAD:main", cwd=dependency)
-        self.git("config", "submodule.vendor/dependency.ignore", "all", cwd=worktree)
+        if local_ignore:
+            self.git("config", "submodule.vendor/dependency.ignore", "all", cwd=worktree)
+        (worktree / ".gitignore").write_text("local.cache\n")
+        (worktree / "local.cache").write_text("not source\n")
         with self.state.lock():
             verified = verify(self.config, self.state, "fix-1")
             committed = submit(self.config, self.state, "fix-1", local=True)
         self.assertTrue(verified["verification"]["passed"])
         self.assertEqual(committed["status"], "committed")
         self.assertIn(submodule_head, self.git("ls-tree", "HEAD", "vendor/dependency", cwd=worktree))
+        self.assertEqual(self.git("ls-tree", "HEAD", "local.cache", cwd=worktree), "")
+        self.assertEqual((worktree / "local.cache").read_text(), "not source\n")
+
+    def test_committed_submodule_head_is_delivered_with_gitmodules_ignore(self):
+        self._assert_committed_submodule_head_is_delivered(gitmodules_ignore=True, local_ignore=False)
+
+    def test_committed_submodule_head_is_delivered_with_local_ignore(self):
+        self._assert_committed_submodule_head_is_delivered(gitmodules_ignore=False, local_ignore=True)
 
 
 class LockAndProcessTests(RepositoryTest):

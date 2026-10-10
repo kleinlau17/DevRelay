@@ -144,6 +144,12 @@ def source_tree(root):
     return _isolated_source_tree(root, inspect_submodules=True)
 
 
+def stage_submodule_gitlinks(root):
+    paths = [path for path in _gitlink_paths(root) if _submodule_checkout(root, path) is not None]
+    if paths:
+        git(root, "add", "--force", "--", *paths)
+
+
 def github_slug(url):
     match = re.fullmatch(
         r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([\w.-]+)/([\w.-]+?)(?:\.git)?/?",
