@@ -1,6 +1,7 @@
 from contextlib import ExitStack
 import json
 from pathlib import Path
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -106,6 +107,20 @@ class MergeTests(GitHubDeliveryFixture):
         with self.state.lock():
             return submit(self.config, self.state, "12")
 
+    def add_dependency_submodule(self):
+        source = Path(self.temporary.name) / "review-dependency"
+        source.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+        subprocess.run(["git", "config", "user.name", "DevRelay Test"], cwd=source, check=True)
+        subprocess.run(["git", "config", "user.email", "devrelay@example.invalid"], cwd=source, check=True)
+        (source / "dependency.txt").write_text("delivered\n")
+        subprocess.run(["git", "add", "."], cwd=source, check=True)
+        subprocess.run(["git", "commit", "-qm", "dependency"], cwd=source, check=True)
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+                        str(source), "vendor/dependency"], cwd=self.root, check=True)
+        self.git("commit", "-qam", "add dependency")
+        self.git("push", "-q", "origin", "main")
+
     def test_opt_in_runs_fresh_review_exact_head_merge_and_real_post_checks(self):
         self.enable(required_checks=["test"])
         trace = Path(self.temporary.name) / "trace.jsonl"
@@ -178,6 +193,19 @@ class MergeTests(GitHubDeliveryFixture):
             with self.assertRaisesRegex(RelayError, "stale"):
                 self.deliver()
         self.assertEqual(self.merge_count, 0)
+
+    def test_dirty_submodule_blocks_review_gate(self):
+        self.add_dependency_submodule()
+        task = self.deliver()
+        worktree = Path(task["worktree"])
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init",
+                        "--recursive"], cwd=worktree, check=True)
+        dependency = worktree / "vendor/dependency/dependency.txt"
+        dependency.write_text("not delivered\n")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree"):
+            review(self.config, self.state, "12")
+        self.assertEqual(self.state.get("12")["status"], "review_blocked")
+        self.assertEqual(dependency.read_text(), "not delivered\n")
 
     def test_ci_waiting_reuses_review_then_completes_without_reimplementation(self):
         self.enable(required_checks=["test"])

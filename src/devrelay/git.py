@@ -44,13 +44,65 @@ def is_ancestor(root, commit, ref):
                           cwd=root, capture_output=True).returncode == 0
 
 
+def _gitlink_paths(root, *, env=None):
+    paths = []
+    for entry in git(root, "ls-files", "--stage", "-z", env=env).split("\0"):
+        if not entry:
+            continue
+        metadata, separator, path = entry.partition("\t")
+        fields = metadata.split()
+        if separator and len(fields) == 3 and fields[0] == "160000" and fields[2] == "0":
+            paths.append(path)
+    return paths
+
+
+def _submodule_snapshot(root, paths, prefix=Path(), seen=None):
+    heads, dirty = {}, []
+    seen = set() if seen is None else seen
+    for path in paths:
+        checkout = (root / path).resolve()
+        if not checkout.is_dir() or not (checkout / ".git").exists() or checkout in seen:
+            continue
+        top = Path(git(checkout, "rev-parse", "--show-toplevel")).resolve()
+        if top != checkout:
+            continue
+        seen.add(checkout)
+        display = (prefix / path).as_posix()
+        heads[display] = git(checkout, "rev-parse", "HEAD")
+        status = git(checkout, "-c", "core.excludesFile=/dev/null", "-c", "status.showUntrackedFiles=all",
+                     "status", "--porcelain=v1", "-z",
+                     "--untracked-files=all", "--ignore-submodules=none")
+        if status:
+            dirty.append(display)
+        nested_heads, nested_dirty = _submodule_snapshot(
+            checkout, _gitlink_paths(checkout), prefix / path, seen)
+        heads.update(nested_heads)
+        dirty.extend(nested_dirty)
+    return heads, dirty
+
+
+def _clean_submodule_snapshot(root, paths):
+    heads, dirty = _submodule_snapshot(root, paths)
+    if dirty:
+        raise RelayError("Submodule worktree has uncommitted changes: " + ", ".join(sorted(set(dirty))))
+    return heads
+
+
 def source_tree(root):
     with tempfile.TemporaryDirectory(prefix="devrelay-index-") as temporary:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
         git(root, "read-tree", "HEAD", env=env)
         git(root, "add", "-A", env=env)
+        paths = _gitlink_paths(root, env=env)
+        submodules = _clean_submodule_snapshot(root, paths)
+        for path in paths:
+            if path in submodules:
+                git(root, "update-index", "--add", "--cacheinfo", "160000", submodules[path], path, env=env)
         git(root, "diff", "--cached", "--check", env=env)
-        return git(root, "write-tree", env=env)
+        tree = git(root, "write-tree", env=env)
+        if _clean_submodule_snapshot(root, paths) != submodules:
+            raise RelayError("Submodule HEAD changed while creating source evidence; rerun verification")
+        return tree
 
 
 def github_slug(url):

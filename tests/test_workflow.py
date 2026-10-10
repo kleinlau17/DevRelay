@@ -215,6 +215,131 @@ class WorkflowTests(RepositoryTest):
             submit(self.config, self.state, "fix-1", local=True)
 
 
+class SubmoduleWorkflowTests(RepositoryTest):
+    def setUp(self):
+        super().setUp()
+        self.dependency_source = Path(self.temporary.name) / "dependency-source"
+        self._initialize_repository(self.dependency_source, "dependency.txt", "broken\n")
+
+    def _initialize_repository(self, path, filename, content):
+        path.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+        subprocess.run(["git", "config", "user.name", "DevRelay Test"], cwd=path, check=True)
+        subprocess.run(["git", "config", "user.email", "devrelay@example.invalid"], cwd=path, check=True)
+        subprocess.run(["git", "config", "receive.denyCurrentBranch", "updateInstead"], cwd=path, check=True)
+        (path / filename).write_text(content)
+        subprocess.run(["git", "add", "."], cwd=path, check=True)
+        subprocess.run(["git", "commit", "-qm", "initial"], cwd=path, check=True)
+
+    def _add_nested_submodule(self):
+        nested_source = Path(self.temporary.name) / "nested-source"
+        self._initialize_repository(nested_source, "nested.txt", "nested\n")
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+                        str(nested_source), "nested/inner"], cwd=self.dependency_source, check=True)
+        subprocess.run(["git", "commit", "-qam", "add nested dependency"],
+                       cwd=self.dependency_source, check=True)
+
+    def _prepare(self, checks=None):
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+                        str(self.dependency_source), "vendor/dependency"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "-f", ".gitmodules", "submodule.vendor/dependency.ignore", "all"],
+                       cwd=self.root, check=True)
+        self.git("commit", "-qam", "add dependency")
+        self.configure(checks=checks or [[sys.executable, "-c", "pass"]])
+        add_local(self.config, self.state, "fix-1", "Fix dependency", "Update the dependency.\nDepends on: none",
+                  "priority:P1")
+        with self.state.lock():
+            task = start(self.config, self.state, "fix-1")
+        worktree = Path(task["worktree"])
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init",
+                        "--recursive"], cwd=worktree, check=True)
+        dependency = worktree / "vendor/dependency"
+        subprocess.run(["git", "config", "user.name", "DevRelay Test"], cwd=dependency, check=True)
+        subprocess.run(["git", "config", "user.email", "devrelay@example.invalid"], cwd=dependency, check=True)
+        return worktree, dependency
+
+    def test_tracked_submodule_change_cannot_be_hidden_by_ignore_configuration(self):
+        worktree, dependency = self._prepare()
+        (dependency / "dependency.txt").write_text("fixed\n")
+        self.git("config", "submodule.vendor/dependency.ignore", "all", cwd=worktree)
+        self.git("config", "status.showUntrackedFiles", "no", cwd=dependency)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+
+    def test_untracked_submodule_file_cannot_be_hidden_by_status_configuration(self):
+        worktree, dependency = self._prepare()
+        (dependency / "untracked.txt").write_text("not delivered\n")
+        excludes = Path(self.temporary.name) / "global-excludes"
+        excludes.write_text("*.txt\n")
+        self.git("config", "submodule.vendor/dependency.ignore", "untracked", cwd=worktree)
+        self.git("config", "core.excludesFile", str(excludes), cwd=dependency)
+        self.git("config", "status.showUntrackedFiles", "no", cwd=dependency)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertTrue((dependency / "untracked.txt").is_file())
+
+    def test_dirty_nested_submodule_is_detected_recursively(self):
+        self._add_nested_submodule()
+        worktree, dependency = self._prepare()
+        nested = dependency / "nested/inner"
+        (nested / "nested.txt").write_text("dirty nested source\n")
+        self.git("config", "submodule.vendor/dependency.ignore", "all", cwd=worktree)
+        self.git("config", "submodule.nested/inner.ignore", "all", cwd=dependency)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "vendor/dependency/nested/inner"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual((nested / "nested.txt").read_text(), "dirty nested source\n")
+
+    def test_submodule_change_during_checks_invalidates_verification(self):
+        checks = [[sys.executable, "-c",
+                   "from pathlib import Path; Path('vendor/dependency/dependency.txt').write_text('during checks\\n')"]]
+        _, dependency = self._prepare(checks)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual(self.state.get("fix-1")["status"], "failed")
+        self.assertEqual((dependency / "dependency.txt").read_text(), "during checks\n")
+
+    def test_submodule_change_after_checks_invalidates_submission(self):
+        _, dependency = self._prepare()
+        with self.state.lock():
+            verify(self.config, self.state, "fix-1")
+        (dependency / "after-checks.txt").write_text("not verified\n")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree"):
+            submit(self.config, self.state, "fix-1", local=True)
+        self.assertTrue((dependency / "after-checks.txt").is_file())
+
+    def test_submodule_change_from_parent_commit_hook_blocks_submission(self):
+        worktree, dependency = self._prepare()
+        (worktree / "value.txt").write_text("fixed\n")
+        with self.state.lock():
+            verify(self.config, self.state, "fix-1")
+        hooks = Path(self.temporary.name) / "hooks"
+        hooks.mkdir()
+        hook = hooks / "pre-commit"
+        hook.write_text("#!/bin/sh\nprintf 'hook mutation\\n' > vendor/dependency/from-hook.txt\n")
+        hook.chmod(0o755)
+        self.git("config", "core.hooksPath", str(hooks), cwd=worktree)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree"):
+            submit(self.config, self.state, "fix-1", local=True)
+        self.assertEqual((dependency / "from-hook.txt").read_text(), "hook mutation\n")
+
+    def test_committed_submodule_head_is_delivered_by_parent_gitlink(self):
+        worktree, dependency = self._prepare([[sys.executable, "-c",
+                                               "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').read_text() == 'fixed\\n'"]])
+        (dependency / "dependency.txt").write_text("fixed\n")
+        self.git("add", "dependency.txt", cwd=dependency)
+        self.git("commit", "-qm", "fix dependency", cwd=dependency)
+        submodule_head = self.git("rev-parse", "HEAD", cwd=dependency)
+        self.git("push", "-q", "origin", "HEAD:main", cwd=dependency)
+        self.git("config", "submodule.vendor/dependency.ignore", "all", cwd=worktree)
+        with self.state.lock():
+            verified = verify(self.config, self.state, "fix-1")
+            committed = submit(self.config, self.state, "fix-1", local=True)
+        self.assertTrue(verified["verification"]["passed"])
+        self.assertEqual(committed["status"], "committed")
+        self.assertIn(submodule_head, self.git("ls-tree", "HEAD", "vendor/dependency", cwd=worktree))
+
+
 class LockAndProcessTests(RepositoryTest):
     def setUp(self):
         super().setUp()

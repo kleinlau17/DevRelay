@@ -113,7 +113,9 @@ Adding a local task explicitly approves it; a missing dependency declaration bec
 
 ## Evidence and recovery
 
-Verification binds source tree, HEAD, target base, configuration and task requirements. Temporary Git indexes hash tracked changes and non-ignored new files without modifying the original index. Source/history/base/configuration/requirements drift invalidates evidence. Integrate a newer base manually and rerun checks; existing work is never reset automatically.
+Verification binds source tree, HEAD, target base, configuration and task requirements. Temporary Git indexes hash tracked changes and non-ignored new files without modifying the original index. Checked-out submodules are inspected recursively for tracked changes and non-ignored untracked files; command-line checks override `submodule.*.ignore`, `.gitmodules` ignore settings and status configuration that hides untracked files. Any dirty submodule blocks acceptance, submission and automatic review/merge gates. DevRelay never commits, cleans, resets or updates submodule work.
+
+Clean committed submodule HEAD changes are included in the source tree through the parent gitlink and can be delivered normally. An uninitialized submodule has no worktree to inspect and is represented by the gitlink recorded in its parent; projects whose checks need submodule contents should initialize them explicitly in `[[setup]]`. Source/history/base/configuration/requirements drift invalidates evidence. Integrate a newer base manually and rerun checks; existing work is never reset automatically.
 
 SQLite state, a repository-wide worker lock, command logs, resource receipts, verification and Codex JSON events live under `devrelay/` in the Git common directory. Every attempt gets a new directory. `devrelay resume ID` uses that task's exact session ID, never `--last`. Timeouts terminate process groups; surviving descendants prevent another worker from starting until they finish.
 

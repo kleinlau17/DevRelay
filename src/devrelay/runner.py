@@ -120,6 +120,8 @@ def verify(config, state, identifier):
         latest = authorized(config, state, identifier)
         if latest["body"] != fresh["body"] or latest["title"] != fresh["title"]:
             raise RelayError("Task requirements changed during verification; resume and revalidate")
+        if source_tree(path) != before or git(path, "rev-parse", "HEAD") != head:
+            raise RelayError("Source or HEAD changed while finalizing verification; rerun the checks")
     except RelayError as error:
         task.update(status="failed", error=str(error))
         state.save(task)
@@ -243,10 +245,10 @@ def submit(config, state, identifier, *, local=False):
     git(path, "add", "-A")
     if git(path, "write-tree") != record["source_tree"]:
         raise RelayError("Staged source differs from verified source")
-    if git(path, "diff", "--cached", "--name-only"):
+    if git(path, "diff", "--cached", "--name-only", "--ignore-submodules=none"):
         git(path, "commit", "-m", f"devrelay: {fresh['title']} ({identifier})")
     head = git(path, "rev-parse", "HEAD")
-    if git(path, "rev-parse", "HEAD^{tree}") != record["source_tree"]:
+    if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD^{tree}") != record["source_tree"]:
         raise RelayError("Commit hooks changed verified content; rerun checks")
     if not int(git(path, "rev-list", "--count", f"{config.base_ref}..HEAD")):
         raise RelayError("No implementation commit to submit")
@@ -258,6 +260,8 @@ def submit(config, state, identifier, *, local=False):
     authorized(config, state, identifier)
     if base_commit(config) != record["base_sha"]:
         raise RelayError("Base changed before push; integrate it and rerun verification")
+    if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
+        raise RelayError("Source or HEAD changed before push; rerun verification")
     git(path, "push", "--set-upstream", config.remote, task["branch"])
     summary = task.get("summary") or "Implementation verified by configured project checks."
     check_lines = "\n".join(f"- `{item['id']}`: exit {item['returncode']}" for item in record["checks"])
