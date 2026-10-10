@@ -1,6 +1,7 @@
 """Codex CLI adapter: exact session IDs, JSON events and structured outcomes."""
 
 import json
+from pathlib import Path
 import re
 
 from .errors import RelayError
@@ -36,7 +37,78 @@ def build_command(config, directory, session=None, *, sandbox=None):
                    "--output-last-message", str(directory / "result.json"), "-"]
 
 
+def _valid_session(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value)
+
+
+def _record_session(state, task, event):
+    if event.get("type") != "thread.started":
+        return
+    session = event.get("thread_id")
+    if not _valid_session(session):
+        raise RelayError("Codex returned an invalid session ID")
+    if any(item["id"] != task["id"] and item.get("session_id") == session for item in state.tasks()):
+        raise RelayError("Codex session ID belongs to another task; refusing cross-task recovery")
+    if task.get("session_id") and session != task["session_id"]:
+        raise RelayError("Codex resumed a different session; inspect the saved run before continuing")
+    if task.get("session_id") != session:
+        task["session_id"] = session
+        state.save(task)
+
+
+def _observe_line(state, task, line, log):
+    if not line.strip():
+        return
+    try:
+        event = json.loads(line)
+    except ValueError as error:
+        raise RelayError(f"Codex event log is incomplete or invalid; inspect {log}") from error
+    if not isinstance(event, dict):
+        raise RelayError(f"Codex event log contains an invalid event; inspect {log}")
+    _record_session(state, task, event)
+
+
+def _read_events(state, task, log, *, recovering=False):
+    completed, failed, saw_event = False, False, False
+    if not log.exists():
+        return completed, failed, saw_event
+    content = log.read_text(errors="replace")
+    for line in content.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError as error:
+            raise RelayError(f"Codex event log is incomplete or invalid; inspect {log}") from error
+        if not isinstance(event, dict):
+            raise RelayError(f"Codex event log contains an invalid event; inspect {log}")
+        saw_event = True
+        _record_session(state, task, event)
+        completed |= event.get("type") == "turn.completed"
+        failed |= event.get("type") == "turn.failed"
+    if recovering and saw_event and not task.get("session_id"):
+        raise RelayError(f"Previous Codex run has events but no valid thread.started; inspect {log}")
+    return completed, failed, saw_event
+
+
+def _recover_previous_run(state, task):
+    previous = task.get("last_run")
+    if not previous:
+        return
+    directory = Path(previous).resolve()
+    expected = (state.directory / "runs" / task["id"]).resolve()
+    try:
+        directory.relative_to(expected)
+    except ValueError as error:
+        raise RelayError("Saved Codex run is outside this task's run directory; refusing recovery") from error
+    log = directory / "events.jsonl"
+    if task.get("event_log") and Path(task["event_log"]).resolve() != log:
+        raise RelayError("Saved Codex event log conflicts with the run directory; refusing recovery")
+    _read_events(state, task, log, recovering=True)
+
+
 def implement(config, state, task, directory, feedback=""):
+    _recover_previous_run(state, task)
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "result-schema.json").write_text(json.dumps(RESULT_SCHEMA, indent=2))
     checks = "\n".join(f"- {entry['id']}: {entry['argv']}" for entry in config.data["checks"])
@@ -61,31 +133,18 @@ Previous verification feedback:
 {feedback or 'None'}
 """
     (directory / "prompt.txt").write_text(prompt)
+    task["last_run"] = str(directory)
+    task["event_log"] = str(directory / "events.jsonl")
+    state.save(task)  # Persist the recovery index before starting Codex.
     failure = None
     try:
         execute(state, build_command(config, directory, task.get("session_id")), task["worktree"],
-                directory / "events.jsonl", config.data["codex"]["timeout_seconds"], input=prompt)
-    except RelayError as error:
+                directory / "events.jsonl", config.data["codex"]["timeout_seconds"], input=prompt,
+                on_output_line=lambda line: _observe_line(state, task, line, directory / "events.jsonl"))
+    except BaseException as error:
         failure = error
-    completed, failed = False, False
     log = directory / "events.jsonl"
-    if log.exists():
-        for line in log.read_text(errors="replace").splitlines():
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            if event.get("type") == "thread.started":
-                session = event.get("thread_id")
-                if not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", session):
-                    raise RelayError("Codex returned an invalid session ID")
-                if task.get("session_id") and session != task["session_id"]:
-                    raise RelayError("Codex resumed a different session; inspect the saved run before continuing")
-                task["session_id"] = session
-            completed |= event.get("type") == "turn.completed"
-            failed |= event.get("type") == "turn.failed"
+    completed, failed, unused = _read_events(state, task, log)
     state.save(task)
     if failure:
         raise failure

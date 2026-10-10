@@ -49,7 +49,7 @@ class RepositoryTest(unittest.TestCase):
     def fake_codex(self):
         executable = Path(self.temporary.name) / "fake-codex"
         executable.write_text('''#!/usr/bin/env python3
-import json, os, sys
+import json, os, signal, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 if args == ['login', 'status']:
@@ -81,8 +81,13 @@ if 'verdict' in schema['properties']:
         print(json.dumps({'type': 'turn.completed'}), flush=True)
     raise SystemExit(0)
 session = args[args.index('resume') + 1] if 'resume' in args else 'exact-test-session'
+if mode == 'stderr-command-failure':
+    print('ordinary CLI diagnostic', file=sys.stderr, flush=True)
 print(json.dumps({'type': 'thread.started', 'thread_id': session}), flush=True)
-if mode == 'command-failure':
+if mode == 'interrupt':
+    os.kill(os.getppid(), signal.SIGINT)
+    time.sleep(30)
+if mode in ('command-failure', 'stderr-command-failure'):
     print(json.dumps({'type': 'turn.failed'}))
     raise SystemExit(9)
 if mode != 'blocked':

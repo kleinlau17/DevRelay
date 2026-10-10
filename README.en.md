@@ -141,7 +141,9 @@ Adding a local task explicitly approves it; a missing dependency declaration bec
 
 Verification binds source tree, HEAD, target base, configuration and task requirements. Temporary Git indexes hash tracked changes and non-ignored new files without modifying the original index. Source/history/base/configuration/requirements drift invalidates evidence. Integrate a newer base manually and rerun checks; existing work is never reset automatically.
 
-SQLite state, a repository-wide worker lock, command logs, resource receipts, verification and Codex JSON events live under `devrelay/` in the Git common directory. Every attempt gets a new directory. `devrelay resume ID` uses that task's exact session ID, never `--last`. Timeouts terminate process groups; surviving descendants prevent another worker from starting until they finish.
+SQLite state, a repository-wide worker lock, command logs, resource receipts, verification and Codex JSON events live under `devrelay/` in the Git common directory. Every attempt gets a new directory. DevRelay records that directory and event-log path before launching Codex, then persists the task's session ID as soon as it receives a valid `thread.started`. `devrelay resume ID` validates the previous log and resumes that exact session, never `--last`. An empty pre-launch log is safe to retry; incomplete, invalid or conflicting session events block recovery.
+
+Ctrl+C and controller crashes cannot silently switch recovery to a new session. Timeouts terminate process groups; `active_process` and the repository lock prevent recovery while the previous process group or any surviving descendants are still running.
 
 Acceptance commands are trusted project code. A zero exit code does not establish business correctness or independent review. Projects control scoring rules, official engine requirements and delivery authorization.
 
