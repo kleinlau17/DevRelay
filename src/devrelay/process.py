@@ -1,6 +1,7 @@
 """Bounded foreground commands with retained logs and crash markers."""
 
 import json
+import locale
 import os
 from pathlib import Path
 import signal
@@ -11,20 +12,81 @@ from .errors import RelayError
 from .state import group_alive, now
 
 
-def execute(state, argv, cwd, log, timeout, *, input=None, env=None):
+def _read_output(reader, pending, on_output_line, *, final=False):
+    pending += reader.read()
+    # JSONL uses LF, not the Unicode separators recognized by str.splitlines().
+    lines = pending.split("\n")
+    pending = lines.pop()
+    for line in lines:
+        on_output_line(line.removesuffix("\r"))
+    if final and pending:
+        on_output_line(pending)
+        pending = ""
+    return pending
+
+
+def _close_stdin(process):
+    stream = process.stdin
+    process.stdin = None
+    if stream is not None:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _stream_output(process, log, timeout, started, input, on_output_line):
+    payload = input.encode(locale.getpreferredencoding(False)) if input is not None else b""
+    offset = 0
+    deadline = started + timeout
+    pending = ""
+    if process.stdin is not None:
+        os.set_blocking(process.stdin.fileno(), False)
+    with log.open(errors="replace", newline="") as reader:
+        while process.poll() is None:
+            pending = _read_output(reader, pending, on_output_line)
+            writes = 0
+            while process.stdin is not None and offset < len(payload) and writes < 16:
+                try:
+                    offset += os.write(process.stdin.fileno(), payload[offset:offset + 65536])
+                    writes += 1
+                except BlockingIOError:
+                    break
+                except OSError:
+                    _close_stdin(process)
+            if process.stdin is not None and offset == len(payload):
+                _close_stdin(process)
+            if time.monotonic() >= deadline:
+                return True
+            time.sleep(0.05)
+        if process.stdin is not None:
+            _close_stdin(process)
+        _read_output(reader, pending, on_output_line, final=True)
+    return False
+
+
+def execute(state, argv, cwd, log, timeout, *, input=None, env=None, on_output_line=None):
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     process = None
     timed_out = False
+    stderr_log = log.with_suffix(log.suffix + ".stderr.log") if on_output_line is not None else None
     with log.open("x") as stream:
+        diagnostics = stderr_log.open("x") if stderr_log is not None else None
         try:
             process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                                       stdout=stream, stderr=subprocess.STDOUT, text=True, env=env,
+                                       stdout=stream, stderr=diagnostics or subprocess.STDOUT,
+                                       text=on_output_line is None, env=env,
                                        start_new_session=True)
             state.set_metadata("active_process", {"group": process.pid, "argv": argv, "started_at": now()})
             try:
-                process.communicate(input, timeout=timeout)
+                if on_output_line is None:
+                    process.communicate(input, timeout=timeout)
+                else:
+                    timed_out = _stream_output(process, log, timeout, started, input, on_output_line)
+                    if timed_out:
+                        terminate(process)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 terminate(process)
@@ -34,6 +96,10 @@ def execute(state, argv, cwd, log, timeout, *, input=None, env=None):
         except OSError as error:
             raise RelayError(f"Cannot start {argv[0]}: {error}") from error
         finally:
+            if diagnostics is not None:
+                diagnostics.close()
+            if process is not None and process.stdin is not None:
+                _close_stdin(process)
             if process is not None and process.poll() is not None:
                 if group_alive(process.pid):
                     # Keep evidence of detached foreground descendants; don't claim a clean finish.
@@ -41,6 +107,8 @@ def execute(state, argv, cwd, log, timeout, *, input=None, env=None):
                 state.set_metadata("active_process", None)
     receipt = {"argv": argv, "cwd": str(cwd), "log": str(log), "returncode": process.returncode,
                "timed_out": timed_out, "wall_seconds": round(time.monotonic() - started, 3), "finished_at": now()}
+    if stderr_log is not None:
+        receipt["stderr_log"] = str(stderr_log)
     log.with_suffix(log.suffix + ".receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     if timed_out or process.returncode:
         raise RelayError(f"{argv[0]} {'timed out' if timed_out else 'failed (' + str(process.returncode) + ')'}; log: {log}")

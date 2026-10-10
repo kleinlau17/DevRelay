@@ -194,7 +194,6 @@ def run_task(config, state, identifier=None, *, resume=False, submit_after=False
             before_head = git(task["worktree"], "rev-parse", "HEAD")
             result = codex.implement(config, state, task, directory, feedback)
             task["summary"] = result["summary"]
-            task["last_run"] = str(directory)
             if git(task["worktree"], "rev-parse", "HEAD") != before_head:
                 raise RelayError("Codex changed Git history; preserve its work and review before continuing")
             assert_config(config)

@@ -2,8 +2,10 @@ import errno
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -71,6 +73,274 @@ class WorkflowTests(RepositoryTest):
         self.assertTrue(Path(task["worktree"]).is_dir())
         result = self.run_task(resume=True)
         self.assertEqual(result["status"], "verified")
+
+    def test_stderr_diagnostic_does_not_corrupt_events_or_exact_resume(self):
+        trace = Path(self.temporary.name) / "stderr-trace.jsonl"
+        with (patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "stderr-command-failure",
+                                     "DEVRELAY_TEST_TRACE": str(trace)}),
+              self.assertRaises(RelayError)):
+            self.run_task()
+        task = self.state.get("fix-1")
+        events = Path(task["event_log"])
+        diagnostics = events.with_suffix(events.suffix + ".stderr.log")
+        self.assertEqual(task["session_id"], "exact-test-session")
+        self.assertNotIn("ordinary CLI diagnostic", events.read_text())
+        self.assertIn("ordinary CLI diagnostic", diagnostics.read_text())
+
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocation = json.loads(trace.read_text().splitlines()[1])
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1],
+                         "exact-test-session")
+
+    def test_chunked_unicode_agent_message_preserves_exact_resume(self):
+        trace = Path(self.temporary.name) / "unicode-trace.jsonl"
+        with (patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "unicode-chunks",
+                                     "DEVRELAY_TEST_TRACE": str(trace)}),
+              self.assertRaises(RelayError)):
+            self.run_task()
+        task = self.state.get("fix-1")
+        self.assertEqual(task["session_id"], "exact-test-session")
+        events = [json.loads(line) for line in Path(task["event_log"]).read_text().split("\n") if line]
+        self.assertEqual(events[1]["item"]["text"], "first\u0085second\u2028third\u2029last")
+        self.assertEqual(events[-1]["type"], "turn.failed")
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocation = json.loads(trace.read_text().split("\n")[1])
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1], "exact-test-session")
+        self.assertNotIn("--last", invocation["argv"])
+
+    def test_upgrade_from_legacy_mixed_log_resumes_exact_session(self):
+        with self.state.lock():
+            task = start(self.config, self.state, "fix-1")
+        directory = self.state.directory / "runs" / task["id"] / "legacy-codex"
+        directory.mkdir(parents=True)
+        log = directory / "events.jsonl"
+        log.write_text("ordinary CLI diagnostic\n" +
+                       json.dumps({"type": "thread.started", "thread_id": "legacy-session"}) + "\n" +
+                       "2026-01-01 WARN ordinary CLI diagnostic\n")
+        task.update(status="interrupted", setup_fingerprint=self.config.fingerprint, session_id="legacy-session",
+                    last_run=str(directory), event_log=str(log))
+        self.state.save(task)
+        trace = Path(self.temporary.name) / "upgrade-trace.jsonl"
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocation = json.loads(trace.read_text().split("\n")[0])
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1], "legacy-session")
+        self.assertNotIn("--last", invocation["argv"])
+        marker = Path(result["event_log"]).with_suffix(".jsonl.format.json")
+        self.assertEqual(json.loads(marker.read_text()), {"format": "stdout-jsonl-v1"})
+
+    def test_foreign_truncated_message_does_not_block_exact_session_resume(self):
+        with self.state.lock():
+            task = start(self.config, self.state, "fix-1")
+        add_local(self.config, self.state, "fix-other", "Other", "Depends on: none", "priority:P1")
+        other_directory = self.state.directory / "runs" / "fix-other" / "crashed-codex"
+        other_directory.mkdir(parents=True)
+        other_log = other_directory / "events.jsonl"
+        other_log.write_text(json.dumps({"type": "thread.started", "thread_id": "other-session"}) + "\n" +
+                             '{"type":"item.completed","item":')
+        other = self.state.get("fix-other")
+        other.update(status="interrupted", last_run=str(other_directory), event_log=str(other_log))
+        self.state.save(other)
+        current = self.state.directory / "runs" / task["id"] / "current-codex"
+        current.mkdir(parents=True)
+        log = current / "events.jsonl"
+        log.write_text(json.dumps({"type": "thread.started", "thread_id": "current-session"}) + "\n")
+        task.update(status="interrupted", setup_fingerprint=self.config.fingerprint, session_id="current-session",
+                    last_run=str(current), event_log=str(log))
+        self.state.save(task)
+        trace = Path(self.temporary.name) / "two-task-trace.jsonl"
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocation = json.loads(trace.read_text().split("\n")[0])
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1], "current-session")
+        self.assertNotIn("--last", invocation["argv"])
+        self.assertIsNone(self.state.get("fix-other").get("session_id"))
+        task = self.state.get("fix-1")
+        task["session_id"] = "other-session"
+        self.state.save(task)
+        with (patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}),
+              self.assertRaisesRegex(RelayError, "another task's implementation log")):
+            self.run_task(resume=True)
+        self.assertEqual(len(trace.read_text().split("\n")) - 1, 1, "Foreign session must not reach Codex")
+
+    def test_interrupt_after_thread_started_resumes_the_exact_session(self):
+        trace = Path(self.temporary.name) / "interrupt-trace.jsonl"
+        with (patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "interrupt", "DEVRELAY_TEST_TRACE": str(trace)}),
+              self.assertRaises(KeyboardInterrupt)):
+            self.run_task()
+        task = self.state.get("fix-1")
+        self.assertEqual(task["status"], "interrupted")
+        self.assertEqual(task["session_id"], "exact-test-session")
+        self.assertEqual(task["event_log"], str(Path(task["last_run"]) / "events.jsonl"))
+
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocations = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(invocations[1]["argv"][invocations[1]["argv"].index("resume") + 1],
+                         "exact-test-session")
+        self.assertNotIn("--last", invocations[1]["argv"])
+
+    def test_controller_crash_log_recovers_session_before_new_codex_run(self):
+        trace = Path(self.temporary.name) / "crash-trace.jsonl"
+        source = Path(__file__).resolve().parents[1] / "src"
+        command = [sys.executable, "-c", "from devrelay.cli import main; raise SystemExit(main())",
+                   "--project", str(self.root)]
+        environment = {**os.environ, "PYTHONPATH": str(source), "DEVRELAY_TEST_TRACE": str(trace)}
+        environment.pop("DEVRELAY_TEST_MODE", None)
+        controller = subprocess.Popen([*command, "run", "fix-1"], env={**environment,
+                                      "DEVRELAY_TEST_MODE": "controller-crash"},
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        group = None
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                task = self.state.get("fix-1")
+                active = self.state.metadata("active_process")
+                if task and task.get("last_run") and task.get("event_log") and active:
+                    events = Path(task["event_log"])
+                    if events.exists() and '"thread_id": "started-session"' in events.read_text():
+                        group = active["group"]
+                        break
+                if controller.poll() is not None:
+                    output, error = controller.communicate()
+                    self.fail(f"controller exited before crash boundary: {output} {error}")
+                time.sleep(0.01)
+            else:
+                self.fail("controller did not persist its run index and first thread event")
+
+            self.assertEqual(task["event_log"], str(Path(task["last_run"]) / "events.jsonl"))
+            self.assertIsNone(task.get("session_id"))
+            controller.kill()
+            controller.communicate(timeout=5)
+            self.assertEqual(controller.returncode, -signal.SIGKILL)
+
+            blocked = subprocess.run([*command, "resume", "fix-1"], env=environment,
+                                     capture_output=True, text=True, timeout=5)
+            self.assertEqual(blocked.returncode, 1)
+            self.assertIn("still runs in process group", blocked.stderr)
+            self.assertEqual(len(trace.read_text().splitlines()), 1)
+
+            os.killpg(group, signal.SIGKILL)
+            time.sleep(0.1)
+            resumed = subprocess.run([*command, "resume", "fix-1"], env=environment,
+                                     capture_output=True, text=True, timeout=15)
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            invocations = [json.loads(line) for line in trace.read_text().splitlines()]
+            argv = invocations[1]["argv"]
+            self.assertEqual(argv[argv.index("resume") + 1], "started-session")
+            self.assertNotIn("--last", argv)
+            self.assertEqual(self.state.get("fix-1")["status"], "verified")
+        finally:
+            if controller.poll() is None:
+                controller.kill()
+                controller.communicate(timeout=5)
+            active = self.state.metadata("active_process")
+            for candidate in {group, active.get("group") if active else None} - {None}:
+                try:
+                    os.killpg(candidate, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_incomplete_or_conflicting_recovery_events_fail_closed(self):
+        cases = [
+            ("incomplete", '{"type":"thread.started","thread_id":'),
+            ("conflicting", '\n'.join((
+                json.dumps({"type": "thread.started", "thread_id": "session-one"}),
+                json.dumps({"type": "thread.started", "thread_id": "session-two"})))),
+        ]
+        for name, content in cases:
+            with self.subTest(name=name):
+                identifier = "fix-" + name
+                add_local(self.config, self.state, identifier, "Recovery", "Depends on: none", "priority:P1")
+                with self.state.lock():
+                    task = start(self.config, self.state, identifier)
+                task["setup_fingerprint"] = self.config.fingerprint
+                task["status"] = "implementing"
+                directory = self.state.directory / "runs" / identifier / "crashed-codex"
+                directory.mkdir(parents=True)
+                (directory / "events.jsonl").write_text(content)
+                task["last_run"] = str(directory)
+                self.state.save(task)
+                with self.assertRaisesRegex(RelayError, "incomplete|different session"):
+                    self.run_task(identifier, resume=True)
+
+    def test_empty_prelaunch_log_can_be_retried_as_a_new_session(self):
+        with self.state.lock():
+            task = start(self.config, self.state, "fix-1")
+        task["setup_fingerprint"] = self.config.fingerprint
+        task["status"] = "implementing"
+        directory = self.state.directory / "runs" / task["id"] / "prelaunch-codex"
+        directory.mkdir(parents=True)
+        (directory / "events.jsonl").touch()
+        task["last_run"] = str(directory)
+        self.state.save(task)
+        trace = Path(self.temporary.name) / "prelaunch-trace.jsonl"
+
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocation = json.loads(trace.read_text().splitlines()[0])
+        self.assertEqual(result["status"], "verified")
+        self.assertNotIn("resume", invocation["argv"])
+
+    def test_recovery_never_reuses_another_tasks_session(self):
+        add_local(self.config, self.state, "fix-other", "Other", "Depends on: none", "priority:P1")
+        other = self.state.get("fix-other")
+        other["session_id"] = "other-task-session"
+        self.state.save(other)
+        with self.state.lock():
+            task = start(self.config, self.state, "fix-1")
+        task["setup_fingerprint"] = self.config.fingerprint
+        task["status"] = "implementing"
+        directory = self.state.directory / "runs" / task["id"] / "crashed-codex"
+        directory.mkdir(parents=True)
+        (directory / "events.jsonl").write_text(
+            json.dumps({"type": "thread.started", "thread_id": "other-task-session"}) + "\n")
+        task["last_run"] = str(directory)
+        self.state.save(task)
+
+        with self.assertRaisesRegex(RelayError, "another task"):
+            self.run_task(resume=True)
+
+    def test_cached_session_is_validated_before_cli_launch_without_thread_started(self):
+        add_local(self.config, self.state, "fix-other", "Other", "Depends on: none", "priority:P1")
+        other = self.state.get("fix-other")
+        other["session_id"] = "other-task-session"
+        self.state.save(other)
+        with self.state.lock():
+            original = start(self.config, self.state, "fix-1")
+        original["setup_fingerprint"] = self.config.fingerprint
+        trace = Path(self.temporary.name) / "rejected-session-trace.jsonl"
+        log_cases = ("no-run", "missing", "empty", "turn-only")
+        sessions = ("other-task-session", "--last", "", 0, ["session"])
+        for log_case in log_cases:
+            for index, session in enumerate(sessions):
+                with self.subTest(log=log_case, session=session):
+                    task = {**original, "status": "interrupted", "session_id": session}
+                    directory = self.state.directory / "runs" / task["id"] / f"{log_case}-{index}"
+                    if log_case != "no-run":
+                        directory.mkdir(parents=True)
+                        log = directory / "events.jsonl"
+                        if log_case == "empty":
+                            log.touch()
+                        elif log_case == "turn-only":
+                            log.write_text(json.dumps({"type": "turn.started"}) + "\n")
+                        task.update(last_run=str(directory), event_log=str(log))
+                    self.state.save(task)
+                    reason = "another task" if session == "other-task-session" else "session ID is invalid"
+                    with (patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}),
+                          self.assertRaisesRegex(RelayError, reason)):
+                        self.run_task(resume=True)
+                    self.assertFalse(trace.exists(), "Codex must not receive a rejected session's prompt")
+                    saved = self.state.get(task["id"])
+                    self.assertEqual(saved.get("last_run"), task.get("last_run"))
+                    self.assertEqual(saved.get("event_log"), task.get("event_log"))
 
     def test_blocked_worker_does_not_run_acceptance(self):
         with patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "blocked"}):
@@ -857,6 +1127,58 @@ class LockAndProcessTests(RepositoryTest):
         receipt = json.loads(log.with_suffix(".log.receipt.json").read_text())
         self.assertTrue(receipt["timed_out"])
         self.assertIsNone(self.state.metadata("active_process"))
+
+    def test_streaming_delivers_large_input_without_a_writer_thread(self):
+        seen = []
+        payload = "x" * 2_000_000
+        script = "import sys; data = sys.stdin.buffer.read(); print(len(data), flush=True)"
+        with self.state.lock():
+            receipt = execute(self.state, [sys.executable, "-c", script], self.root,
+                              self.state.directory / "large-input.log", 5, input=payload,
+                              on_output_line=seen.append)
+        self.assertEqual(seen, [str(len(payload))])
+        self.assertEqual(receipt["returncode"], 0)
+        self.assertEqual(Path(receipt["stderr_log"]).read_text(), "")
+
+    def test_streaming_large_input_does_not_wait_on_descendant_held_stdin(self):
+        group_file = Path(self.temporary.name) / "held-stdin-group"
+        script = """import os, sys, time
+path = sys.argv[1]
+with open(path, 'w') as stream:
+    stream.write(str(os.getpgrp()))
+    stream.flush()
+if os.fork() == 0:
+    time.sleep(30)
+    os._exit(0)
+os._exit(0)
+"""
+        started = time.monotonic()
+        group = None
+        try:
+            with self.state.lock(), self.assertRaisesRegex(RelayError, "live descendants"):
+                execute(self.state, [sys.executable, "-c", script, str(group_file)], self.root,
+                        self.state.directory / "held-stdin.log", 1, input="x" * 2_000_000,
+                        on_output_line=lambda line: None)
+            self.assertLess(time.monotonic() - started, 3)
+            group = int(group_file.read_text())
+            self.assertEqual(self.state.metadata("active_process")["group"], group)
+        finally:
+            if group is None and group_file.exists():
+                group = int(group_file.read_text())
+            if group is not None:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        os.killpg(group, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail(f"process group {group} survived test cleanup")
 
     def test_surviving_process_group_blocks_crash_recovery(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
