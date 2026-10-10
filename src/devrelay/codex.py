@@ -113,6 +113,72 @@ def _event_lines(log):
         raise RelayError(f"Cannot read Codex event log; inspect {log}") from error
 
 
+def _non_session_event_prefix(line):
+    """Identify a damaged non-session event without treating nested types as headers."""
+    if "thread.started" in line or "thread_id" in line:
+        return False
+    content = line.lstrip()
+    if not content.startswith("{"):
+        return False
+    decoder = json.JSONDecoder()
+    position = 1
+    non_session_type = False
+    try:
+        while position < len(content):
+            while position < len(content) and content[position] in " \t\r\n":
+                position += 1
+            key, position = decoder.raw_decode(content, position)
+            if not isinstance(key, str):
+                return False
+            if key == "thread_id" or (key == "type" and non_session_type):
+                return False
+            while position < len(content) and content[position] in " \t\r\n":
+                position += 1
+            if position >= len(content) or content[position] != ":":
+                return False
+            position += 1
+            while position < len(content) and content[position] in " \t\r\n":
+                position += 1
+            try:
+                value, position = decoder.raw_decode(content, position)
+            except ValueError:
+                return non_session_type and key != "type"
+            if key == "type":
+                non_session_type = isinstance(value, str) and (value.startswith(("item.", "turn.")) or value == "error")
+                if not non_session_type:
+                    return False
+            while position < len(content) and content[position] in " \t\r\n":
+                position += 1
+            if position >= len(content):
+                return non_session_type
+            if content[position] != ",":
+                return False
+            position += 1
+    except ValueError:
+        return False
+    return non_session_type
+
+
+def _ownership_sessions(lines, log, *, legacy):
+    """Harvest reservations, not full turn validity; ambiguous session damage fails closed."""
+    sessions = set()
+    for line in lines:
+        try:
+            event = _parse_event(line, log, legacy=legacy)
+        except RelayError:
+            # A crash can truncate a later message without damaging the known
+            # session reservation. Full recovery of that task still rejects it.
+            if _non_session_event_prefix(line):
+                continue
+            raise
+        if event and event.get("type") == "thread.started":
+            session = event.get("thread_id")
+            if not _valid_session(session):
+                raise RelayError(f"Saved Codex session ID is invalid; inspect {log}")
+            sessions.add(session)
+    return sessions
+
+
 def _implementation_sessions(state, task):
     """Reserve IDs written before a crashed controller could checkpoint them."""
     root = _run_root(state, task, "implementation")
@@ -139,17 +205,7 @@ def _implementation_sessions(state, task):
     for directory in directories:
         log = directory / "events.jsonl"
         legacy = _legacy_event_log(log)
-        run_sessions = set()
-        for line in _event_lines(log):
-            event = _parse_event(line, log, legacy=legacy)
-            if event and event.get("type") == "thread.started":
-                session = event.get("thread_id")
-                if not _valid_session(session):
-                    raise RelayError("Saved Codex implementation session ID is invalid; refusing recovery")
-                run_sessions.add(session)
-        if len(run_sessions) > 1:
-            raise RelayError(f"Saved Codex implementation log has conflicting session IDs; inspect {log}")
-        sessions.update(run_sessions)
+        sessions.update(_ownership_sessions(_event_lines(log), log, legacy=legacy))
     return sessions
 
 
@@ -199,15 +255,9 @@ def _review_sessions(state, task):
                         raise ValueError("Invalid review receipt")
                     record(receipt.get("session_id"))
                 else:
-                    # Existing review logs can include stderr diagnostics. As in
-                    # review(), harvest only valid JSON events, separated by LF.
-                    for line in content.split("\n"):
-                        try:
-                            event = json.loads(line)
-                        except ValueError:
-                            continue
-                        if isinstance(event, dict) and event.get("type") == "thread.started":
-                            record(event.get("thread_id"))
+                    # Reviews still use mixed logs. Ordinary legacy diagnostics
+                    # are allowed, but damaged session evidence is never ignored.
+                    sessions.update(_ownership_sessions(content.split("\n"), path, legacy=_legacy_event_log(path)))
             except FileNotFoundError:
                 continue
             except (OSError, ValueError) as error:

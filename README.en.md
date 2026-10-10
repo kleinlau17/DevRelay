@@ -147,6 +147,8 @@ Ctrl+C and controller crashes cannot silently switch recovery to a new session. 
 
 Session ownership includes saved IDs, retained implementation events (including uncheckpointed IDs after a controller crash), and review receipts/events under each task's run directory, even after acceptance or review is invalidated. Implementation recovery rejects other tasks' sessions and review sessions, including its own; unsafe or unreadable evidence blocks recovery without reading outside the repository's owned run directories.
 
+Ownership harvesting retains every known session reservation without validating other tasks' entire turns. A clearly identified truncated non-session message does not block unrelated recovery; damaged or ambiguous session events still block it. The recovering task's own log remains fully validated, so its incomplete or conflicting events cannot be bypassed.
+
 Codex JSONL events are separated only at LF boundaries, preserving Unicode separators inside messages even with chunked output. Stderr diagnostics are retained separately and are not parsed as JSON events.
 
 New implementation runs record `events.jsonl.format.json` before launch and retain strict stdout JSONL parsing during recovery. Older unmarked logs without a separate stderr log may contain ordinary stderr diagnostics; recovery ignores that text but still rejects malformed JSON/session events and conflicting IDs. A diagnostics-only legacy log without a saved session blocks recovery rather than silently starting a new session.

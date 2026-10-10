@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from devrelay.codex import _observe_line, _recover_previous_run, build_command
+from devrelay.codex import _implementation_sessions, _observe_line, _recover_previous_run, build_command
 from devrelay.errors import RelayError
 from devrelay.providers import add_local
 from devrelay.runner import run_task, start
@@ -82,6 +82,35 @@ class CodexOwnershipTests(RepositoryTest):
         self.assertNotIn("session_id", self.task)
         self.assertIsNone(self.state.get(self.task["id"]).get("session_id"))
 
+    def test_damaged_foreign_review_session_evidence_blocks_cli_launch_and_checkpoint(self):
+        directory = self.state.directory / "runs" / "fix-other" / "interrupted-review"
+        directory.mkdir(parents=True)
+        log = directory / "events.jsonl"
+        other = self.state.get("fix-other")
+        other.update(review=None, review_run=str(directory), status="review_blocked")
+        self.state.save(other)
+        cases = (
+            '{"type":"thread.started","thread_id":"review-session"',
+            '{"type":"thread.started","thread_id":',
+            '{"type":"thread.sta',
+            '{"item":{"type":"item.completed"},"type":"thread.sta',
+            '{"type":"item.completed","\\u0074ype":"thread\\u002estarted","thread\\u005fid":"review-session"',
+            '{"type":"item.completed","\\u0074yp',
+        )
+        for content in cases:
+            with self.subTest(content=content):
+                log.write_text("ordinary CLI diagnostic\n" + content)
+                self.task["session_id"] = "review-session"
+                self.state.save(self.task)
+                self.assert_resume_rejected("incomplete or invalid")
+                self.task.pop("session_id")
+                self.state.save(self.task)
+                with self.assertRaisesRegex(RelayError, "incomplete or invalid"):
+                    _observe_line(self.state, self.task,
+                                  json.dumps({"type": "thread.started", "thread_id": "review-session"}),
+                                  self.state.directory / "events.jsonl")
+                self.assertIsNone(self.state.get(self.task["id"]).get("session_id"))
+
     def retain_implementation(self, owner, *, historical=False, legacy=False):
         session = owner["id"] + "-uncheckpointed-session"
         directory = self.state.directory / "runs" / owner["id"] / "crashed-codex"
@@ -144,6 +173,54 @@ class CodexOwnershipTests(RepositoryTest):
         self.task["session_id"] = "implementation-session"
         self.state.save(self.task)
         self.assert_resume_rejected("outside this task's run directory")
+
+    def test_other_tasks_message_damage_does_not_block_unrelated_exact_recovery(self):
+        other_session = self.retain_implementation(self.state.get("fix-other"))
+        other = self.state.get("fix-other")
+        log = Path(other["event_log"])
+        started = log.read_text()
+        current = self.state.directory / "runs" / self.task["id"] / "current-codex"
+        current.mkdir(parents=True)
+        (current / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": "current-session"}))
+        self.task.update(last_run=str(current), event_log=str(current / "events.jsonl"), session_id="current-session")
+        for tail in ('{"type":"item.completed","item":',
+                     '{"type":"turn.completed",',
+                     '{"timestamp":1,"type":"item.completed","item":'):
+            with self.subTest(tail=tail):
+                log.write_text(started + tail)
+                self.state.save(self.task)
+                _recover_previous_run(self.state, self.task)
+                self.assertEqual(self.state.get(self.task["id"])["session_id"], "current-session")
+                self.assertEqual(_implementation_sessions(self.state, other), {other_session})
+                argv = build_command(self.config, current, self.task["session_id"])
+                self.assertEqual(argv[argv.index("resume") + 1], "current-session")
+                self.assertNotIn("--last", argv)
+                # Ownership harvesting must not weaken full recovery of the
+                # interrupted task or release its known session reservation.
+                with self.assertRaisesRegex(RelayError, "incomplete or invalid"):
+                    _recover_previous_run(self.state, dict(other))
+                self.task["session_id"] = other_session
+                self.state.save(self.task)
+                self.assert_resume_rejected("another task")
+                self.task["session_id"] = "current-session"
+
+    def test_conflicting_foreign_events_reserve_both_ids_without_blocking_unrelated_recovery(self):
+        session = self.retain_implementation(self.state.get("fix-other"))
+        other = self.state.get("fix-other")
+        log = Path(other["event_log"])
+        log.write_text(log.read_text() + json.dumps({"type": "thread.started", "thread_id": "second-other-session"}))
+        self.assertEqual(_implementation_sessions(self.state, other), {session, "second-other-session"})
+        self.task["session_id"] = "current-session"
+        self.state.save(self.task)
+        _recover_previous_run(self.state, self.task)
+        for foreign in (session, "second-other-session"):
+            self.task["session_id"] = foreign
+            self.state.save(self.task)
+            self.assert_resume_rejected("another task's implementation log")
+        self.task["session_id"] = "current-session"
+        self.state.save(self.task)
+        with self.assertRaisesRegex(RelayError, "different session"):
+            _recover_previous_run(self.state, dict(other))
 
     def test_implementation_session_remains_usable_alongside_review_records(self):
         self.retain_review(self.task, "current")

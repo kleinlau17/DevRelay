@@ -132,6 +132,41 @@ class WorkflowTests(RepositoryTest):
         marker = Path(result["event_log"]).with_suffix(".jsonl.format.json")
         self.assertEqual(json.loads(marker.read_text()), {"format": "stdout-jsonl-v1"})
 
+    def test_foreign_truncated_message_does_not_block_exact_session_resume(self):
+        with self.state.lock():
+            task = start(self.config, self.state, "fix-1")
+        add_local(self.config, self.state, "fix-other", "Other", "Depends on: none", "priority:P1")
+        other_directory = self.state.directory / "runs" / "fix-other" / "crashed-codex"
+        other_directory.mkdir(parents=True)
+        other_log = other_directory / "events.jsonl"
+        other_log.write_text(json.dumps({"type": "thread.started", "thread_id": "other-session"}) + "\n" +
+                             '{"type":"item.completed","item":')
+        other = self.state.get("fix-other")
+        other.update(status="interrupted", last_run=str(other_directory), event_log=str(other_log))
+        self.state.save(other)
+        current = self.state.directory / "runs" / task["id"] / "current-codex"
+        current.mkdir(parents=True)
+        log = current / "events.jsonl"
+        log.write_text(json.dumps({"type": "thread.started", "thread_id": "current-session"}) + "\n")
+        task.update(status="interrupted", setup_fingerprint=self.config.fingerprint, session_id="current-session",
+                    last_run=str(current), event_log=str(log))
+        self.state.save(task)
+        trace = Path(self.temporary.name) / "two-task-trace.jsonl"
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocation = json.loads(trace.read_text().split("\n")[0])
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1], "current-session")
+        self.assertNotIn("--last", invocation["argv"])
+        self.assertIsNone(self.state.get("fix-other").get("session_id"))
+        task = self.state.get("fix-1")
+        task["session_id"] = "other-session"
+        self.state.save(task)
+        with (patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}),
+              self.assertRaisesRegex(RelayError, "another task's implementation log")):
+            self.run_task(resume=True)
+        self.assertEqual(len(trace.read_text().split("\n")) - 1, 1, "Foreign session must not reach Codex")
+
     def test_interrupt_after_thread_started_resumes_the_exact_session(self):
         trace = Path(self.temporary.name) / "interrupt-trace.jsonl"
         with (patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "interrupt", "DEVRELAY_TEST_TRACE": str(trace)}),
