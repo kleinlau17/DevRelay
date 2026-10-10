@@ -246,6 +246,45 @@ class LockAndProcessTests(RepositoryTest):
         self.assertTrue(receipt["timed_out"])
         self.assertIsNone(self.state.metadata("active_process"))
 
+    def test_execute_after_termination_failure_preserves_live_group_marker(self):
+        log = self.state.directory / "termination-failure.log"
+        retry_log = self.state.directory / "blocked-retry.log"
+        retry_output = Path(self.temporary.name) / "retry-started"
+        process = None
+
+        def fail_termination(command):
+            nonlocal process
+            process = command
+            raise RelayError("Cannot stop process group; recovery will remain blocked")
+
+        try:
+            # Stay inside the same lock, as runner's automatic retry does.
+            with self.state.lock():
+                with (patch("devrelay.process.terminate", side_effect=fail_termination),
+                      self.assertRaisesRegex(RelayError, "Cannot stop process group")):
+                    execute(self.state, [sys.executable, "-c", "import time; time.sleep(30)"],
+                            self.root, log, 0.1)
+                active = self.state.metadata("active_process")
+                self.assertEqual(active["group"], process.pid)
+                with self.assertRaisesRegex(RelayError, "Previous command still runs"):
+                    execute(self.state,
+                            [sys.executable, "-c",
+                             "from pathlib import Path; import sys; Path(sys.argv[1]).touch()", str(retry_output)],
+                            self.root, retry_log, 5)
+                self.assertEqual(self.state.metadata("active_process"), active)
+                self.assertFalse(retry_log.exists())
+                self.assertFalse(retry_output.exists())
+                process.kill()
+                process.wait(timeout=5)
+                # A retry becomes safe once the original group is confirmed gone.
+                execute(self.state, [sys.executable, "-c", "print('recovered')"],
+                        self.root, retry_log, 5)
+                self.assertIsNone(self.state.metadata("active_process"))
+        finally:
+            if process is not None:
+                process.kill()
+                process.wait(timeout=5)
+
     def test_timeout_kills_descendant_that_ignores_sigterm(self):
         log = self.state.directory / "stubborn-descendant.log"
         marker = Path(self.temporary.name) / "stubborn-descendant"
@@ -326,6 +365,19 @@ class LockAndProcessTests(RepositoryTest):
                         self.fail("an uninspectable group must keep recovery blocked")
                 self.assertLess(time.monotonic() - recovery_started, 1)
                 self.assertEqual(self.state.metadata("active_process")["group"], process.pid)
+                active = self.state.metadata("active_process")
+                retry_log = self.state.directory / "uninspectable-retry.log"
+                retry_output = Path(self.temporary.name) / "uninspectable-retry-started"
+                retry_started = time.monotonic()
+                with self.assertRaisesRegex(RelayError, "inspection timed out"):
+                    execute(self.state,
+                            [sys.executable, "-c",
+                             "from pathlib import Path; import sys; Path(sys.argv[1]).touch()", str(retry_output)],
+                            self.root, retry_log, 5)
+                self.assertLess(time.monotonic() - retry_started, 1)
+                self.assertEqual(self.state.metadata("active_process"), active)
+                self.assertFalse(retry_log.exists())
+                self.assertFalse(retry_output.exists())
         finally:
             process.kill()
             process.wait(timeout=5)

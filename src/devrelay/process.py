@@ -17,6 +17,13 @@ _GROUP_POLL_SECONDS = 0.05
 
 
 def execute(state, argv, cwd, log, timeout, *, input=None, env=None):
+    # Retries can execute under the same worker lock after termination fails.
+    # Do not replace the previous group's recovery marker until it is gone.
+    active = state.metadata("active_process")
+    if active:
+        if group_alive(active["group"]):
+            raise RelayError(f"Previous command still runs in process group {active['group']}; wait for it to finish")
+        state.set_metadata("active_process", None)
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
