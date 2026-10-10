@@ -76,8 +76,9 @@ def _read_events(state, task, log, *, recovering=False):
     completed, failed, saw_event = False, False, False
     if not log.exists():
         return completed, failed, saw_event
-    content = log.read_text(errors="replace")
-    for line in content.splitlines():
+    with log.open(errors="replace", newline="") as stream:
+        content = stream.read()
+    for line in content.split("\n"):
         if not line.strip():
             continue
         try:
@@ -208,7 +209,7 @@ Acceptance commands (JSON): {json.dumps(config.data['checks'], ensure_ascii=Fals
     execute(state, build_command(config, directory, sandbox="read-only"), task["worktree"],
             directory / "events.jsonl", config.data["codex"]["timeout_seconds"], input=prompt)
     sessions, completed, failed = set(), False, False
-    for line in (directory / "events.jsonl").read_text(errors="replace").splitlines():
+    for line in (directory / "events.jsonl").read_text(errors="replace").split("\n"):
         try:
             event = json.loads(line)
         except ValueError:

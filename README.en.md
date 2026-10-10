@@ -145,6 +145,8 @@ SQLite state, a repository-wide worker lock, command logs, resource receipts, ve
 
 Ctrl+C and controller crashes cannot silently switch recovery to a new session. Timeouts terminate process groups; `active_process` and the repository lock prevent recovery while the previous process group or any surviving descendants are still running.
 
+Codex JSONL events are separated only at LF boundaries, preserving Unicode separators inside messages even with chunked output. Stderr diagnostics are retained separately and are not parsed as JSON events.
+
 Acceptance commands are trusted project code. A zero exit code does not establish business correctness or independent review. Projects control scoring rules, official engine requirements and delivery authorization.
 
 ## Develop

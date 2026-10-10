@@ -92,6 +92,24 @@ class WorkflowTests(RepositoryTest):
         self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1],
                          "exact-test-session")
 
+    def test_chunked_unicode_agent_message_preserves_exact_resume(self):
+        trace = Path(self.temporary.name) / "unicode-trace.jsonl"
+        with (patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "unicode-chunks",
+                                     "DEVRELAY_TEST_TRACE": str(trace)}),
+              self.assertRaises(RelayError)):
+            self.run_task()
+        task = self.state.get("fix-1")
+        self.assertEqual(task["session_id"], "exact-test-session")
+        events = [json.loads(line) for line in Path(task["event_log"]).read_text().split("\n") if line]
+        self.assertEqual(events[1]["item"]["text"], "first\u0085second\u2028third\u2029last")
+        self.assertEqual(events[-1]["type"], "turn.failed")
+        with patch.dict(os.environ, {"DEVRELAY_TEST_TRACE": str(trace)}):
+            result = self.run_task(resume=True)
+        invocation = json.loads(trace.read_text().split("\n")[1])
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(invocation["argv"][invocation["argv"].index("resume") + 1], "exact-test-session")
+        self.assertNotIn("--last", invocation["argv"])
+
     def test_interrupt_after_thread_started_resumes_the_exact_session(self):
         trace = Path(self.temporary.name) / "interrupt-trace.jsonl"
         with (patch.dict(os.environ, {"DEVRELAY_TEST_MODE": "interrupt", "DEVRELAY_TEST_TRACE": str(trace)}),

@@ -14,13 +14,14 @@ from .state import group_alive, now
 
 def _read_output(reader, pending, on_output_line, *, final=False):
     pending += reader.read()
-    lines = pending.splitlines(keepends=True)
-    pending = ""
+    # JSONL uses LF, not the Unicode separators recognized by str.splitlines().
+    lines = pending.split("\n")
+    pending = lines.pop()
     for line in lines:
-        if line.endswith(("\n", "\r")) or final:
-            on_output_line(line.rstrip("\r\n"))
-        else:
-            pending = line
+        on_output_line(line.removesuffix("\r"))
+    if final and pending:
+        on_output_line(pending)
+        pending = ""
     return pending
 
 
@@ -41,7 +42,7 @@ def _stream_output(process, log, timeout, started, input, on_output_line):
     pending = ""
     if process.stdin is not None:
         os.set_blocking(process.stdin.fileno(), False)
-    with log.open(errors="replace") as reader:
+    with log.open(errors="replace", newline="") as reader:
         while process.poll() is None:
             pending = _read_output(reader, pending, on_output_line)
             writes = 0

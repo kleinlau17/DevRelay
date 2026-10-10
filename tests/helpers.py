@@ -87,12 +87,21 @@ if mode == 'stderr-command-failure':
 if mode == 'controller-crash' and 'resume' not in args:
     os.kill(os.getppid(), signal.SIGSTOP)
 print(json.dumps({'type': 'thread.started', 'thread_id': session}), flush=True)
+if mode == 'unicode-chunks':
+    message = json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message',
+                         'text': 'first\\u0085second\\u2028third\\u2029last'}}, ensure_ascii=False)
+    boundary = message.index('\\u2028') + 1
+    sys.stdout.write(message[:boundary])
+    sys.stdout.flush()
+    time.sleep(0.15)
+    sys.stdout.write(message[boundary:] + '\\n')
+    sys.stdout.flush()
 if mode == 'controller-crash' and 'resume' not in args:
     time.sleep(30)
 if mode == 'interrupt':
     os.kill(os.getppid(), signal.SIGINT)
     time.sleep(30)
-if mode in ('command-failure', 'stderr-command-failure'):
+if mode in ('command-failure', 'stderr-command-failure', 'unicode-chunks'):
     print(json.dumps({'type': 'turn.failed'}))
     raise SystemExit(9)
 if mode != 'blocked':
