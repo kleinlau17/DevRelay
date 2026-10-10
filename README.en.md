@@ -155,6 +155,8 @@ SQLite state, a repository-wide worker lock, command logs, resource receipts, ve
 
 Acceptance commands are trusted project code. A zero exit code does not establish business correctness or independent review. Projects control scoring rules, official engine requirements and delivery authorization.
 
+Source, HEAD and recursive submodule cleanliness are checked after each acceptance command, before the next command can run, as well as at finalization. Post-merge acceptance applies the same checks after setup and between acceptance commands. A dirty submodule fails verification immediately, retaining its changes and command evidence; a later command cannot restore it to hide the mutation. These are command-boundary snapshots, not continuous monitoring of changes restored within a single command.
+
 ## Develop
 
 This repository's `.devrelay/config.toml` enables self-maintenance: approved GitHub Issues are implemented in isolated worktrees, verified with the full test suite, submitted as draft PRs, and reviewed in fresh read-only AI sessions. Automatic merge is disabled; run `devrelay merge ID` after merging to perform post-merge acceptance and cleanup.

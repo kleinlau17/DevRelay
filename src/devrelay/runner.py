@@ -112,6 +112,8 @@ def verify(config, state, identifier):
         for entry in config.data["checks"]:
             receipt = execute(state, entry["argv"], path, directory / (entry["id"] + ".log"), entry["timeout_seconds"])
             results.append({"id": entry["id"], **receipt})
+            if source_tree(path) != before or git(path, "rev-parse", "HEAD") != head:
+                raise RelayError("Source or HEAD changed during verification; rerun the checks")
         assert_config(config)
         if source_tree(path) != before or git(path, "rev-parse", "HEAD") != head:
             raise RelayError("Source or HEAD changed during verification; rerun the checks")

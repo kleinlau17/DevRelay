@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from devrelay.codex import build_command
 from devrelay.config import load
+from devrelay.delivery import post_merge
 from devrelay.errors import RelayError
 from devrelay.git import _gitlink_paths, _isolated_source_tree, source_tree
 from devrelay.process import execute
@@ -271,14 +272,14 @@ class SubmoduleWorkflowTests(RepositoryTest):
         subprocess.run(["git", "commit", "-qam", "add nested dependency"],
                        cwd=self.dependency_source, check=True)
 
-    def _prepare(self, checks=None, *, initialize=True, gitmodules_ignore=True):
+    def _prepare(self, checks=None, *, initialize=True, gitmodules_ignore=True, setup=None):
         subprocess.run(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
                         str(self.dependency_source), "vendor/dependency"], cwd=self.root, check=True)
         if gitmodules_ignore:
             subprocess.run(["git", "config", "-f", ".gitmodules",
                             "submodule.vendor/dependency.ignore", "all"], cwd=self.root, check=True)
         self.git("commit", "-qam", "add dependency")
-        self.configure(checks=checks or [[sys.executable, "-c", "pass"]])
+        self.configure(checks=checks or [[sys.executable, "-c", "pass"]], setup=setup)
         add_local(self.config, self.state, "fix-1", "Fix dependency", "Update the dependency.\nDepends on: none",
                   "priority:P1")
         with self.state.lock():
@@ -718,6 +719,61 @@ class SubmoduleWorkflowTests(RepositoryTest):
             verify(self.config, self.state, "fix-1")
         self.assertEqual(self.state.get("fix-1")["status"], "failed")
         self.assertEqual((dependency / "dependency.txt").read_text(), "during checks\n")
+
+    def _submodule_modify_and_restore_checks(self):
+        return [[sys.executable, "-c",
+                 "from pathlib import Path; dependency = Path('vendor/dependency/dependency.txt'); "
+                 "dependency.write_text('fixed\\n'); assert dependency.read_text() == 'fixed\\n'"],
+                [sys.executable, "-c",
+                 "from pathlib import Path; Path('vendor/dependency/dependency.txt').write_text('broken\\n'); "
+                 "marker = Path('.devrelay/runtime/restore-ran.txt'); marker.parent.mkdir(parents=True, exist_ok=True); "
+                 "marker.write_text('ran\\n')"]]
+
+    def test_dirty_submodule_stops_checks_before_later_command_can_restore_it(self):
+        worktree, dependency = self._prepare(self._submodule_modify_and_restore_checks())
+        (worktree / "value.txt").write_text("fixed\n")
+        indexes = [self._git_metadata_path(root, "index") for root in (worktree, dependency)]
+        originals = [index.read_bytes() for index in indexes]
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        failed = self.state.get("fix-1")
+        self.assertEqual(failed["status"], "failed")
+        self.assertIsNone(failed["verification"])
+        receipts = list((self.state.directory / "runs/fix-1").glob("*-checks/verification.json"))
+        self.assertEqual(len(receipts), 1)
+        record = json.loads(receipts[0].read_text())
+        self.assertFalse(record["passed"])
+        self.assertEqual([check["id"] for check in record["checks"]], ["checks-0"])
+        self.assertEqual(record["checks"][0]["returncode"], 0)
+        self.assertFalse((worktree / ".devrelay/runtime/restore-ran.txt").exists())
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+        self.assertEqual([index.read_bytes() for index in indexes], originals)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "missing or stale"):
+            submit(self.config, self.state, "fix-1", local=True)
+
+    def test_post_merge_dirty_submodule_stops_checks_before_later_restore(self):
+        worktree, _ = self._prepare(self._submodule_modify_and_restore_checks(), setup=[
+            ["git", "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"]])
+        task = self.state.get("fix-1")
+        head = self.git("rev-parse", "HEAD", cwd=worktree)
+        task.update(head_sha=head, verification={"source_tree": source_tree(worktree)})
+        pull = {"state": "MERGED", "baseRefName": "main", "headRefOid": head,
+                "headRefName": task["branch"], "isCrossRepository": False, "mergeCommit": {"oid": head}}
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            post_merge(self.config, self.state, task, pull)
+        failed = self.state.get("fix-1")
+        self.assertEqual(failed["status"], "post_merge_failed")
+        self.assertEqual(failed["merge_sha"], head)
+        self.assertFalse(failed["post_merge"]["passed"])
+        self.assertEqual([check["id"] for check in failed["post_merge"]["checks"]], ["checks-0"])
+        self.assertEqual(failed["post_merge"]["checks"][0]["returncode"], 0)
+        self.assertEqual(len(failed["post_merge"]["setup"]), 1)
+        self.assertEqual(json.loads(Path(failed["post_merge_path"]).read_text()), failed["post_merge"])
+        path = Path(failed["post_merge_worktree"])
+        self.assertFalse((path / ".devrelay/runtime/restore-ran.txt").exists())
+        self.assertEqual((path / "vendor/dependency/dependency.txt").read_text(), "fixed\n")
+        self.assertEqual((worktree / "vendor/dependency/dependency.txt").read_text(), "broken\n")
+        self.assertTrue(worktree.exists())
 
     def test_submodule_change_after_checks_invalidates_submission(self):
         _, dependency = self._prepare()
