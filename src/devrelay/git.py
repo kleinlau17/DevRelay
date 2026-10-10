@@ -138,8 +138,8 @@ def _submodule_snapshot(root, paths, prefix=Path(), seen=None):
         if (not _submodule_content_matches_head(checkout)
                 or _evidence_git(checkout, "diff-index", "--cached", "--raw", "--ignore-submodules=none",
                                  "HEAD", "--", text=False)
-                or _evidence_git(checkout, "ls-files", "--others", "--exclude-per-directory=.gitignore",
-                                 "-z", text=False)
+                or _evidence_git(checkout, "-c", "core.ignoreCase=false", "ls-files", "--others",
+                                 "--exclude-per-directory=.gitignore", "-z", text=False)
                 or _isolated_source_tree(checkout, inspect_submodules=False,
                                          neutralize_config=True) != head_tree):
             dirty.append(display)
@@ -161,7 +161,8 @@ def _isolated_source_tree(root, *, inspect_submodules, neutralize_config=False):
     with tempfile.TemporaryDirectory(prefix="devrelay-index-") as temporary:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index"), "GIT_OPTIONAL_LOCKS": "0"}
         _evidence_git(root, "read-tree", "HEAD", env=env, text=False)
-        config = (["-c", "core.fileMode=true", "-c", f"core.excludesFile={os.devnull}"]
+        config = (["-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
+                   "-c", f"core.excludesFile={os.devnull}"]
                   if neutralize_config else [])
         _evidence_git(root, *config, "add", "-A", env=env, text=False)
         paths = _gitlink_paths(root, env=env)

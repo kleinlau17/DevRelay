@@ -10,7 +10,7 @@ from unittest.mock import patch
 from devrelay.codex import build_command
 from devrelay.config import load
 from devrelay.errors import RelayError
-from devrelay.git import _gitlink_paths, source_tree
+from devrelay.git import _gitlink_paths, _isolated_source_tree, source_tree
 from devrelay.process import execute
 from devrelay.providers import add_local, queue_report, snapshot
 from devrelay.runner import complete_local, run_task, start, submit, verify
@@ -600,6 +600,66 @@ class SubmoduleWorkflowTests(RepositoryTest):
         (build / "output.txt").write_text("generated\n")
         self.assertEqual(source_tree(worktree), before)
         self.assertEqual((build / "output.txt").read_text(), "generated\n")
+
+    def _prepare_ignore_case_dependency(self, checks=None):
+        (self.dependency_source / ".gitignore").write_text("build/\n")
+        self.git("add", ".gitignore", cwd=self.dependency_source)
+        self.git("commit", "-qm", "ignore build artifacts", cwd=self.dependency_source)
+        worktree, dependency = self._prepare(checks)
+        self.git("config", "core.ignoreCase", "true", cwd=dependency)
+        return worktree, dependency
+
+    def _add_case_variant_source(self, dependency):
+        build = dependency / "BuIlD"
+        build.mkdir()
+        source = build / "undelivered.txt"
+        source.write_text("fixed\n")
+        self.assertEqual(self.git("ls-files", "--others", "--exclude-per-directory=.gitignore",
+                                  cwd=dependency), "")
+        return source
+
+    def test_ignore_case_cannot_hide_untracked_submodule_source_from_verification(self):
+        worktree, dependency = self._prepare_ignore_case_dependency([[sys.executable, "-c",
+            "from pathlib import Path; assert Path('vendor/dependency/BuIlD/undelivered.txt').read_text() == 'fixed\\n'"]])
+        source = self._add_case_variant_source(dependency)
+        index = self._git_metadata_path(dependency, "index")
+        original = index.read_bytes()
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual(index.read_bytes(), original)
+        self.assertEqual(source.read_text(), "fixed\n")
+        self.assertEqual(self.git("config", "core.ignoreCase", cwd=dependency), "true")
+        with self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            source_tree(worktree)
+
+    def test_ignore_case_after_verification_blocks_submission(self):
+        worktree, dependency = self._prepare_ignore_case_dependency()
+        (worktree / "value.txt").write_text("fixed\n")
+        with self.state.lock():
+            verified = verify(self.config, self.state, "fix-1")
+        self.assertTrue(verified["verification"]["passed"])
+        head = self.git("rev-parse", "HEAD", cwd=worktree)
+        indexes = [self._git_metadata_path(root, "index") for root in (worktree, dependency)]
+        originals = [index.read_bytes() for index in indexes]
+        source = self._add_case_variant_source(dependency)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            submit(self.config, self.state, "fix-1", local=True)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree), head)
+        self.assertEqual([index.read_bytes() for index in indexes], originals)
+        self.assertEqual(source.read_text(), "fixed\n")
+        self.assertEqual(self.git("config", "core.ignoreCase", cwd=dependency), "true")
+
+    def test_isolated_submodule_index_uses_case_sensitive_ignore_rules(self):
+        _, dependency = self._prepare_ignore_case_dependency()
+        source = self._add_case_variant_source(dependency)
+        index = self._git_metadata_path(dependency, "index")
+        original = index.read_bytes()
+        tree = _isolated_source_tree(dependency, inspect_submodules=False, neutralize_config=True)
+        self.assertNotEqual(tree, self.git("rev-parse", "HEAD^{tree}", cwd=dependency))
+        self.assertIn("BuIlD/undelivered.txt", self.git("ls-tree", "-r", "--name-only", tree, cwd=dependency))
+        self.assertEqual(index.read_bytes(), original)
+        self.assertEqual(source.read_text(), "fixed\n")
+        self.assertEqual(self.git("config", "core.ignoreCase", cwd=dependency), "true")
 
     def test_source_snapshot_preserves_submodule_indexes_with_invalid_cache_trees(self):
         self._add_nested_submodule()

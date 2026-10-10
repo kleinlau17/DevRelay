@@ -143,7 +143,7 @@ Verification binds source tree, HEAD, target base, configuration and task requir
 
 All Git operations that generate source evidence disable local replacement refs and inspect actual commit objects, leaving replacement refs untouched. NUL-delimited paths are parsed as bytes, supporting non-UTF-8 filenames and carriage returns where the filesystem permits them.
 
-Untracked submodule files are detected using only `.gitignore` rules, without local `info/exclude` or `core.excludesFile` rules. Staged content is compared using a read-only index operation; source evidence does not rebuild cache trees in real submodule indexes and disables optional index refresh writes.
+Untracked submodule files are detected using only `.gitignore` rules, without local `info/exclude` or `core.excludesFile` rules. Detection and isolated-index comparisons force `core.ignoreCase=false`, so a rule such as `build/` cannot hide `BuIlD/undelivered.txt`; user configuration is left unchanged. Staged content is compared using a read-only index operation; source evidence does not rebuild cache trees in real submodule indexes and disables optional index refresh writes.
 
 Tracked regular files in submodules also have their raw bytes compared against HEAD blobs, bypassing attributes and clean filters so local transformations cannot hide undelivered content. Submodule worktree bytes must match the commit; checkouts that require line-ending normalization, encoding conversion or smudge filters to match committed blobs block acceptance.
 
