@@ -41,9 +41,92 @@ def _valid_session(value):
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value)
 
 
+def _review_sessions(state, task):
+    """Retain review ownership even after the current acceptance/review is invalidated."""
+    sessions = set()
+
+    def record(session):
+        if not _valid_session(session):
+            raise RelayError("Saved Codex review session ID is invalid; refusing recovery")
+        sessions.add(session)
+
+    review = task.get("review")
+    if review:
+        if not isinstance(review, dict):
+            raise RelayError("Saved Codex review record is invalid; refusing recovery")
+        record(review.get("session_id"))
+
+    runs = state.directory / "runs"
+    if runs.is_symlink():
+        raise RelayError("Saved Codex review runs are outside the owned run directory; refusing recovery")
+    runs = runs.resolve()
+    root = runs / task["id"]
+    if root.is_symlink():
+        raise RelayError("Saved Codex review evidence is outside this task's run directory; refusing recovery")
+    root = root.resolve()
+    if root.parent != runs or root.name != task["id"]:
+        raise RelayError("Saved Codex review evidence is outside this task's run directory; refusing recovery")
+
+    def scoped(directory):
+        resolved = directory.resolve()
+        if directory.is_symlink() or resolved.parent != root or not resolved.name.endswith("-review"):
+            raise RelayError("Saved Codex review evidence is outside this task's run directory; refusing recovery")
+        return resolved
+
+    try:
+        candidates = list(root.iterdir())
+    except FileNotFoundError:
+        candidates = []
+    except OSError as error:
+        raise RelayError(f"Cannot inspect saved Codex review runs; inspect {root}") from error
+    directories = {scoped(path) for path in candidates if path.name.endswith("-review")}
+    for key in ("review_run", "review_path"):
+        if task.get(key):
+            path = Path(task[key])
+            if key == "review_path":
+                if path.name != "review.json":
+                    raise RelayError("Saved Codex review receipt path is invalid; refusing recovery")
+                path = path.parent
+            directories.add(scoped(path))
+    for directory in directories:
+        for filename in ("review.json", "events.jsonl"):
+            path = directory / filename
+            if path.is_symlink() or path.resolve().parent != directory:
+                raise RelayError("Saved Codex review evidence is outside its run directory; refusing recovery")
+            try:
+                with path.open(errors="replace", newline="") as stream:
+                    content = stream.read()
+                if filename == "review.json":
+                    receipt = json.loads(content)
+                    if not isinstance(receipt, dict):
+                        raise ValueError("Invalid review receipt")
+                    record(receipt.get("session_id"))
+                else:
+                    # Existing review logs can include stderr diagnostics. As in
+                    # review(), harvest only valid JSON events, separated by LF.
+                    for line in content.split("\n"):
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(event, dict) and event.get("type") == "thread.started":
+                            record(event.get("thread_id"))
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as error:
+                raise RelayError(f"Cannot read saved Codex review evidence; inspect {path}") from error
+    return sessions
+
+
 def _check_session_owner(state, task, session):
-    if any(item["id"] != task["id"] and item.get("session_id") == session for item in state.tasks()):
-        raise RelayError("Codex session ID belongs to another task; refusing cross-task recovery")
+    for item in [task, *state.tasks()]:
+        foreign = item["id"] != task["id"]
+        if foreign and item.get("session_id") == session:
+            raise RelayError("Codex session ID belongs to another task; refusing cross-task recovery")
+        if session in _review_sessions(state, item):
+            if foreign:
+                raise RelayError("Codex session ID belongs to another task's review; refusing cross-task recovery")
+            raise RelayError("Codex session ID belongs to a review; refusing implementation recovery")
 
 
 def _record_session(state, task, event):
