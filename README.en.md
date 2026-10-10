@@ -87,6 +87,8 @@ devrelay submit 12
 
 When a remote targets a different repository, the error identifies the fetch or push URL with `does not match project.repository`; correct that remote before retrying GitHub operations.
 
+Tracking updates after push and tracking cleanup use the first matching positive fetch refspec. Negative fetch refspecs restrict fetching, but do not cancel this tracking mapping.
+
 Transport preserves Git's `GIT_CONFIG_NOSYSTEM` boolean policy: `0`/`false` keeps the original system settings, while `1`/`true` disables them. Other Git boolean spellings are supported; invalid values stop the transport.
 
 ## Automatic review and merge

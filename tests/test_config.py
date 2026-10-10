@@ -220,18 +220,27 @@ class ConfigurationTests(RepositoryTest):
                  "+refs/heads/main:refs/remotes/origin/main")
         self.git("config", "--add", "remote.origin.fetch",
                  "+refs/heads/devrelay/*:refs/remotes/custom/*")
+        self.git("config", "--add", "remote.origin.fetch", "^refs/heads/devrelay/*")
         branch = "devrelay/task-tracking"
-        self.git("branch", branch)
+        original = self.git("rev-parse", "main")
+        self.git("checkout", "-qb", branch)
+        self.git("commit", "--allow-empty", "-qm", "tracking update")
+        head = self.git("rev-parse", branch)
         self.git("config", f"branch.{branch}.remote", "origin")
         self.git("config", f"branch.{branch}.merge", "refs/heads/" + branch)
+        # Establish the oracle with a real named-remote push, not the helper:
+        # the negative fetch rule does not suppress Git's tracking update.
+        self.git("push", "origin", branch)
+        self.assertEqual(self.git("rev-parse", branch + "@{upstream}"), head)
+        self.assertEqual(self.git("rev-parse", "refs/remotes/custom/task-tracking"), head)
         tracking = remote_tracking_ref(self.root, "origin", branch)
         self.assertEqual(tracking, "refs/remotes/custom/task-tracking")
+        self.git("update-ref", tracking, original)
         with pinned_transport(self.root, str(remote)) as (target, env):
             git(self.root, "push", target, f"refs/heads/{branch}:refs/heads/{branch}", env=env)
-        self.git("update-ref", tracking, self.git("rev-parse", branch))
-        self.assertEqual(self.git("rev-parse", branch + "@{upstream}"), self.git("rev-parse", branch))
-        self.git("config", "--add", "remote.origin.fetch", "^refs/heads/devrelay/*")
-        self.assertIsNone(remote_tracking_ref(self.root, "origin", branch))
+        self.git("update-ref", tracking, head)
+        self.assertEqual(self.git("--git-dir", str(remote), "rev-parse", "refs/heads/" + branch), head)
+        self.assertEqual(self.git("rev-parse", branch + "@{upstream}"), head)
         self.assertIsNone(remote_tracking_ref(self.root, "origin", "unmapped"))
 
     def test_remote_validation_uses_the_transport_worktree_context(self):

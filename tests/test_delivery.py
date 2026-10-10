@@ -131,6 +131,23 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
                                   cwd=task["worktree"]), "refs/remotes/custom/task-12")
         self.assertEqual(self.git("for-each-ref", "refs/remotes/origin/" + task["branch"]), "")
 
+    def test_negative_fetch_refspec_does_not_suppress_pushed_upstream_update(self):
+        self.git("config", "--replace-all", "remote.origin.fetch",
+                 "+refs/heads/main:refs/remotes/origin/main")
+        self.git("config", "--add", "remote.origin.fetch",
+                 "+refs/heads/devrelay/*:refs/remotes/custom/*")
+        self.git("config", "--add", "remote.origin.fetch", "^refs/heads/devrelay/*")
+        self.implement()
+        self.git("update-ref", "refs/remotes/custom/task-12", self.git("rev-parse", "main"))
+        with self.state.lock():
+            task = submit(self.config, self.state, "12")
+        self.assertEqual(task["status"], "pr_open")
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", task["branch"]),
+                         task["head_sha"])
+        self.assertEqual(self.git("rev-parse", "@{upstream}", cwd=task["worktree"]), task["head_sha"])
+        self.assertEqual(self.git("rev-parse", "--symbolic-full-name", "@{upstream}",
+                                  cwd=task["worktree"]), "refs/remotes/custom/task-12")
+
     def test_mismatched_pr_head_is_rejected(self):
         self.implement()
         self.readback_head = "0" * 40

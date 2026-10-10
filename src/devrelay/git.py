@@ -138,16 +138,16 @@ def pinned_transport(root, url):
 
 
 def remote_tracking_ref(root, remote, branch):
-    """Map a pushed branch using Git's first matching fetch refspec policy."""
+    """Map a pushed branch using the first matching positive fetch refspec."""
     ref = "refs/heads/" + branch
     specs = _config_values(root, f"remote.{remote}.fetch")
 
     def match(pattern):
         return re.fullmatch(re.escape(pattern).replace(r"\*", "(.*)"), ref)
 
-    if any(match(spec[1:]) for spec in specs if spec.startswith("^")):
-        return None
     for spec in specs:
+        # Negative refspecs filter fetch selection, not Git's positive
+        # tracking mapping for a successfully pushed branch.
         if spec.startswith("^"):
             continue
         source, separator, destination = spec.removeprefix("+").partition(":")

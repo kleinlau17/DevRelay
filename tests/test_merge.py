@@ -419,6 +419,28 @@ class MergeTests(GitHubDeliveryFixture):
         self.assertFalse(has_ref(self.root, "refs/remotes/origin/" + result["branch"]))
         self.assertTrue(has_ref(self.root, "refs/remotes/origin/main"))
 
+    def test_cleanup_removes_tracking_ref_excluded_by_negative_fetch_refspec(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        self.git("config", "--replace-all", "remote.origin.fetch",
+                 "+refs/heads/main:refs/remotes/origin/main")
+        self.git("config", "--add", "remote.origin.fetch",
+                 "+refs/heads/devrelay/*:refs/remotes/custom/*")
+        self.git("config", "--add", "remote.origin.fetch", "^refs/heads/devrelay/*")
+
+        def check_upstream():
+            task = self.state.get("12")
+            self.assertEqual(self.git("rev-parse", "@{upstream}", cwd=task["worktree"]),
+                             task["head_sha"])
+            self.assertEqual(self.git("rev-parse", "refs/remotes/custom/task-12"), task["head_sha"])
+
+        with self.after_acceptance(check_upstream):
+            result = self.deliver()
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(has_ref(self.root, "refs/remotes/custom/task-12"))
+        self.assertEqual(self.git("--git-dir", str(self.remote), "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/" + result["branch"]), "")
+        self.assertTrue(has_ref(self.root, "refs/remotes/origin/main"))
+
     def test_worktree_only_cleanup_keeps_branches(self):
         self.enable(cleanup_worktrees=True)
         result = self.deliver()
