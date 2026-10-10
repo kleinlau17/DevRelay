@@ -22,24 +22,35 @@ def execute(state, argv, cwd, log, timeout, *, input=None, env=None):
     started = time.monotonic()
     process = None
     timed_out = False
+    termination_failed = False
     with log.open("x") as stream:
         try:
-            process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                                       stdout=stream, stderr=subprocess.STDOUT, text=True, env=env,
-                                       start_new_session=True)
+            try:
+                process = subprocess.Popen(argv, cwd=cwd,
+                                           stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                                           stdout=stream, stderr=subprocess.STDOUT, text=True, env=env,
+                                           start_new_session=True)
+            except OSError as error:
+                raise RelayError(f"Cannot start {argv[0]}: {error}") from error
             state.set_metadata("active_process", {"group": process.pid, "argv": argv, "started_at": now()})
             try:
                 process.communicate(input, timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                terminate(process)
+                try:
+                    terminate(process)
+                except BaseException:
+                    termination_failed = True
+                    raise
             except BaseException:
-                terminate(process)
+                try:
+                    terminate(process)
+                except BaseException:
+                    termination_failed = True
+                    raise
                 raise
-        except OSError as error:
-            raise RelayError(f"Cannot start {argv[0]}: {error}") from error
         finally:
-            if process is not None and process.poll() is not None:
+            if not termination_failed and process is not None and process.poll() is not None:
                 if group_alive(process.pid):
                     # Keep evidence of detached foreground descendants; don't claim a clean finish.
                     raise RelayError(f"Command left live descendants in process group {process.pid}")
@@ -53,14 +64,27 @@ def execute(state, argv, cwd, log, timeout, *, input=None, env=None):
 
 
 def terminate(process):
+    inspection_error = None
     for sig, wait in ((signal.SIGTERM, _TERMINATE_GRACE_SECONDS),
                       (signal.SIGKILL, _KILL_GRACE_SECONDS)):
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
             pass
-        if _wait_for_group(process, wait):
-            return
+        except OSError as error:
+            raise RelayError(f"Cannot signal process group {process.pid} with {sig.name}: {error}; "
+                             "recovery will remain blocked") from error
+        try:
+            if _wait_for_group(process, wait):
+                return
+            inspection_error = None
+        except RelayError as error:
+            # An unknown state is treated as alive so SIGTERM inspection
+            # failure still escalates to SIGKILL.
+            inspection_error = error
+    if inspection_error is not None:
+        raise RelayError(f"Cannot confirm process group {process.pid} stopped: {inspection_error}; "
+                         "recovery will remain blocked") from inspection_error
     raise RelayError(f"Cannot stop process group {process.pid}; recovery will remain blocked")
 
 
@@ -70,7 +94,10 @@ def _wait_for_group(process, timeout):
         # Reap the direct child when possible, but completion is determined by
         # every non-zombie member of the controlled process group.
         process.poll()
-        if not group_alive(process.pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if not group_alive(process.pid, timeout=remaining):
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:

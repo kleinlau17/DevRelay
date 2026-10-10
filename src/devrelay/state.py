@@ -12,15 +12,27 @@ from .errors import RelayError
 from .git import common_dir
 
 
+_GROUP_PROBE_TIMEOUT_SECONDS = 3
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def group_alive(group):
+def group_alive(group, timeout=None):
     # Ignore zombies and include descendants that outlived the original worker.
-    result = subprocess.run(["ps", "-axo", "pgid=,stat="], text=True, capture_output=True)
+    if timeout is None:
+        timeout = _GROUP_PROBE_TIMEOUT_SECONDS
+    try:
+        result = subprocess.run(["ps", "-axo", "pgid=,stat="], text=True,
+                                capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RelayError(f"Process group {group} inspection timed out after {timeout:g} seconds; "
+                         "refusing recovery") from error
+    except OSError as error:
+        raise RelayError(f"Cannot inspect process group {group}: {error}; refusing recovery") from error
     if result.returncode:
-        raise RelayError("Cannot inspect surviving process groups; refusing recovery")
+        raise RelayError(f"Cannot inspect process group {group}: ps exited {result.returncode}; refusing recovery")
     for line in result.stdout.splitlines():
         fields = line.split()
         if len(fields) == 2 and fields[0] == str(group) and not fields[1].startswith("Z"):

@@ -6,13 +6,13 @@ import subprocess
 import sys
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from devrelay.codex import build_command
 from devrelay.config import load
 from devrelay.errors import RelayError
 from devrelay.git import source_tree
-from devrelay.process import execute
+from devrelay.process import execute, terminate
 from devrelay.providers import add_local, queue_report, snapshot
 from devrelay.runner import complete_local, run_task, start, submit, verify
 from devrelay.state import State, group_alive
@@ -277,7 +277,14 @@ class LockAndProcessTests(RepositoryTest):
                 self.assertIsNone(self.state.metadata("active_process"))
         finally:
             if group is None and marker.exists():
-                group = int(marker.read_text().split()[0])
+                try:
+                    group = int(marker.read_text().split()[0])
+                except (OSError, ValueError, IndexError):
+                    pass
+            if group is None:
+                active = self.state.metadata("active_process")
+                if active:
+                    group = active["group"]
             if group is not None:
                 try:
                     os.killpg(group, signal.SIGKILL)
@@ -291,6 +298,37 @@ class LockAndProcessTests(RepositoryTest):
                     # SIGKILL above is the cleanup guarantee; an environment
                     # that forbids ps cannot confirm it here.
                     pass
+
+    def test_hung_process_group_probe_is_bounded_and_keeps_recovery_marker(self):
+        fake_bin = Path(self.temporary.name) / "fake-bin"
+        fake_bin.mkdir()
+        fake_ps = fake_bin / "ps"
+        fake_ps.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+        fake_ps.chmod(0o755)
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                   start_new_session=True)
+        self.state.set_metadata("active_process", {"group": process.pid})
+        try:
+            with (patch.dict(os.environ, {"PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]}),
+                  patch("devrelay.process._TERMINATE_GRACE_SECONDS", 0.2),
+                  patch("devrelay.process._KILL_GRACE_SECONDS", 0.2),
+                  patch("devrelay.state._GROUP_PROBE_TIMEOUT_SECONDS", 0.2),
+                  patch("devrelay.process.os.killpg") as kill_group):
+                started = time.monotonic()
+                with self.assertRaisesRegex(RelayError, "inspection timed out"):
+                    terminate(process)
+                self.assertLess(time.monotonic() - started, 1)
+                self.assertEqual(kill_group.call_args_list,
+                                 [call(process.pid, signal.SIGTERM), call(process.pid, signal.SIGKILL)])
+                recovery_started = time.monotonic()
+                with self.assertRaisesRegex(RelayError, "inspection timed out"):
+                    with self.state.lock():
+                        self.fail("an uninspectable group must keep recovery blocked")
+                self.assertLess(time.monotonic() - recovery_started, 1)
+                self.assertEqual(self.state.metadata("active_process")["group"], process.pid)
+        finally:
+            process.kill()
+            process.wait(timeout=5)
 
     def test_surviving_process_group_blocks_crash_recovery(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
