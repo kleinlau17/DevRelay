@@ -77,8 +77,17 @@ def _config_values(root, key):
 
 
 def _system_config_path(root):
-    if os.environ.get("GIT_CONFIG_NOSYSTEM"):
-        return None
+    nosystem = os.environ.get("GIT_CONFIG_NOSYSTEM")
+    if nosystem is not None:
+        # Use Git's own boolean parser (including numeric and false spellings),
+        # without loading configuration that this variable controls.
+        try:
+            disabled = git(root, "config", "--file", os.devnull, "--type=bool",
+                           "--default", nosystem, "--get", "devrelay.nosystem")
+        except RelayError as error:
+            raise RelayError("Cannot parse GIT_CONFIG_NOSYSTEM as a Git boolean") from error
+        if disabled == "true":
+            return None
     configured = os.environ.get("GIT_CONFIG_SYSTEM")
     if configured:
         path = Path(configured)

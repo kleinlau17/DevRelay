@@ -1,7 +1,9 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import unittest
+from unittest.mock import patch
 
 from devrelay.config import detect, initialize, load
 from devrelay.errors import RelayError
@@ -129,6 +131,43 @@ class ConfigurationTests(RepositoryTest):
         self.git("config", "url.https://github.com/example/other.git.insteadOf", original)
         with self.assertRaisesRegex(RelayError, "URL rewrite"):
             validate_remote(self.config)
+
+    def test_transport_preserves_system_settings_when_nosystem_is_false(self):
+        system = Path(self.temporary.name) / "system-false.gitconfig"
+        self.git("config", "--file", str(system), "devrelay.probe", "preserved")
+        for value in ("0", "false", "no", "off", "FALSE", "", "00"):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "GIT_CONFIG_NOSYSTEM": value, "GIT_CONFIG_SYSTEM": str(system),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }):
+                self.assertEqual(git(self.root, "config", "--get", "devrelay.probe"), "preserved")
+                with pinned_transport(self.root, "https://github.com/example/project.git") as (_, env):
+                    self.assertEqual(git(self.root, "config", "--get", "devrelay.probe", env=env),
+                                     "preserved")
+
+    def test_transport_keeps_system_settings_disabled_when_nosystem_is_true(self):
+        system = Path(self.temporary.name) / "system-true.gitconfig"
+        self.git("config", "--file", str(system), "devrelay.probe", "disabled")
+        for value in ("1", "true", "yes", "on", "TRUE", "2", "-1"):
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "GIT_CONFIG_NOSYSTEM": value, "GIT_CONFIG_SYSTEM": str(system),
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }):
+                with pinned_transport(self.root, "https://github.com/example/project.git") as (_, env):
+                    for actual_env in (os.environ, env):
+                        result = subprocess.run(
+                            ["git", "config", "--get", "devrelay.probe"], cwd=self.root,
+                            env=actual_env, text=True, capture_output=True, timeout=60,
+                        )
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertEqual(result.stdout, "")
+
+    def test_transport_rejects_invalid_nosystem_boolean_before_yielding(self):
+        for value in ("invalid", "truthy", "0.0"):
+            with self.subTest(value=value), patch.dict(os.environ, {"GIT_CONFIG_NOSYSTEM": value}):
+                with self.assertRaisesRegex(RelayError, "GIT_CONFIG_NOSYSTEM.*Git boolean"):
+                    with pinned_transport(self.root, "https://github.com/example/project.git"):
+                        self.fail("Invalid system configuration policy must stop the transport")
 
     def test_transport_pin_wins_over_a_later_url_rewrite(self):
         allowed = Path(self.temporary.name) / "pin-allowed.git"
