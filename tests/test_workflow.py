@@ -267,6 +267,33 @@ class SubmoduleWorkflowTests(RepositoryTest):
             verify(self.config, self.state, "fix-1")
         self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
 
+    def _assert_index_mask_cannot_hide_tracked_submodule_change(self, flag):
+        checks = [[sys.executable, "-c",
+                   "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').read_text() == 'fixed\\n'"]]
+        _, dependency = self._prepare(checks)
+        self.git("update-index", flag, "dependency.txt", cwd=dependency)
+        (dependency / "dependency.txt").write_text("fixed\n")
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertEqual((dependency / "dependency.txt").read_text(), "fixed\n")
+
+    def test_assume_unchanged_cannot_hide_tracked_submodule_content(self):
+        self._assert_index_mask_cannot_hide_tracked_submodule_change("--assume-unchanged")
+
+    def test_skip_worktree_cannot_hide_tracked_submodule_content(self):
+        self._assert_index_mask_cannot_hide_tracked_submodule_change("--skip-worktree")
+
+    def test_filemode_configuration_cannot_hide_submodule_mode_change(self):
+        checks = [[sys.executable, "-c",
+                   "from pathlib import Path; assert Path('vendor/dependency/dependency.txt').stat().st_mode & 0o111"]]
+        _, dependency = self._prepare(checks)
+        target = dependency / "dependency.txt"
+        self.git("config", "core.fileMode", "false", cwd=dependency)
+        target.chmod(0o755)
+        with self.state.lock(), self.assertRaisesRegex(RelayError, "Submodule worktree.*vendor/dependency"):
+            verify(self.config, self.state, "fix-1")
+        self.assertTrue(target.stat().st_mode & 0o111)
+
     def test_untracked_submodule_file_cannot_be_hidden_by_status_configuration(self):
         worktree, dependency = self._prepare()
         (dependency / "untracked.txt").write_text("not delivered\n")

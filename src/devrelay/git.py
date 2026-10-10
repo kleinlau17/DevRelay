@@ -56,23 +56,36 @@ def _gitlink_paths(root, *, env=None):
     return paths
 
 
+def _submodule_checkout(root, path):
+    checkout = (root / path).resolve()
+    if not checkout.is_dir() or not (checkout / ".git").exists():
+        return None
+    return checkout if Path(git(checkout, "rev-parse", "--show-toplevel")).resolve() == checkout else None
+
+
+def _submodule_heads(root, paths):
+    heads = {}
+    for path in paths:
+        checkout = _submodule_checkout(root, path)
+        if checkout is not None:
+            heads[path] = git(checkout, "rev-parse", "HEAD")
+    return heads
+
+
 def _submodule_snapshot(root, paths, prefix=Path(), seen=None):
     heads, dirty = {}, []
     seen = set() if seen is None else seen
     for path in paths:
-        checkout = (root / path).resolve()
-        if not checkout.is_dir() or not (checkout / ".git").exists() or checkout in seen:
-            continue
-        top = Path(git(checkout, "rev-parse", "--show-toplevel")).resolve()
-        if top != checkout:
+        checkout = _submodule_checkout(root, path)
+        if checkout is None or checkout in seen:
             continue
         seen.add(checkout)
         display = (prefix / path).as_posix()
         heads[display] = git(checkout, "rev-parse", "HEAD")
-        status = git(checkout, "-c", "core.excludesFile=/dev/null", "-c", "status.showUntrackedFiles=all",
-                     "status", "--porcelain=v1", "-z",
-                     "--untracked-files=all", "--ignore-submodules=none")
-        if status:
+        head_tree = git(checkout, "rev-parse", "HEAD^{tree}")
+        if (git(checkout, "write-tree") != head_tree
+                or _isolated_source_tree(checkout, inspect_submodules=False,
+                                         neutralize_config=True) != head_tree):
             dirty.append(display)
         nested_heads, nested_dirty = _submodule_snapshot(
             checkout, _gitlink_paths(checkout), prefix / path, seen)
@@ -88,21 +101,29 @@ def _clean_submodule_snapshot(root, paths):
     return heads
 
 
-def source_tree(root):
+def _isolated_source_tree(root, *, inspect_submodules, neutralize_config=False):
     with tempfile.TemporaryDirectory(prefix="devrelay-index-") as temporary:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
         git(root, "read-tree", "HEAD", env=env)
-        git(root, "add", "-A", env=env)
+        config = (["-c", "core.fileMode=true", "-c", f"core.excludesFile={os.devnull}"]
+                  if neutralize_config else [])
+        git(root, *config, "add", "-A", env=env)
         paths = _gitlink_paths(root, env=env)
-        submodules = _clean_submodule_snapshot(root, paths)
+        submodules = (_clean_submodule_snapshot(root, paths) if inspect_submodules
+                      else _submodule_heads(root, paths))
         for path in paths:
             if path in submodules:
                 git(root, "update-index", "--add", "--cacheinfo", "160000", submodules[path], path, env=env)
-        git(root, "diff", "--cached", "--check", env=env)
+        if inspect_submodules:
+            git(root, "diff", "--cached", "--check", env=env)
         tree = git(root, "write-tree", env=env)
-        if _clean_submodule_snapshot(root, paths) != submodules:
+        if inspect_submodules and _clean_submodule_snapshot(root, paths) != submodules:
             raise RelayError("Submodule HEAD changed while creating source evidence; rerun verification")
         return tree
+
+
+def source_tree(root):
+    return _isolated_source_tree(root, inspect_submodules=True)
 
 
 def github_slug(url):
