@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
+import subprocess
 import unittest
 
 from devrelay.config import detect, initialize, load
 from devrelay.errors import RelayError
-from devrelay.git import github_slug, validate_remote
+from devrelay.git import git, github_slug, pinned_transport, validate_remote
 
 from helpers import RepositoryTest
 
@@ -128,6 +129,19 @@ class ConfigurationTests(RepositoryTest):
         self.git("config", "url.https://github.com/example/other.git.insteadOf", original)
         with self.assertRaisesRegex(RelayError, "URL rewrite"):
             validate_remote(self.config)
+
+    def test_transport_pin_wins_over_a_later_url_rewrite(self):
+        allowed = Path(self.temporary.name) / "pin-allowed.git"
+        unapproved = Path(self.temporary.name) / "pin-unapproved.git"
+        for remote in (allowed, unapproved):
+            subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        self.git("config", f"url.{unapproved}.pushInsteadOf", str(allowed))
+        with pinned_transport(self.root, str(allowed)) as env:
+            git(self.root, "push", str(allowed), "refs/heads/main:refs/heads/pinned", env=env)
+        self.assertEqual(self.git("--git-dir", str(allowed), "rev-parse", "refs/heads/pinned"),
+                         self.git("rev-parse", "main"))
+        refs = self.git("--git-dir", str(unapproved), "for-each-ref", "--format=%(refname)")
+        self.assertNotIn("refs/heads/pinned", refs)
 
     def test_remote_validation_uses_the_transport_worktree_context(self):
         self.configure(provider="github")

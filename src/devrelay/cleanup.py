@@ -6,7 +6,7 @@ import re
 import uuid
 
 from .errors import RelayError
-from .git import git, has_ref, is_ancestor, source_tree, validate_remote, worktrees
+from .git import git, has_ref, is_ancestor, pinned_transport, source_tree, validate_remote, worktrees
 from .runner import assert_config, base_commit
 from .state import now
 
@@ -32,8 +32,8 @@ def _tree(config, path, head, branch=None):
     return True
 
 
-def _remote_head(config, url, ref):
-    output = git(config.root, "ls-remote", url, ref)
+def _remote_head(config, url, ref, *, env=None):
+    output = git(config.root, "ls-remote", url, ref, env=env)
     if not output:
         return None
     fields = output.split()
@@ -98,7 +98,8 @@ def run(config, state, task):
                       and Path(item["worktree"]).resolve() != task_path.resolve()]
             if others:
                 raise RelayError("Task branch is checked out in another worktree; preserved")
-            remote_head = _remote_head(config, push_url, ref)
+            with pinned_transport(config.root, push_url) as env:
+                remote_head = _remote_head(config, push_url, ref, env=env)
             if remote_head is not None and remote_head != task["head_sha"]:
                 raise RelayError("Remote task branch advanced; preserved")
 
@@ -120,19 +121,20 @@ def run(config, state, task):
             def remote():
                 assert_config(config)
                 current_push_url = validate_remote(config)
-                current = _remote_head(config, current_push_url, ref)
-                if current is None:
-                    return "already_absent"
-                if current != task["head_sha"]:
-                    raise RelayError("Remote task branch advanced; preserved")
-                failure = None
-                try:
-                    git(config.root, "push", "--force-with-lease=" + ref + ":" + task["head_sha"],
-                        current_push_url, ":" + ref)
-                except RelayError as error:
-                    failure = error
-                if _remote_head(config, current_push_url, ref) is not None:
-                    raise failure or RelayError("Remote task branch still exists after deletion")
+                with pinned_transport(config.root, current_push_url) as env:
+                    current = _remote_head(config, current_push_url, ref, env=env)
+                    if current is None:
+                        return "already_absent"
+                    if current != task["head_sha"]:
+                        raise RelayError("Remote task branch advanced; preserved")
+                    failure = None
+                    try:
+                        git(config.root, "push", "--force-with-lease=" + ref + ":" + task["head_sha"],
+                            current_push_url, ":" + ref, env=env)
+                    except RelayError as error:
+                        failure = error
+                    if _remote_head(config, current_push_url, ref, env=env) is not None:
+                        raise failure or RelayError("Remote task branch still exists after deletion")
                 return "removed"
             step("remote_branch", remote)
 

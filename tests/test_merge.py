@@ -503,6 +503,32 @@ class MergeTests(GitHubDeliveryFixture):
         self.assertEqual(result["status"], "completed")
         self.assertFalse(has_ref(self.root, result["branch"]))
 
+    def test_rewrite_added_after_validation_cannot_redirect_remote_deletion(self):
+        self.enable(cleanup_branches=True, cleanup_worktrees=True)
+        extra = Path(self.temporary.name) / "cleanup-race-extra.git"
+        self.git("init", "--bare", "-q", str(extra))
+        validation_calls = 0
+
+        def validate_then_rewrite(config, root=None):
+            nonlocal validation_calls
+            validation_calls += 1
+            if validation_calls == 2:
+                self.git("config", f"url.{extra}.pushInsteadOf", str(self.remote))
+            return str(self.remote)
+
+        def seed_extra():
+            task = self.state.get("12")
+            self.git("push", "-q", str(extra), task["branch"], cwd=task["worktree"])
+
+        with (patch("devrelay.cleanup.validate_remote", side_effect=validate_then_rewrite),
+              self.after_acceptance(seed_extra)):
+            result = self.deliver()
+        self.assertEqual(validation_calls, 2)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/" + result["branch"]), "")
+        self.assertEqual(self.git("--git-dir", str(extra), "rev-parse", result["branch"]),
+                         result["head_sha"])
+
     def test_remote_branch_already_deleted_by_github_is_idempotent(self):
         self.enable(cleanup_branches=True, cleanup_worktrees=True)
         def remove_remote():

@@ -1,5 +1,6 @@
 """Git operations that preserve the caller's working tree and index."""
 
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import re
@@ -73,6 +74,51 @@ def _config_values(root, key):
         detail = result.stderr.strip() or result.stdout.strip()
         raise RelayError(f"git failed ({result.returncode}): {detail}")
     return result.stdout.splitlines()
+
+
+def _system_config_path(root):
+    if os.environ.get("GIT_CONFIG_NOSYSTEM"):
+        return None
+    configured = os.environ.get("GIT_CONFIG_SYSTEM")
+    if configured:
+        path = Path(configured)
+        return path if path.is_absolute() else (Path(root) / path).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "config", "--system", "--includes", "--show-origin", "--null", "--list"],
+            cwd=root, capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RelayError(f"Cannot inspect Git system configuration: {error}") from error
+    if result.returncode:
+        if b"No such file or directory" in result.stderr:
+            return None  # A missing system file is valid and contributes no settings.
+        raise RelayError("Cannot inspect Git system configuration")
+    entries = result.stdout.split(b"\0")
+    for origin in entries[::2]:
+        if origin.startswith(b"file:"):
+            return Path(os.fsdecode(origin[5:]))
+    return None
+
+
+@contextmanager
+def pinned_transport(root, url):
+    """Pin one transport URL ahead of mutable global/local rewrite rules."""
+    root = Path(root)
+    system_config = _system_config_path(root)
+    with tempfile.TemporaryDirectory(prefix="devrelay-transport-") as temporary:
+        path = Path(temporary) / "gitconfig"
+        # System configuration is read before global, local, worktree and
+        # command scopes. Git keeps the first equally long rewrite match, so
+        # these exact self-mappings cannot be superseded by a later mutation.
+        for name in ("insteadOf", "pushInsteadOf"):
+            command(["git", "config", "--file", str(path), "--add", f"url.{url}.{name}", url], root)
+        if system_config is not None:
+            command(["git", "config", "--file", str(path), "--add", "include.path",
+                     str(system_config)], root)
+        env = {**os.environ, "GIT_CONFIG_SYSTEM": str(path)}
+        env.pop("GIT_CONFIG_NOSYSTEM", None)
+        yield env
 
 
 def validate_remote(config, root=None):

@@ -101,6 +101,20 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
         self.assertEqual(self.edit_count, 1)
         self.assertEqual(recovered["status"], "pr_open")
 
+    def test_restricted_fetch_refspec_does_not_break_branch_tracking(self):
+        self.git("config", "--replace-all", "remote.origin.fetch",
+                 "+refs/heads/main:refs/remotes/origin/main")
+        self.implement()
+        with self.state.lock():
+            task = submit(self.config, self.state, "12")
+        self.assertEqual(task["status"], "pr_open")
+        self.assertEqual(self.git("config", "--get", "branch." + task["branch"] + ".remote",
+                                  cwd=task["worktree"]), "origin")
+        self.assertEqual(self.git("config", "--get", "branch." + task["branch"] + ".merge",
+                                  cwd=task["worktree"]), "refs/heads/" + task["branch"])
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", task["branch"]),
+                         task["head_sha"])
+
     def test_mismatched_pr_head_is_rejected(self):
         self.implement()
         self.readback_head = "0" * 40
@@ -156,6 +170,29 @@ class GitHubDeliveryTests(GitHubDeliveryFixture):
                 ["git", "--git-dir", str(remote), "for-each-ref", "--format=%(refname)"], text=True
             )
             self.assertNotIn(branch, refs)
+
+    def test_rewrite_added_after_validation_cannot_redirect_real_push(self):
+        self.implement()
+        extra = Path(self.temporary.name) / "race-extra.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(extra)], check=True)
+        changed = False
+
+        def validate_then_rewrite(config, root=None):
+            nonlocal changed
+            if root is not None and not changed:
+                changed = True
+                self.git("config", f"url.{extra}.pushInsteadOf", str(self.remote))
+            return str(self.remote)
+
+        with patch("devrelay.runner.validate_remote", side_effect=validate_then_rewrite), self.state.lock():
+            task = submit(self.config, self.state, "12")
+        self.assertTrue(changed)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", task["branch"]),
+                         task["head_sha"])
+        refs = subprocess.check_output(
+            ["git", "--git-dir", str(extra), "for-each-ref", "--format=%(refname)"], text=True
+        )
+        self.assertNotIn("refs/heads/" + task["branch"], refs)
 
 
 if __name__ == "__main__":

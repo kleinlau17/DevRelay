@@ -7,7 +7,7 @@ import uuid
 from . import codex
 from .config import load
 from .errors import RelayError
-from .git import git, has_ref, is_ancestor, source_tree, validate_remote, worktrees
+from .git import git, has_ref, is_ancestor, pinned_transport, source_tree, validate_remote, worktrees
 from .process import execute
 from .providers import authorized, gh, gh_json, queue_report, snapshot, task_id
 from .state import now
@@ -260,12 +260,16 @@ def submit(config, state, identifier, *, local=False):
         raise RelayError("Base changed before push; integrate it and rerun verification")
     push_url = validate_remote(config, path)
     ref = "refs/heads/" + task["branch"]
-    # Push the exact validated endpoint. A remote name could fan out to a
-    # second pushurl added after validation.
-    git(path, "push", push_url, ref + ":" + ref)
+    # Pin the exact validated endpoint in the transport invocation. A remote
+    # name could fan out, while a later rewrite could redirect a plain URL.
+    with pinned_transport(path, push_url) as env:
+        git(path, "push", push_url, ref + ":" + ref, env=env)
     tracking_ref = "refs/remotes/" + config.remote + "/" + task["branch"]
     git(path, "update-ref", tracking_ref, head)
-    git(path, "branch", "--set-upstream-to", config.remote + "/" + task["branch"], task["branch"])
+    # Match `push --set-upstream` without requiring the task branch to be
+    # covered by remote.<name>.fetch (single-branch clones commonly are not).
+    git(path, "config", "branch." + task["branch"] + ".remote", config.remote)
+    git(path, "config", "branch." + task["branch"] + ".merge", ref)
     summary = task.get("summary") or "Implementation verified by configured project checks."
     check_lines = "\n".join(f"- `{item['id']}`: exit {item['returncode']}" for item in record["checks"])
     body = (f"{summary}\n\nVerification\n\n{check_lines}\n\n"
