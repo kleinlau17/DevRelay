@@ -145,6 +145,8 @@ devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
 
 `--interval` is a shorter alias for `--poll-interval`, for example `watch --interval 30`; both accept positive integers and default to 60 seconds.
 
+`--limit` is a shorter alias for `--max-tasks`, for example `watch --limit 2`; both accept positive integers, with no task limit by default when omitted.
+
 `watch` serially claims authorized issues with integrated dependencies, ordered by configured priority and creation time. It implements, verifies and submits a draft PR, including fresh read-only review when `auto_review` is enabled, then immediately moves to the next eligible issue. It neither waits for earlier PRs to merge nor repeats already submitted tasks. An empty queue is checked every 60 seconds by default, so newly authorized issues can be picked up. Existing authorization, blockers, dependency, duplicate-claim and acceptance gates still apply.
 
 Merging stays with the maintainer: `watch` requires `[delivery] auto_merge = false`, rejects automatic merge configurations and leaves drafts as drafts. It runs in the foreground; keep the terminal and machine running. It does not install a background service or startup job. Output is flushed JSON Lines events followed by a final status. `--max-tasks` counts successfully delivered PRs during this invocation, including recovered deliveries; omit it to keep watching.

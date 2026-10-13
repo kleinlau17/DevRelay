@@ -153,6 +153,8 @@ devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
 
 `--interval` 是 `--poll-interval` 的简短别名，例如 `watch --interval 30`；两种写法都要求正整数，默认值均为 60 秒。
 
+`--limit` 是 `--max-tasks` 的简短别名，例如 `watch --limit 2`；两种写法都要求正整数，省略时默认不限制任务数量。
+
 `watch` 按配置的优先级和创建时间串行领取已授权、依赖已交付的 Issue，自动实现、验收并提交 draft PR；开启 `auto_review` 时还会执行独立只读审查。成功提交（及启用的审查）后立即领取下一条，不等待前一个 PR 合并，也不重复处理已经提交的任务。队列为空时默认每 60 秒重新检查，新 Issue 授权后即可被领取。原有授权、阻塞、依赖、重复领取和验收门禁全部保留。
 
 合并由维护者决定：`watch` 要求 `[delivery] auto_merge = false`，不接受开启自动合并的配置，也不将 draft 标为 ready。它是前台长运行命令，终端和机器需要保持运行；不会安装后台服务或开机启动。输出为实时刷新的 JSON Lines 事件及最终状态。`--max-tasks` 计算本次成功交付的 PR 数（包括恢复的交付），省略则持续等待。
