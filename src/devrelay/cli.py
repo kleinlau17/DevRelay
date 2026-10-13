@@ -50,16 +50,19 @@ def parser():
         item.add_argument("id")
         if name == "submit":
             item.add_argument("--local", action="store_true", help="Create a local commit without push or PR")
+        if name == "merge":
+            item.add_argument("--retry-request", action="store_true",
+                              help="Explicitly retry a saved merge request only after remote queue/auto-merge is absent")
         if name == "resume":
             item.add_argument("--submit", action="store_true", help="Submit a draft PR after checks pass")
     run = sub.add_parser("run", help="Implement and verify one task, recovering interrupted work first")
     run.add_argument("id", nargs="?")
     run.add_argument("--submit", action="store_true", help="Submit a draft PR after checks pass")
-    worker = sub.add_parser("watch", help="Continuously implement authorized GitHub issues and submit draft PRs; merge manually")
+    worker = sub.add_parser("watch", help="Continuously deliver authorized GitHub issues using configured review/merge policy")
     worker.add_argument("--poll-interval", type=positive_integer, default=60,
-                        help="Seconds to wait when the queue is empty (default: 60)")
+                        help="Seconds between empty-queue and merge-gate polls (default: 60)")
     worker.add_argument("--max-tasks", type=positive_integer,
-                        help="Stop after this many delivered PRs (default: keep watching)")
+                        help="Stop after this many deliveries (post-merge acceptance in auto mode; default: keep watching)")
     return root
 
 
@@ -162,7 +165,7 @@ def main(argv=None):
                     elif args.command == "review":
                         result = review(config, state, args.id)
                     elif args.command == "merge":
-                        result = merge(config, state, args.id)
+                        result = merge(config, state, args.id, retry_request=args.retry_request)
                     else:
                         result = run_task(config, state, args.id, resume=args.command == "resume", submit_after=args.submit)
         print(json.dumps(result, indent=2, ensure_ascii=False))

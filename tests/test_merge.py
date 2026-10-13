@@ -58,7 +58,8 @@ class MergeTests(GitHubDeliveryFixture):
         self.assertIn("name=project", argv)
         self.assertIn("number=1", argv)
         task = self.state.get("12")
-        pull = {"url": task["pr_url"], "state": "MERGED" if self.merged else "OPEN",
+        pull = {"id": "PR-test", "mergeQueueEntry": {"id": "queue-test"} if self.request_pending and self.merge_count and not self.merged else None,
+                "autoMergeRequest": None, "url": task["pr_url"], "state": "MERGED" if self.merged else "OPEN",
                 "headRefName": task["branch"], "headRefOid": self.head_override or task["head_sha"],
                 "baseRefName": "main", "baseRefOid": self.git("rev-parse", "origin/main"),
                 "isCrossRepository": False, "isDraft": self.draft, "mergeable": "MERGEABLE",

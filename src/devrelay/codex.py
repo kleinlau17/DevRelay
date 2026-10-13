@@ -430,6 +430,11 @@ Acceptance commands (JSON): {json.dumps(config.data['checks'], ensure_ascii=Fals
     (directory / "prompt.txt").write_text(prompt)
     execute(state, build_command(config, directory, sandbox="read-only"), task["worktree"],
             directory / "events.jsonl", config.data["codex"]["timeout_seconds"], input=prompt)
+    return read_review(task, directory)
+
+
+def read_review(task, directory):
+    """Read a completed independent review without starting another session."""
     sessions, completed, failed = set(), False, False
     for line in (directory / "events.jsonl").read_text(errors="replace").split("\n"):
         try:
