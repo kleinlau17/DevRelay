@@ -1,6 +1,8 @@
 # DevRelay engineering
 
 - Keep the core project-independent. Project commands and acceptance belong in configuration.
+- One issue defines one observable, reviewable result. Keep the code, configuration, tests and documentation needed for that result together. Split child issues only when they have independent value or acceptance criteria; file, layer or phase boundaries alone do not justify splitting.
+- Overall plans are tracking parents, never executable tasks. Mark them with `scope:plan` or `Task kind: plan`; grant execution authorization only to bounded child issues.
 - Preserve existing work, original indexes and verification evidence. Never reset a user's worktree.
 - Execute commands as argument arrays, never interpolate issue content into a shell command.
 - Bind verification to the source tree, configuration and target base. Failed or stale checks must block submission.

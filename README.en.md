@@ -53,12 +53,17 @@ Defaults follow DexLab's management rules:
 | Dimension | Labels |
 |---|---|
 | Primary work type | `bug`, `enhancement`, `documentation`, `experiment`, `infrastructure` |
+| Overall plan | `scope:plan` (tracks children; rejected for execution) |
 | Relevant area | `area:backend`, `area:benchmark`, `area:cloth`, `area:contact`, `area:evaluation`, `area:hardware` |
 | Exactly one priority | `priority:P0` (urgent fixes), `priority:P1` (core delivery), `priority:P2` (extensions) |
 | Authorization | `auto:approved` |
 | Blockers | `blocked`, `needs-input` |
 
-Templates record evidence, scope, acceptance commands, one `Depends on: none` declaration, resources and recovery conditions. Bug, task and experiment templates pre-apply only the work type. The plan template tracks bounded child deliveries and explicitly excludes execution authorization on the parent. **Generated templates never automatically apply `auto:approved`, a configured authorization label, or a priority to new issues.** Creating a repository label does not authorize an issue. Maintainers separately select one priority and grant execution authorization after confirming the scope and acceptance; dependencies and blockers still apply.
+One issue delivers one observable, reviewable result. Keep the code, configuration, tests and documentation necessary for that result together. Split child issues only when they have independent value or acceptance criteria, not merely by file, layer or phase. Maintainers confirm this scope before authorization; implementation and AI review prompts carry the same rule. The queue does not automatically judge whether a natural-language task should be split.
+
+Templates record evidence, scope, acceptance commands, one `Depends on: none` declaration, resources and recovery conditions. Bug, task and experiment templates pre-apply only the work type. The plan template pre-applies `scope:plan` and includes `Task kind: plan` in its body to track child deliveries. **Generated templates never automatically apply `auto:approved`, a configured authorization label, or a priority to new issues.** Creating a repository label does not authorize an issue. Maintainers separately select one priority and grant execution authorization after confirming the scope and acceptance; dependencies and blockers still apply.
+
+Tracking parents carrying `scope:plan` or a standalone body line `Task kind: plan` are rejected even if accidentally authorized. The original template's `## Child issues and delivery plan / 子任务与交付计划` heading is also recognized. This applies to GitHub and local tasks, automatic selection and authorization for explicit-ID execution, resume and submission. A child's `Parent: #N` link does not affect eligibility; do not declare its tracking parent as a prerequisite that must be completed first. Maintainers must mark custom plans without these indicators; `init --sync-github` preserves existing templates rather than upgrading them.
 
 Existing label names, colors and descriptions, template files and other forms are preserved. Preserved project templates retain their own defaults and should be reviewed separately. Add project-specific area labels as needed. For already-onboarded projects or recovery after network/permission errors:
 
