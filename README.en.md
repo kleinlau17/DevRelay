@@ -15,6 +15,8 @@ python3 -m venv .venv
 .venv/bin/devrelay --help
 ```
 
+Use `devrelay --version` or `devrelay -V` to print the version; neither a Git repository nor project configuration is required.
+
 Alternatively, use `pipx install /path/to/DevRelay` for a global command. AI execution requires an installed, signed-in Codex CLI. GitHub tasks and PR submission also require authenticated `gh`. Existing authentication is reused; credential files are not read or copied.
 
 ```bash

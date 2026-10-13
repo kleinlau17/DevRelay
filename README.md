@@ -15,6 +15,8 @@ python3 -m venv .venv
 .venv/bin/devrelay --help
 ```
 
+使用 `devrelay --version` 或 `devrelay -V` 查询版本；无需在 Git 仓库内运行，也无需项目配置。
+
 也可使用 `pipx install /path/to/DevRelay` 安装全局命令。运行 AI 任务前需要安装并登录 Codex CLI；GitHub 队列和 PR 操作另外需要已认证的 `gh`。DevRelay 使用既有登录，不读取或复制凭据文件。
 
 ## 接入一个项目
