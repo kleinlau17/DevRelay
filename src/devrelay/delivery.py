@@ -11,7 +11,7 @@ from .errors import RelayError
 from .git import command, git, is_ancestor, source_tree, validate_remote
 from .process import execute
 from .providers import authorized, gh, task_id
-from .runner import assert_config, base_commit, claimed_task
+from .runner import assert_config, base_commit, claimed_task, require_prepared
 from .state import now
 
 
@@ -87,6 +87,7 @@ def current_review(task, config):
 
 def open_evidence(config, state, task, pull):
     assert_config(config)
+    require_prepared(config, task)
     fresh = authorized(config, state, task["id"])
     record = task.get("verification") or {}
     path = Path(task["worktree"])

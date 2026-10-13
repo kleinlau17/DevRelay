@@ -2,9 +2,9 @@
 
 [English](README.en.md) | 简体中文
 
-通过少量项目配置，让 Codex 从明确任务推进到经过验证、可审查的 PR，并按项目授权自动合并。
+面向 Agent 的通用工程工具：让 Agent 自主规划、探索和实现，通过 DevRelay 完成工作树隔离、项目验收与受门禁约束的交付。
 
-DevRelay 管理任务队列、隔离工作树、Codex 执行、验收记录和 PR 提交。项目负责定义安装命令与验收规则。0.4 版支持 macOS / Linux、Python 3.11+ 和 Git；核心没有第三方运行依赖。
+主要工作流由外层 Agent 驱动，逐步调用 `next/start/prepare/check/submit`；DevRelay 管理工程状态和验收证据。`run/resume/watch` 保留为可选的 Codex 程序编排。项目负责定义安装命令与验收规则。0.4 版支持 macOS / Linux、Python 3.11+ 和 Git；核心没有第三方运行依赖。
 
 ## 安装
 
@@ -15,7 +15,7 @@ python3 -m venv .venv
 .venv/bin/devrelay --help
 ```
 
-也可使用 `pipx install /path/to/DevRelay` 安装全局命令。运行 AI 任务前需要安装并登录 Codex CLI；GitHub 队列和 PR 操作另外需要已认证的 `gh`。DevRelay 使用既有登录，不读取或复制凭据文件。
+也可使用 `pipx install /path/to/DevRelay` 安装全局命令。工程工具模式不要求 Codex CLI；可选编排与 AI 审查需要安装并登录 Codex CLI。GitHub 队列和 PR 操作需要已认证的 `gh`。DevRelay 使用既有登录，不读取或复制凭据文件。
 
 ## 接入一个项目
 
@@ -36,6 +36,7 @@ repository = "owner/project"
 base_branch = "main"
 
 [codex]
+# 仅配置可选编排与 AI 审查；工程工具模式可省略此表。
 sandbox = "workspace-write"
 max_attempts = 2
 
@@ -46,6 +47,27 @@ argv = ["python3", "-m", "unittest", "discover", "-s", "tests"]
 
 将项目配置、必要忽略规则及生成的 Issue 模板纳入项目版本管理，再从主 checkout 使用 DevRelay。新建的空仓库需要先有初始提交。模型默认沿用用户 Codex 配置，可显式设置 `codex.model` / `codex.profile`。
 
+## 主要工作流：Agent 驱动
+
+外层 Agent 负责调查目标、探索方案、拆分可独立验收的任务、实现和根据结果调整计划。明确授权的子任务进入现有队列；DevRelay 负责工程操作与交付门禁。规划和实验结论可以保存在 Issues、任务文件与项目产物中。
+
+```bash
+devrelay --project /path/to/project next
+devrelay --project /path/to/project start 12
+devrelay --project /path/to/project prepare 12
+# Agent 在 start 返回的 worktree 中调查、实现并修复。
+devrelay --project /path/to/project check 12
+devrelay --project /path/to/project submit 12
+```
+
+从主 checkout 调用工具，读取 JSON 返回值中的工作树、状态和证据路径。`start` 只领取并创建或恢复工作树；`prepare` 在已领取的工作树中执行配置的全部 setup 命令，不调用模型，每次显式调用都重跑并使旧验收、AI 审查与合并门禁记录失效，历史日志保留，完成后需重新 `check`。准备失败或中断保存现场与日志，修复原因后重试 `prepare`。配置了 setup 时，准备缺失、失败或配置已过期都会阻止验收与交付。`check` 不启动实现 Agent；失败后由外层 Agent 读取证据并修复，再调用 `check`。`submit` 默认交付 draft PR；如果项目明确启用了自动审查或合并，它仍会推进相应策略。
+
+已有本地提交或未合并 PR 的任务可以重新 `prepare`，再 `check/submit`，继续使用原分支与 PR。对已有 PR 会回读仓库、状态、head 与 base；已关闭、已合并、正在合并或身份不符时拒绝准备，保留现场并转入交付恢复。环境配置改变后，应先把最新目标分支集成到任务分支。`submit` 在提交、推送、PR 发布和回读边界重新比较任务标题、正文、授权、源码、配置与 base；观察到变化即停止，保留已发生的提交、推送及已回读的 PR 身份，重新验收后恢复，不自动回滚。
+
+外层 Agent 的会话、计划、实验预算及工作树编辑期间的独占由外层负责。DevRelay 的单 worker 锁只覆盖工具命令执行，不覆盖两次调用之间的编辑；不要同时为该仓库启动 `watch`。恢复时先查看 `status` 和实际工作树，再继续编辑或重试工具。`resume` 专用于可选的 DevRelay Codex 编排，不能恢复外层 Agent 的会话。
+
+`doctor` 默认检查工程工具，并检查已配置的 AI 交付依赖；启用了 `auto_review` 或 `auto_merge` 时仍要求 Codex。使用可选编排或显式 `review` 前运行 `doctor --with-codex`。完整操作约定见 [Agent 工作流](docs/agent-workflow.md)。
+
 ### GitHub 标签与 Issue 模板
 
 GitHub 项目首次 `init` 会使用已认证的 `gh` 补齐仓库标签，并生成 `.github/ISSUE_TEMPLATE/devrelay-{bug,task,experiment,plan}.md`。需要对该仓库创建标签的权限；本地模式仍完全离线。标签直接创建在 GitHub，模板写入本地，提交到仓库默认分支后才会出现在新建 Issue 页面。初始化不会替你提交或推送文件。
@@ -55,12 +77,17 @@ GitHub 项目首次 `init` 会使用已认证的 `gh` 补齐仓库标签，并�
 | 维度 | 标签 |
 |---|---|
 | 主要任务类型 | `bug`、`enhancement`、`documentation`、`experiment`、`infrastructure` |
+| 总体计划 | `scope:plan`（只跟踪子任务，队列拒绝执行） |
 | 相关范围 | `area:backend`、`area:benchmark`、`area:cloth`、`area:contact`、`area:evaluation`、`area:hardware` |
 | 唯一优先级 | `priority:P0`（首要修复）、`priority:P1`（当前核心交付）、`priority:P2`（后续扩展） |
 | 执行授权 | `auto:approved` |
 | 阻塞 | `blocked`、`needs-input` |
 
-模板包含问题与证据、交付范围、验收与命令、唯一的 `Depends on: none` 声明、资源与恢复条件。Bug、工程任务、实验模板只预设类型标签；总体计划模板用于拆分和跟踪子任务，明确要求不给父任务执行授权。**任何生成的模板都不自动给新 Issue 加 `auto:approved` 或配置的授权标签，也不自动设优先级。** 创建仓库标签本身不授权任何 Issue；维护者确认任务后另行设置一个优先级及授权。依赖、阻塞和验收仍需满足。
+一个 Issue 对应一个可观察、可审查结果。实现该结果所需的代码、配置、测试和文档放在一起；只有具备独立价值或验收标准才拆子项，不仅按文件、层或阶段拆分。维护者在授权前确认粒度，执行与 AI 审查提示词也遵守该规则；队列不自动判断自然语言任务是否应该拆分。
+
+模板包含问题与证据、交付范围、验收与命令、唯一的 `Depends on: none` 声明、资源与恢复条件。Bug、工程任务、实验模板只预设类型标签；总体计划模板预设 `scope:plan` 并在正文写入 `Task kind: plan`，只跟踪子任务。**任何生成的模板都不自动给新 Issue 加 `auto:approved` 或配置的授权标签，也不自动设优先级。** 创建仓库标签本身不授权任何 Issue；维护者确认任务后另行设置一个优先级及授权。依赖、阻塞和验收仍需满足。
+
+带 `scope:plan` 标签或正文独立行 `Task kind: plan` 的总体计划父任务，即使误加授权也会被队列拒绝；旧模板的 `## Child issues and delivery plan / 子任务与交付计划` 标题也会被识别。该限制同时用于 GitHub／本地任务、自动选取及显式指定 ID 的执行、恢复和提交授权检查。普通子任务的 `Parent: #N` 链接不影响资格；不要把父任务写成必须先完成的依赖，否则子任务会等待父任务。未使用这些标记的自定义计划须由维护者补标记；`init --sync-github` 保留已有模板，不会自动升级它们。
 
 已有标签保留名称、颜色和描述，已有模板文件与其他表单不覆盖；保留的项目模板继续使用项目自己的默认标签，维护者应单独核对。可以自行添加项目领域标签。对于已经接入的项目或网络/权限错误后的补齐，运行：
 
@@ -85,13 +112,13 @@ Depends on: #12, #27
 ```bash
 devrelay next
 devrelay start 12
-devrelay run 12
+devrelay prepare 12
 devrelay status
 devrelay check 12
 devrelay submit 12
 ```
 
-`run` 每次只处理一个任务。无 ID 时优先恢复中断任务；已有失败或阻塞任务时返回 `needs_attention`，由维护者检查并明确恢复后再派发新任务。`start` 只创建或恢复工作树。Codex 在 `.devrelay/worktrees/ID` 实现，DevRelay 执行验收。检查失败时，在配置的 `max_attempts` 范围内把失败信息交给相同 Codex 会话修复。Codex 报告外部阻塞时保存阻塞状态。
+工程工具与可选编排共用本节的任务授权、依赖与验收规则。外层 Agent 的报告不代替 `check` 产生的有效证据。
 
 `submit` 仅接受仍有效的验证证据，然后提交、推送并创建或更新 **draft PR**。`run --submit` 可串联这些步骤。GitHub 远程必须解析为唯一 fetch URL 和唯一 push URL，两者均须指向 `project.repository`；SSH 与 HTTPS 可混用。多个 fetch/push URL 会被拒绝，不会执行 Git 的 push 扇出。为了绑定实际端点，作用于该远程的 `insteadOf` / `pushInsteadOf` URL 改写也会被明确拒绝；请直接配置 GitHub URL。Git 配置会在实际传输的工作树中校验，因此 `includeIf` 的分支或路径条件不能绕过检查。提交和清理使用不能解析为远端名称的绝对路径传输参数，在同次 Git 调用中绑定已校验 URL；校验后新增的改写或 URL 同名远端别名都无法重定向或扇出，原有凭据和 CA 设置仍保留。提交直接保留配置远程的分支跟踪设置，兼容单分支克隆，并按现有 fetch refspec 更新跟踪引用，不假定其位于 `refs/remotes/<remote>/<branch>`；清理使用相同映射。默认停在 draft；可按下节开启自动审查与合并。PR 使用 `Refs #N`，不自动关闭整个 Issue，也不发布、部署或创建后台定时任务。
 
@@ -101,7 +128,20 @@ devrelay submit 12
 
 传输保留 Git 对 `GIT_CONFIG_NOSYSTEM` 的布尔值规则：`0`/`false` 保留原有系统设置，`1`/`true` 禁用它们。其他 Git 布尔值写法同样支持；无效值会停止传输。
 
-## 持续自动领取 Issues
+## 可选模式：Codex 程序编排
+
+需要 DevRelay 启动实现 Agent 时，明确执行以下命令：
+
+```bash
+devrelay doctor --with-codex
+devrelay run 12             # setup → Codex 实现 → 项目验收
+devrelay run 12 --submit    # 再按项目策略交付
+devrelay resume 12          # 恢复 DevRelay 保存的实现会话
+```
+
+`run` 每次只处理一个任务。无 ID 时优先恢复中断任务；已有失败或阻塞任务时返回 `needs_attention`，由维护者检查并明确恢复后再派发新任务。Codex 在 `.devrelay/worktrees/ID` 实现，DevRelay 执行验收。检查失败时，在配置的 `max_attempts` 范围内把失败信息交给相同 Codex 会话修复。Codex 报告外部阻塞时保存阻塞状态。不要用无 ID 的 `run` 或 `watch` 接管仍由外层 Agent 编辑的任务；切换前应先停止原执行者并检查现场。
+
+### 持续自动领取 Issues
 
 在已接入的 GitHub 项目中运行：
 
@@ -136,7 +176,7 @@ cleanup_branches = true
 两个自动开关默认均为 `false`。仅开启 `auto_review` 会审查并保留 draft；开启 `auto_merge` 会自动包含审查，通过门禁后标记 ready 并请求 squash 合并。`required_checks` 防止预期 CI 尚未出现就被忽略；所有已报告检查也必须成功。跳过、中立、失败或运行中的检查不算成功。没有 CI 时默认等待；确实没有 GitHub CI 的项目可明确设置 `allow_no_ci = true`，本地验收与审查仍须通过，指定的必需检查也不会豁免。
 
 ```bash
-devrelay run 12 --submit   # 实现 → 验收 → draft PR → 审查 → 合并 → 合并后验收
+devrelay submit 12         # 已验收实现 → draft PR → 启用的审查/合并策略
 devrelay review 12         # 显式启动一次新的只读 AI 审查
 devrelay merge 12          # 开启 auto_merge 后，重读门禁并推进/恢复合并
 devrelay resume 12 --submit
@@ -167,11 +207,14 @@ devrelay resume 12 --submit
 ```bash
 devrelay init --provider local
 devrelay task add fix-1 --title "修复一个明确问题" --file /path/to/task.md
-devrelay run fix-1
+devrelay start fix-1
+devrelay prepare fix-1
+# 外层 Agent 在返回的 worktree 中实现。
+devrelay check fix-1
 devrelay submit fix-1 --local
 ```
 
-`task add` 明确授权该本地任务；缺少依赖行时添加 `Depends on: none`。本地任务也可声明 `Depends on: #fix-1`。`submit --local` 只创建本地验证提交；维护者将提交集成到配置的目标分支后，执行 `devrelay task complete fix-1`，依赖任务才可运行。验收模板见 [任务示例](examples/task.md)。
+`task add` 明确授权该本地任务；缺少依赖行时添加 `Depends on: none`。本地任务也可声明 `Depends on: #fix-1`。`submit --local` 只创建本地验证提交；维护者将提交集成到配置的目标分支后，执行 `devrelay task complete fix-1`，依赖任务才可运行。完成要求当前有效验收、任务要求与配置一致，实际工作树和 HEAD 与交付提交及验收树一致，且该提交位于目标分支祖先链。新增内容即使重新验收，也须再次提交并集成后才能完成；失败不会解锁依赖。验收模板见 [任务示例](examples/task.md)。
 
 ## 验证与恢复
 
@@ -199,7 +242,7 @@ devrelay submit fix-1 --local
 
 本仓库的 `.devrelay/config.toml` 已配置自维护：经授权的 GitHub Issues 在独立工作树中实现，运行完整测试并创建 draft PR，再进行独立只读 AI 审查。自动合并关闭；合并后的验收与清理可通过 `devrelay merge ID` 执行。
 
-自维护执行器固定使用 `gpt-6.1-sol`，已用 Codex CLI `0.162.1` 验证。若旧 CLI 拒绝此模型，先升级 CLI；修改模型配置后，已有任务需要重新验收与审查。
+自维护的可选编排执行器和 AI 审查固定使用 `gpt-6.1-sol`，已用 Codex CLI `0.162.1` 验证。若旧 CLI 拒绝此模型，先升级 CLI；修改模型配置后，已有任务需要重新验收与审查。外层 Agent 的模型由其宿主控制。
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
