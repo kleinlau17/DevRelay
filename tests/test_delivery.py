@@ -5,8 +5,8 @@ import unittest
 from unittest.mock import patch
 
 from devrelay.errors import RelayError
-from devrelay.git import validate_remote as real_validate_remote
-from devrelay.runner import run_task, submit
+from devrelay.git import git as real_git, validate_remote as real_validate_remote
+from devrelay.runner import prepare_task, run_task, submit, verify
 
 from helpers import RepositoryTest
 
@@ -85,6 +85,103 @@ class GitHubDeliveryFixture(RepositoryTest):
 
 
 class GitHubDeliveryTests(GitHubDeliveryFixture):
+    def test_requirements_changed_during_commit_block_push_and_can_be_revalidated(self):
+        task = self.implement()
+        worktree = Path(task["worktree"])
+        def change_requirement(root, *argv, **kwargs):
+            result = real_git(root, *argv, **kwargs)
+            if argv[0] == "commit":
+                self.issue["body"] += "\nAcceptance: add requirement.txt\n"
+            return result
+        with self.state.lock(), patch("devrelay.runner.git", side_effect=change_requirement):
+            with self.assertRaisesRegex(RelayError, "missing or stale"):
+                submit(self.config, self.state, "12")
+        self.assertEqual(self.create_count, 0)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "for-each-ref", "refs/heads/devrelay/"), "")
+        self.assertEqual(self.git("show", "HEAD:value.txt", cwd=worktree), "fixed")
+        (worktree / "requirement.txt").write_text("New acceptance implemented\n")
+        with self.state.lock():
+            verify(self.config, self.state, "12")
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["status"], "pr_open")
+        self.assertEqual(recovered["verification"]["task_body"], self.issue["body"])
+        self.assertEqual(self.create_count, 1)
+
+    def test_requirements_changed_during_push_block_pr_creation_and_preserve_remote(self):
+        task = self.implement()
+        def change_requirement(root, *argv, **kwargs):
+            result = real_git(root, *argv, **kwargs)
+            if argv[0] == "push":
+                self.issue["body"] += "\nAcceptance changed during push\n"
+            return result
+        with self.state.lock(), patch("devrelay.runner.git", side_effect=change_requirement):
+            with self.assertRaisesRegex(RelayError, "missing or stale"):
+                submit(self.config, self.state, "12")
+        saved = self.state.get("12")
+        self.assertEqual(self.create_count, 0)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", saved["branch"]), saved["head_sha"])
+        with self.state.lock():
+            verify(self.config, self.state, "12")
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["head_sha"], saved["head_sha"])
+        self.assertEqual(recovered["status"], "pr_open")
+        self.assertTrue(Path(task["worktree"]).exists())
+
+    def test_title_changed_during_pr_lookup_blocks_publication(self):
+        self.implement()
+        def change_title(config, *argv):
+            result = self.pull_read(config, *argv)
+            if argv[1] == "list":
+                self.issue["title"] = "Updated task scope"
+            return result
+        with self.state.lock(), patch("devrelay.runner.gh_json", side_effect=change_title):
+            with self.assertRaisesRegex(RelayError, "missing or stale"):
+                submit(self.config, self.state, "12")
+        self.assertEqual(self.create_count, 0)
+        with self.state.lock():
+            verify(self.config, self.state, "12")
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["verification"]["task_title"], self.issue["title"])
+        self.assertEqual(recovered["status"], "pr_open")
+
+    def test_drift_during_pr_creation_retains_pr_identity_for_recovery(self):
+        self.implement()
+        def change_requirement(config, *argv, input=None):
+            result = self.pull_write(config, *argv, input=input)
+            if argv[1] == "create":
+                self.issue["body"] += "\nAcceptance changed during creation\n"
+            return result
+        with self.state.lock(), patch("devrelay.runner.gh", side_effect=change_requirement):
+            with self.assertRaisesRegex(RelayError, "missing or stale"):
+                submit(self.config, self.state, "12")
+        saved = self.state.get("12")
+        self.assertTrue(saved["pr_url"])
+        with self.state.lock():
+            with self.assertRaisesRegex(RelayError, "missing or stale"):
+                submit(self.config, self.state, "12")
+            verify(self.config, self.state, "12")
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(self.create_count, 1)
+        self.assertEqual(self.edit_count, 1)
+        self.assertEqual(recovered["pr_url"], saved["pr_url"])
+
+    def test_preparation_after_api_timeout_reuses_the_existing_pr(self):
+        self.implement()
+        self.timeout_after_create = True
+        with self.state.lock():
+            with self.assertRaisesRegex(RelayError, "timed out"):
+                submit(self.config, self.state, "12")
+            saved = self.state.get("12")
+            self.assertEqual(saved["status"], "committed")
+            self.assertFalse(saved.get("pr_url"))
+            prepared = prepare_task(self.config, self.state, "12")
+            self.assertIsNone(prepared["verification"])
+            verify(self.config, self.state, "12")
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(self.create_count, 1)
+        self.assertEqual(self.edit_count, 1)
+        self.assertEqual(recovered["head_sha"], saved["head_sha"])
+
     def test_verified_branch_is_pushed_and_draft_pr_is_read_back(self):
         self.implement()
         with self.state.lock():
