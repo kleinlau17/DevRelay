@@ -209,6 +209,37 @@ def _implementation_sessions(state, task):
     return sessions
 
 
+def _historical_review_session(state, task, path):
+    """Read only the known integration receipt layout for completed legacy tasks."""
+    integration = state.directory / "integration"
+    path = path.absolute()
+    directory = path.parent
+    if (path.name != "review.json" or directory.parent != integration
+            or not re.fullmatch(r"[0-9a-f]{32}", directory.name)):
+        return None
+    if (integration.is_symlink() or directory.is_symlink() or path.is_symlink()
+            or path.resolve() != path):
+        raise RelayError("Historical integration review evidence is outside its owned directory; refusing recovery")
+    review = task.get("review")
+    if (task.get("status") != "completed" or not isinstance(review, dict)
+            or not isinstance(task.get("head_sha"), str)
+            or not re.fullmatch(r"[0-9a-f]{40,64}", task["head_sha"])
+            or not isinstance(task.get("pr_url"), str)
+            or not re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/pull/[1-9]\d*", task["pr_url"])
+            or review.get("head_sha") != task["head_sha"] or review.get("pr_url") != task["pr_url"]):
+        raise RelayError("Historical integration review requires a completed task with matching PR and HEAD")
+    try:
+        receipt = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise RelayError(f"Cannot read historical integration review receipt; inspect {path}") from error
+    if receipt != review:
+        raise RelayError("Historical integration review receipt differs from the saved review; refusing recovery")
+    session = receipt.get("session_id")
+    if not _valid_session(session):
+        raise RelayError("Historical integration review session ID is invalid; refusing recovery")
+    return session
+
+
 def _review_sessions(state, task):
     """Retain review ownership even after the current acceptance/review is invalidated."""
     sessions = set()
@@ -237,6 +268,10 @@ def _review_sessions(state, task):
         if task.get(key):
             path = Path(task[key])
             if key == "review_path":
+                historical_session = _historical_review_session(state, task, path)
+                if historical_session is not None:
+                    record(historical_session)
+                    continue
                 if path.name != "review.json":
                     raise RelayError("Saved Codex review receipt path is invalid; refusing recovery")
                 path = path.parent
@@ -354,8 +389,24 @@ value or acceptance criteria, not merely by file, layer or phase. Tracking plan
 parents are not executable. Do not expand the issue into a continuing roadmap.
 Do not weaken acceptance rules or bypass failed checks. Do not start detached jobs.
 DevRelay runs configured checks after you finish; your report is not verification evidence.
-Return outcome=ready when the implementation is ready for checks; outcome=blocked
-when missing data, permissions or environment prevent progress. Explain blockers.
+
+Execution roles and outcome selection:
+- You implement in a development sandbox. Run available tests required by repository
+  instructions and retain their actual results and diagnostics.
+- The DevRelay controller runs EVERY configured acceptance command in its own host
+  environment after outcome=ready. Sandbox diagnostics never waive those checks,
+  establish successful acceptance, or authorize submission.
+- If implementation is complete and only validation is prevented by development
+  sandbox restrictions (for example ps permission denial, temporary-directory access
+  or filename-creation restrictions), return outcome=ready with blockers=[] and
+  explain the restriction in summary. Do not return blocked solely because host
+  acceptance cannot run inside your sandbox. Let the controller execute the unchanged
+  checks; host failures will stop submission and supply repair feedback.
+- Fix real code regressions and test assertions; do not relabel unexplained failures
+  as sandbox limitations or weaken tests to get a passing result.
+- Return outcome=blocked when implementation itself cannot proceed, or required
+  project data, dependencies, services, hardware or external permissions are missing.
+  Explain the actual blocker. A failed host check is never excused by this policy.
 
 Task title: {task['title']}
 Task data (JSON encoded):
