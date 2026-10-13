@@ -27,15 +27,35 @@ class WatchArgumentTests(unittest.TestCase):
                     self.assertEqual(raised.exception.code, 2)
                     self.assertIn("must be a positive integer", err.getvalue())
 
-    def test_watch_help_lists_both_options_without_starting_worker(self):
-        with patch("devrelay.cli.repository_root") as repository_root, patch("devrelay.cli.watch") as watch:
+    def test_max_tasks_alias_uses_same_destination_and_default(self):
+        self.assertIsNone(parser().parse_args(["watch"]).max_tasks)
+        for option in ("--max-tasks", "--limit"):
+            with self.subTest(option=option):
+                args = parser().parse_args(["watch", option, "2"])
+                self.assertEqual(args.max_tasks, 2)
+
+    def test_max_tasks_alias_rejects_non_positive_integers(self):
+        for option in ("--max-tasks", "--limit"):
+            for value in ("0", "-1", "1.5", "invalid"):
+                with self.subTest(option=option, value=value):
+                    with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as raised:
+                        main(["watch", option, value])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn("must be a positive integer", err.getvalue())
+
+    def test_watch_help_lists_all_aliases_without_side_effects(self):
+        with patch("devrelay.cli.repository_root") as repository_root, patch("devrelay.cli.watch") as watch, \
+                patch("devrelay.cli.subprocess.run") as subprocess_run:
             with redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as raised:
                 main(["watch", "--help"])
             self.assertEqual(raised.exception.code, 0)
             self.assertIn("--poll-interval", out.getvalue())
             self.assertIn("--interval", out.getvalue())
+            self.assertIn("--max-tasks", out.getvalue())
+            self.assertIn("--limit", out.getvalue())
             repository_root.assert_not_called()
             watch.assert_not_called()
+            subprocess_run.assert_not_called()
 
 
 class CliTests(RepositoryTest):
