@@ -264,6 +264,34 @@ class WorkspaceTest(RepositoryTest):
         self.assertEqual(report["status"], "needs_attention")
         self.assertEqual(report["tasks"], ["urgent"])
 
+    def test_base_advance_stops_without_repeated_implementation(self):
+        self.add_task()
+        calls = []
+        def implement(config, state, task, directory, *args, **kwargs):
+            calls.append(task["id"])
+            for member in task["members"].values():
+                Path(member["worktree"], "value.txt").write_text("fixed\n")
+            (self.second / "latest.txt").write_text("new base")
+            self.git("add", "latest.txt", cwd=self.second)
+            self.git("commit", "-qm", "new base", cwd=self.second)
+            return {"outcome": "ready", "summary": "Implemented", "blockers": []}
+        with patch("devrelay.workspace.codex.implement", side_effect=implement):
+            code, report = self.invoke("run", "fix")
+        self.assertEqual(code, 1)
+        self.assertIn("base advanced", report["error"])
+        self.assertEqual(calls, ["fix"])
+
+    def test_explicit_resume_retains_previous_blocker_feedback(self):
+        self.add_task()
+        with patch.dict(os.environ, DEVRELAY_TEST_MODE="blocked"):
+            self.invoke("run", "fix")
+        trace = Path(self.temporary.name) / "resume-trace.jsonl"
+        with patch.dict(os.environ, DEVRELAY_TEST_MODE="pass", DEVRELAY_TEST_TRACE=str(trace)):
+            code, task = self.invoke("resume", "fix")
+        self.assertEqual(code, 0, task)
+        first = json.loads(trace.read_text().splitlines()[0])
+        self.assertIn("Provide dataset", first["prompt"])
+
     def test_remote_partial_delivery_retry_reuses_draft(self):
         task = self.fixed()
         # Member configuration remains local for checks; replace only immutable runtime objects for transport tests.

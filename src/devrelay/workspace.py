@@ -21,6 +21,10 @@ from .runner import base_commit
 from .state import State, now
 
 
+class WorkspaceInputChanged(RelayError):
+    """Scope or integration baseline needs explicit recovery, not another model repair."""
+
+
 @dataclass(frozen=True)
 class Workspace:
     path: Path
@@ -91,15 +95,15 @@ def load(path):
 
 def assert_current(workspace, task):
     if load(workspace.path).fingerprint != workspace.fingerprint or task["config_sha256"] != workspace.fingerprint:
-        raise RelayError("Workspace configuration changed; restore the registered configuration or create a new task")
+        raise WorkspaceInputChanged("Workspace configuration changed; restore the registered configuration or create a new task")
     if not task.get("approved"):
-        raise RelayError("Workspace task authorization was revoked")
+        raise WorkspaceInputChanged("Workspace task authorization was revoked")
     try:
         body = Path(task["requirements_path"]).read_text()
     except OSError as error:
         raise RelayError("Registered task requirements are unavailable") from error
     if body != task["body"]:
-        raise RelayError("Task requirements changed; restore them or register a new authorized task")
+        raise WorkspaceInputChanged("Task requirements changed; restore them or register a new authorized task")
 
 
 def get_task(state, identifier):
@@ -237,7 +241,7 @@ def snapshot(workspace, task):
         inspect_member(config, member)
         base = base_commit(config)
         if not is_ancestor(member["worktree"], base, "HEAD"):
-            raise RelayError(f"Repository {key} base advanced; integrate the latest base and rerun all checks")
+            raise WorkspaceInputChanged(f"Repository {key} base advanced; integrate the latest base and rerun all checks")
         result[key] = {"base_sha": base, "head_sha": git(member["worktree"], "rev-parse", "HEAD"),
                        "source_tree": source_tree(Path(member["worktree"]))}
     return result
@@ -288,16 +292,16 @@ def run(workspace, state, task, states, *, submit_after=False):
         raise RelayError("Task already delivered")
     if task.get("publication_started"):
         raise RelayError("Task has partial delivery; recover with check/submit, preserve existing PRs")
+    feedback = task.get("error") or ""
     start(workspace, state, task, states)
     if not task.get("prepared"):
         prepare(workspace, state, task)
     first = next(iter(workspace.members))
     task["worktree"] = task["members"][first]["worktree"]
     config = validate(Path(task["worktree"]), {"codex": workspace.codex_config, "checks": []})
-    context = json.dumps({"members": {key: {"worktree": m["worktree"], "base": m["base_sha"],
+    context = json.dumps({"members": {key: {"worktree": m["worktree"], "base": base_commit(workspace.members[key]),
                   "checks": workspace.members[key].data["checks"]} for key, m in task["members"].items()},
                   "joint_checks": workspace.checks}, ensure_ascii=False)
-    feedback = task.get("error") or ""
     for attempt in range(workspace.codex_config["max_attempts"]):
         assert_current(workspace, task)
         heads = {key: git(member["worktree"], "rev-parse", "HEAD") for key, member in task["members"].items()}
@@ -318,6 +322,8 @@ def run(workspace, state, task, states, *, submit_after=False):
             review(workspace, state, task)
             if task["review"]["verdict"] != "approve":
                 raise RelayError("Joint review requested changes: " + ("; ".join(task["review"]["findings"]) or task["review"]["summary"]))
+        except WorkspaceInputChanged:
+            raise
         except RelayError as error:
             feedback = str(error)
             task["error"] = feedback
@@ -335,7 +341,8 @@ def review(workspace, state, task):
     directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-review")
     proxy = {**task, "head_sha": before[first]["head_sha"], "verification": before[first]}
     config = validate(Path(task["worktree"]), {"codex": workspace.codex_config})
-    context = json.dumps({"members": task["members"], "accepted_sources": before,
+    context = json.dumps({"members": {key: {**member, "base_sha": before[key]["base_sha"]}
+                          for key, member in task["members"].items()}, "accepted_sources": before,
                           "checks": task["verification"]["checks"],
                           "instruction": "Review the complete task-relative working source in EVERY member: git diff BASE, git status --short and read newly added files. HEAD alone may contain no implementation yet. Check the shared contract and integration evidence."})
     task.update(status="reviewing", review=None, review_run=str(directory))
