@@ -45,7 +45,7 @@ second task database is introduced; Issues and task files carry plans and requir
 | `codex` | Optional implementation/review adapter, explicit sessions and structured outcomes / 可选实现与审查适配器、精确会话与结构化结果 |
 | `process` | Timeout, process groups and unique receipts / 超时、进程组与独立回执 |
 | `runner` | Agent-callable claim/setup/check/submit plus optional implementation loop / Agent 工程操作与可选实现循环 |
-| `worker` | Optional continuous Codex dispatch through draft PRs / 可选持续 Codex 调度，交付停在 draft PR |
+| `worker` | Optional serial Codex dispatch with configured delivery and recovery / 可选串行 Codex 调度、配置的交付策略与恢复 |
 | `delivery` | Fresh AI review, GitHub merge gates, post-merge acceptance / 审查、合并门禁及合并后验收 |
 | `cleanup` | Opt-in exact-ref cleanup after acceptance, durable recovery / 验收后清理与恢复 |
 
@@ -67,6 +67,9 @@ queued → claimed → preparing → prepared → implementing → verifying →
 pr_open → reviewing → reviewed → merge_waiting → merging → merged → cleaning → completed
               ↓                                            ↓          ↓
         review_blocked                               post_merge_failed cleanup_failed
+
+merge_waiting / merging → merge_blocked (revocation, stale evidence, uncertain request)
+merge_blocked → explicit recovery / merge --retry-request (fresh gates, no remote queue)
 ```
 
 State is saved before long-running phases. Main-checkout configuration controls commands even when a task changes its own copy. Verification is independent of any agent's completion report. Optional Codex resume preserves code and targets only the saved session. External sessions remain owned by their host. GitHub remains authoritative for approval and integrated dependencies.
@@ -79,12 +82,16 @@ State is saved before long-running phases. Main-checkout configuration controls 
 - In agent-driven mode the lock covers each tool call, not external editing between calls. The host must serialize editors and optional orchestration for a repository. External agent sessions are not stored or resumed by DevRelay.
 - GitHub onboarding creates only missing repository labels and local template files under the worker lock. It never assigns issue labels or authorization. Existing files/definitions remain intact; uncertain creates are read back and `init --sync-github` repairs partial setup. Templates become public only after normal Git delivery to the default branch.
 - One issue delivers one reviewable result; split children only for independent value or acceptance criteria. Templates and implementation/review prompts state this scope policy. Queue eligibility and explicit-ID authorization reject tracking parents marked `scope:plan`, `Task kind: plan`, or the original plan-template child-delivery heading, even with execution approval. This is marker-based enforcement, not semantic classification of arbitrary issue prose. / 一个 Issue 对应一个可审查结果，仅有独立价值或验收标准才拆子项；模板、执行和审查提示词约束粒度。队列与显式 ID 授权检查拒绝已标记的总体计划父任务，即使误加执行授权；检查依据明确标记，不自动理解任意正文。
-- Each task has bounded attempts and command timeouts; explicit resume may grant a new bounded attempt window. `watch` is a foreground loop holding the repository worker lock through execution and idle waits; it stops on errors or attention states, and reuses the existing evidence and authorization gates. Submitted/reviewed drafts do not block new dispatch. It requires automatic merge to be disabled, and configuration changes stop it before further dispatch.
+- Each task has bounded attempts and command timeouts; explicit resume may grant a new bounded attempt window. `watch` is a foreground loop holding the repository worker lock through execution and idle waits; it stops on errors or attention states, and reuses the existing evidence and authorization gates. Manual mode advances after draft submission/review; explicit project `auto_merge=true` holds the current task through CI/protection/queue waits, confirmed merge, post-merge acceptance and cleanup. Only completion permits the next claim. Permanent CI/review failures stop watch; pending conditions poll without repeated development, review or merge requests. Configuration changes stop it before further dispatch.
 - Default Codex sandbox is workspace-write; approval policy is never, so permission failures become actionable failures rather than unattended prompts.
 - Implementation prompts distinguish development-sandbox validation limits from actual implementation blockers. A ready report with sandbox diagnostics still runs every original host check; blocked reports and failed host checks remain barriers to delivery.
 - Session ownership accepts the fixed historical integration-review receipt layout only for completed tasks with exact cached receipt, PR and HEAD matches, without symlinks. This reserves the historical review session and preserves its evidence; arbitrary out-of-scope paths remain rejected.
 - Delivery defaults to draft PR. Project configuration may opt into fresh read-only AI review and exact-head squash merging; GitHub human approvals and protection still apply.
 - Review binds PR URL, head, base, tree, configuration and task requirements; CI is read from the exact head commit. Truncated API data fails closed. Default no-CI policy blocks, with an explicit project opt-out.
+- Queue behavior follows the [GitHub CLI merge contract](https://cli.github.com/manual/gh_pr_merge); cancellation uses [GitHub GraphQL pull request mutations](https://docs.github.com/en/graphql/reference/pulls).
+- A completed review process receipt plus identity-bound review checkpoint can be read after a crash without a second review session; incomplete evidence requires explicit review. A durable `merge_request` precedes the exact-head mutation. Queue/remote-auto-merge readback prevents duplicate requests; uncertain/disappeared requests require explicit `merge --retry-request` after fresh gates. Older queued tasks without a request checkpoint fail closed.
+- On evidence/configuration/authorization failure, recorded pending requests are cancelled through GitHub GraphQL and read back; cancellation failures retain evidence and block dispatch. Interrupts preserve queued requests. Remote queue execution is independent of the controller: cancellation and authorization checks are not atomic with merge, and an already merged outcome must be retained. 合并前持久化请求，排队只回读；不确定结果需显式重试。撤销授权或证据变化时尝试撤销远端排队请求，失败保留错误；中断保留队列，远端合并与撤销仍存在竞态。
+- Review recovery validates canonical task-owned run paths and rejects symlinks at directory and file boundaries. The process receipt must match the successful configured read-only command, worktree and log; result/approval paths stay in that run. 恢复只读取实际归属本任务的证据；目录或文件符号链接、进程回执身份不匹配时阻断，保留现场并要求显式审查。
 - GitHub HEAD matching is atomic, base matching is not. Refresh before merge and verify the merged tree afterwards. Post-merge setup/checks run in a separate detached worktree; failure preserves the merge checkpoint and blocks new automatic dispatch.
 - Cleanup defaults off for task resources. Successful acceptance scratch trees are removed; failed trees/evidence remain. Optional task worktree and exact-head branch cleanup checkpoints each step; recovery reads actual refs without assuming the original checkout still exists.
 - Remote deletion uses an explicit expected SHA lease; local/remote-tracking ref deletion uses compare-and-swap. Worktree removal is never forced. Git operations outside DevRelay still require coordination with the repository worker.
@@ -93,4 +100,4 @@ State is saved before long-running phases. Main-checkout configuration controls 
 - Project commands may require services, credentials or hardware; DevRelay does not provision them.
 - Process markers detect remaining foreground groups after controller crashes. Commands must not daemonize or escape the group. There is a brief spawn-to-marker crash window; this is cooperative recovery, not an OS isolation guarantee.
 
-默认单仓库、单 worker、有限重试并停在 draft PR；项目可明确开启审查与合并。`watch` 持续串行调度，空队列等待期间也保留 worker 锁，要求关闭自动合并；已提交/审查的 draft 不阻止领取下一任务，错误或人工处理状态会停止调度。审查绑定准确提交与 base；CI、GitHub 审查意见和保护条件另行核验。合并后在独立工作树重跑 setup/checks；失败保留远端已合并的事实和本地证据。后台服务安装、远端执行、多仓库事务与发布留给后续适配。项目命令负责业务环境。进程组恢复要求命令不脱离前台进程组；进程启动与标记之间仍有短暂中断窗口，不能宣称操作系统级隔离。
+默认单仓库、单 worker、有限重试并停在 draft PR；项目可明确开启审查与合并。`watch` 持续串行调度，空队列等待期间也保留 worker 锁，人工模式在 draft 交付后继续；明确开启 `auto_merge=true` 后等待 CI、保护条件及合并队列，合并后验收和清理完成才继续。失败或人工处理状态会停止调度。审查绑定准确提交与 base；CI、GitHub 审查意见和保护条件另行核验。合并后在独立工作树重跑 setup/checks；失败保留远端已合并的事实和本地证据。后台服务安装、远端执行、多仓库事务与发布留给后续适配。项目命令负责业务环境。进程组恢复要求命令不脱离前台进程组；进程启动与标记之间仍有短暂中断窗口，不能宣称操作系统级隔离。

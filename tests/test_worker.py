@@ -18,7 +18,7 @@ from devrelay.worker import watch
 from test_delivery import GitHubDeliveryFixture
 
 
-class WorkerTests(GitHubDeliveryFixture):
+class WorkerFixture(GitHubDeliveryFixture):
     def setUp(self):
         super().setUp()
         self.issues = [self.issue, {**self.issue, "number": 13, "title": "Fix second value",
@@ -65,6 +65,8 @@ class WorkerTests(GitHubDeliveryFixture):
         path.write_text(path.read_text().replace("[[checks]]", "[delivery]\nauto_review = true\n[[checks]]", 1))
         self.config = load(self.root)
 
+
+class WorkerTests(WorkerFixture):
     def test_two_real_workflows_deliver_in_priority_order_without_waiting_for_merge(self):
         result = self.watching(max_tasks=2)
         self.assertEqual(result, {"status": "stopped", "reason": "max_tasks", "delivered": 2})
@@ -254,11 +256,7 @@ class WorkerTests(GitHubDeliveryFixture):
                 self.watching()
         self.assertEqual(self.state.tasks(), [])
 
-    def test_refuse_auto_merge_local_provider_and_invalid_limits(self):
-        self.config.data["delivery"]["auto_merge"] = True
-        with self.assertRaisesRegex(RelayError, "auto_merge=false"):
-            self.watching()
-        self.config.data["delivery"]["auto_merge"] = False
+    def test_refuse_local_provider_and_invalid_limits(self):
         for options in ({"poll_interval": 0}, {"max_tasks": 0}, {"max_tasks": -1}):
             with self.subTest(options=options), self.assertRaises(RelayError):
                 self.watching(**options)

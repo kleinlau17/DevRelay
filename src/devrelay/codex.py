@@ -465,8 +465,9 @@ REVIEW_SCHEMA = {
 
 def review(config, state, task, directory):
     """A fresh read-only review session; never reuse implementation context."""
+    directory = review_directory(state, task, directory)
     directory.mkdir(parents=True, exist_ok=False)
-    (directory / "result-schema.json").write_text(json.dumps(REVIEW_SCHEMA, indent=2))
+    review_file(state, task, directory, "result-schema.json").write_text(json.dumps(REVIEW_SCHEMA, indent=2))
     prompt = f"""Review this exact committed change in a fresh session.
 Read applicable AGENTS.md. Inspect git diff {task['verification']['base_sha']} {task['head_sha']}
 and relevant surrounding code, tests and task requirements. Identify correctness bugs,
@@ -486,11 +487,38 @@ Task body (JSON): {json.dumps(task['body'], ensure_ascii=False)}
 Verified source tree: {task['verification']['source_tree']}
 Acceptance commands (JSON): {json.dumps(config.data['checks'], ensure_ascii=False)}
 """
-    (directory / "prompt.txt").write_text(prompt)
+    review_file(state, task, directory, "prompt.txt").write_text(prompt)
+    review_file(state, task, directory, "result.json")
     execute(state, build_command(config, directory, sandbox="read-only"), task["worktree"],
             directory / "events.jsonl", config.data["codex"]["timeout_seconds"], input=prompt)
+    return read_review(state, task, directory)
+
+
+def review_directory(state, task, directory):
+    """Resolve only this task's direct, non-symlink review run."""
+    directory = Path(directory)
+    root = _run_root(state, task, "review")
+    if (not directory.is_absolute() or directory.is_symlink()
+            or directory.parent != root or directory.resolve() != directory
+            or not directory.name.endswith("-review")):
+        raise RelayError("Saved Codex review evidence is outside this task's run directory; refusing recovery")
+    return directory
+
+
+def review_file(state, task, directory, filename):
+    """Check each evidence/output path before reading or writing it."""
+    directory = review_directory(state, task, directory)
+    path = directory / filename
+    if path.is_symlink() or path.resolve().parent != directory:
+        raise RelayError("Saved Codex review evidence is outside its run directory; refusing recovery")
+    return path
+
+
+def read_review(state, task, directory):
+    """Read a completed independent review without starting another session."""
     sessions, completed, failed = set(), False, False
-    for line in (directory / "events.jsonl").read_text(errors="replace").split("\n"):
+    directory = review_directory(state, task, directory)
+    for line in review_file(state, task, directory, "events.jsonl").read_text(errors="replace").split("\n"):
         try:
             event = json.loads(line)
         except ValueError:
@@ -507,7 +535,7 @@ Acceptance commands (JSON): {json.dumps(config.data['checks'], ensure_ascii=Fals
     if (len(sessions) != 1 or task.get("session_id") in sessions or not completed or failed):
         raise RelayError("Codex review did not complete in a fresh independent session")
     try:
-        result = json.loads((directory / "result.json").read_text())
+        result = json.loads(review_file(state, task, directory, "result.json").read_text())
     except (OSError, ValueError) as error:
         raise RelayError("Codex review produced no valid structured result") from error
     if (not isinstance(result, dict) or set(result) != {"verdict", "summary", "findings"}

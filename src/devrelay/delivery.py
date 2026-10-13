@@ -17,6 +17,7 @@ from .state import now
 
 PULL_QUERY = """query($owner:String!,$name:String!,$number:Int!){
  repository(owner:$owner,name:$name){pullRequest(number:$number){
+  id mergeQueueEntry{id} autoMergeRequest{enabledAt}
   url state headRefName headRefOid baseRefName baseRefOid isCrossRepository
   isDraft mergeable mergeStateStatus reviewDecision mergeCommit{oid}
   reviewThreads(first:100){nodes{isResolved} pageInfo{hasNextPage}}
@@ -58,6 +59,12 @@ def pull_snapshot(config, task):
             raise ValueError("head checks")
         rollup = commits[0]["commit"]["statusCheckRollup"]
         pull["checks"] = _connection(rollup["contexts"]) if rollup else []
+        if not isinstance(pull["id"], str) or not pull["id"]:
+            raise ValueError("PR node ID")
+        for key, field in (("mergeQueueEntry", "id"), ("autoMergeRequest", "enabledAt")):
+            value = pull[key]
+            if value is not None and (not isinstance(value, dict) or not isinstance(value[field], str) or not value[field]):
+                raise ValueError(key)
         pull["reviewDecision"]
         pull["mergeCommit"]
     except (ValueError, KeyError, TypeError, AttributeError) as error:
@@ -106,28 +113,45 @@ def open_evidence(config, state, task, pull):
         raise RelayError("Target base changed; integrate the base, check, submit and review again")
 
 
-def review(config, state, identifier):
+def review(config, state, identifier, *, recover=False):
     if config.provider != "github":
         raise RelayError("PR review requires project.provider=github")
     task = claimed_task(config, state, identifier)
     try:
         pull = pull_snapshot(config, task)
         open_evidence(config, state, task, pull)
-        task.update(status="reviewing", review=None, error=None)
-        directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-review")
-        task["review_run"] = str(directory)
-        state.save(task)
-        result = codex.review(config, state, task, directory)
+        if recover:
+            if task.get("review_identity") != identity(task, config):
+                raise RelayError("Saved review identity is missing or stale; explicitly review again")
+            directory = codex.review_directory(state, task, Path(task.get("review_run", "")))
+            try:
+                receipt_path = codex.review_file(state, task, directory, "events.jsonl.receipt.json")
+                receipt = json.loads(receipt_path.read_text())
+                if (not isinstance(receipt, dict) or type(receipt.get("returncode")) is not int
+                        or receipt["returncode"] != 0 or receipt.get("timed_out") is not False
+                        or receipt.get("cwd") != task["worktree"]
+                        or receipt.get("log") != str(directory / "events.jsonl")
+                        or receipt.get("argv") != codex.build_command(config, directory, sandbox="read-only")):
+                    raise ValueError("Review process receipt does not match this successful review run")
+                result = codex.read_review(state, task, directory)
+            except (OSError, ValueError) as error:
+                raise RelayError("Interrupted review has no complete evidence; explicitly review again") from error
+        else:
+            task.update(status="reviewing", review=None, error=None, review_identity=identity(task, config))
+            directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-review")
+            task["review_run"] = str(directory)
+            state.save(task)
+            result = codex.review(config, state, task, directory)
         open_evidence(config, state, task, pull_snapshot(config, task))
         record = {**result, **identity(task, config), "finished_at": now()}
-        receipt = directory / "review.json"
+        receipt = codex.review_file(state, task, directory, "review.json")
         receipt.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
         task.update(review=record, review_path=str(receipt),
                     status="reviewed" if result["verdict"] == "approve" else "review_blocked")
         if result["verdict"] != "approve":
             task["error"] = "; ".join(result["findings"]) or result["summary"]
         return state.save(task)
-    except (RelayError, KeyboardInterrupt) as error:
+    except (RelayError, OSError, KeyboardInterrupt) as error:
         task.update(status="review_blocked", review=None, error=str(error) or "Review interrupted")
         state.save(task)
         raise
@@ -168,6 +192,74 @@ def gate_reasons(config, pull):
     if not pull["checks"] and not config.data["delivery"]["allow_no_ci"]:
         reasons.append("No CI evidence; configure CI or explicitly set delivery.allow_no_ci=true")
     return list(dict.fromkeys(reasons))
+
+
+def blocking_gates(pull):
+    """Permanent failures stop watch; pending CI/approvals/protection may be polled."""
+    blockers = []
+    if pull["mergeable"] == "CONFLICTING" or pull["mergeStateStatus"] == "DIRTY":
+        blockers.append("Merge conflict")
+    if pull["reviewDecision"] == "CHANGES_REQUESTED":
+        blockers.append("Changes requested")
+    if any(item.get("isResolved") is not True for item in pull["reviewThreads"]["nodes"]):
+        blockers.append("Unresolved review thread")
+    if any(item.get("state") not in ("APPROVED", "COMMENTED", "DISMISSED", "PENDING")
+           for item in pull["latestReviews"]["nodes"]):
+        blockers.append("Outstanding or unknown GitHub review state")
+    for item in pull["checks"]:
+        kind = item.get("__typename")
+        if (not isinstance(item.get("name" if kind == "CheckRun" else "context"), str)
+                or not item.get("name" if kind == "CheckRun" else "context")
+                or kind == "CheckRun" and item.get("status") not in ("COMPLETED", "QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED")
+                or kind == "CheckRun" and item.get("status") == "COMPLETED" and item.get("conclusion") != "SUCCESS"
+                or kind == "StatusContext" and item.get("state") not in ("SUCCESS", "PENDING")
+                or kind not in ("CheckRun", "StatusContext")):
+            blockers.append("Failed or unknown CI check")
+    return blockers
+
+
+def abort_pending(config, state, task, reason):
+    """Best-effort revocation of our saved request, with durable remote readback."""
+    request = task.get("merge_request")
+    if not request or request.get("state") == "cancelled":
+        return task
+    cancellation = {"reason": reason, "at": now(), "status": "started"}
+    task["merge_cancellation"] = cancellation
+    state.save(task)
+    try:
+        if request.get("pr_url") != task.get("pr_url"):
+            raise RelayError("Saved request PR identity differs; cancellation requires manual inspection")
+        validate_remote(config)
+        pull = pull_snapshot(config, task)
+        if pull["state"] == "MERGED":
+            task["merge_sha"] = (pull.get("mergeCommit") or {}).get("oid")
+            cancellation["status"] = "already_merged"
+        else:
+            # Use GraphQL: gh --disable-auto refuses a PR already in the merge queue.
+            for field, mutation, argument, output in (
+                    ("autoMergeRequest", "disablePullRequestAutoMerge", "pullRequestId", "pullRequest{id}"),
+                    ("mergeQueueEntry", "dequeuePullRequest", "id", "mergeQueueEntry{id}")):
+                if pull.get(field):
+                    query = f"mutation($id:ID!){{{mutation}(input:{{{argument}:$id}}){{{output}}}}}"
+                    raw = command(["gh", "api", "--hostname", "github.com", "graphql", "-f", "query=" + query,
+                                   "-f", "id=" + pull["id"]], config.root)
+                    response = json.loads(raw)
+                    if response.get("errors") or not response.get("data", {}).get(mutation):
+                        raise RelayError("GitHub did not confirm pending merge cancellation")
+            pull = pull_snapshot(config, task)
+            if pull["state"] == "MERGED":
+                task["merge_sha"] = (pull.get("mergeCommit") or {}).get("oid")
+                cancellation["status"] = "already_merged"
+            elif pull.get("mergeQueueEntry") or pull.get("autoMergeRequest"):
+                raise RelayError("Remote merge remains pending; remove it on GitHub before recovery")
+            else:
+                cancellation["status"] = "cancelled"
+                request["state"] = "cancelled"
+        task.update(status="merge_blocked", error=reason)
+    except (RelayError, OSError, ValueError, TypeError, AttributeError) as error:
+        cancellation.update(status="failed", error=str(error))
+        task.update(status="merge_blocked", error=f"{reason}; pending merge cancellation failed: {error}")
+    return state.save(task)
 
 
 def post_merge(config, state, task, pull):
@@ -230,22 +322,26 @@ def post_merge(config, state, task, pull):
     return cleanup(config, state, task)
 
 
-def merge(config, state, identifier):
+def merge(config, state, identifier, *, retry_request=False):
     try:
-        return _merge(config, state, identifier)
+        return _merge(config, state, identifier, retry_request=retry_request)
     except (RelayError, KeyboardInterrupt) as error:
         task = state.get(str(identifier))
-        if task and (config.data["delivery"]["auto_merge"] or task.get("merge_sha")):
-            if task["status"] == "completed":
+        if task and (config.data["delivery"]["auto_merge"] or task.get("merge_sha") or task.get("merge_request")):
+            if isinstance(error, KeyboardInterrupt) and task.get("merge_request") and task["status"] in ("merging", "merge_waiting"):
+                task["status"] = "merging"
+            elif task["status"] == "completed":
                 task["status"] = "post_merge_failed"
-            elif task["status"] not in ("merged", "post_merge_failed", "merge_waiting", "review_blocked", "cleanup_failed"):
+            elif task["status"] not in ("merged", "post_merge_failed", "review_blocked", "cleanup_failed"):
                 task["status"] = "merge_blocked"
             task["error"] = str(error) or "Merge interrupted; read back GitHub before retrying"
             state.save(task)
+            if isinstance(error, RelayError) and task.get("merge_request") and not task.get("merge_sha"):
+                abort_pending(config, state, task, task["error"])
         raise
 
 
-def _merge(config, state, identifier):
+def _merge(config, state, identifier, *, retry_request=False):
     if config.provider != "github":
         raise RelayError("Automatic PR merge requires project.provider=github")
     task = state.get(task_id(identifier))
@@ -269,8 +365,32 @@ def _merge(config, state, identifier):
     if not config.data["delivery"]["auto_merge"]:
         raise RelayError("Merge is disabled; opt in with [delivery] auto_merge=true in project configuration")
     open_evidence(config, state, task, pull)
+    request = task.get("merge_request")
+    pending = bool(pull.get("mergeQueueEntry") or pull.get("autoMergeRequest"))
+    if request:
+        if not current_review(task, config) or task["review"]["verdict"] != "approve":
+            raise RelayError("Pending merge has no current approved independent review")
+        if pending and not all(request.get(key) == value for key, value in identity(task, config).items()):
+            raise RelayError("Saved merge request evidence differs; inspect it before retrying")
+        if pending:
+            blockers = blocking_gates(pull)
+            if blockers:
+                raise RelayError("; ".join(blockers))
+            task.update(status="merge_waiting", error="Merge request is pending on GitHub")
+            task["merge_gates"] = {"head_sha": task["head_sha"], "base_sha": pull["baseRefOid"],
+                                   "checked_at": now(), "reasons": gate_reasons(config, pull),
+                                   "blockers": [], "checks": pull["checks"]}
+            return state.save(task)
+        if not retry_request:
+            raise RelayError("Saved merge request is no longer queued or its outcome is uncertain; "
+                             "inspect GitHub, then use devrelay merge ID --retry-request to retry explicitly")
+        task.setdefault("merge_request_history", []).append(request)
+        task.pop("merge_request")
+        state.save(task)
+    elif pending:
+        raise RelayError("PR has a remote pending merge without a saved request; inspect GitHub before continuing")
     if not current_review(task, config):
-        task = review(config, state, identifier)
+        task = review(config, state, identifier, recover=task["status"] == "reviewing")
     if task["review"]["verdict"] != "approve":
         return task
     pull = pull_snapshot(config, task)
@@ -281,7 +401,7 @@ def _merge(config, state, identifier):
     open_evidence(config, state, task, pull)
     reasons = gate_reasons(config, pull)
     task["merge_gates"] = {"head_sha": task["head_sha"], "base_sha": pull["baseRefOid"],
-                           "checked_at": now(), "reasons": reasons, "checks": pull["checks"]}
+                           "checked_at": now(), "reasons": reasons, "blockers": blocking_gates(pull), "checks": pull["checks"]}
     if reasons:
         task.update(status="merge_waiting", error="; ".join(reasons))
         return state.save(task)
@@ -295,22 +415,29 @@ def _merge(config, state, identifier):
     reasons = gate_reasons(config, pull)
     if reasons:
         task.update(status="merge_waiting", error="; ".join(reasons))
-        task["merge_gates"].update(reasons=reasons, checked_at=now(), checks=pull["checks"])
+        task["merge_gates"].update(reasons=reasons, blockers=blocking_gates(pull), checked_at=now(), checks=pull["checks"])
         return state.save(task)
+    if pull.get("mergeQueueEntry") or pull.get("autoMergeRequest"):
+        raise RelayError("PR acquired a remote pending merge; inspect GitHub before continuing")
+    task["merge_request"] = {**identity(task, config), "state": "started", "requested_at": now()}
+    state.save(task)  # Crash/timeout after this point must never silently resend the mutation.
     request_error = None
     try:
         gh(config, "pr", "merge", task["pr_url"], "--squash", "--match-head-commit", task["head_sha"])
     except RelayError as error:
         request_error = error
+    task["merge_request"].update(state="uncertain" if request_error else "accepted",
+                                 error=str(request_error) if request_error else None)
+    state.save(task)
     pull = pull_snapshot(config, task)
     if pull["state"] == "MERGED":
         return post_merge(config, state, task, pull)
-    task.update(status="merge_waiting", error=str(request_error) if request_error else
-                "Merge is pending on GitHub; rerun devrelay merge to read back the result")
-    state.save(task)
     if request_error:
         raise request_error
-    return task
+    if not (pull.get("mergeQueueEntry") or pull.get("autoMergeRequest")):
+        raise RelayError("Merge request returned without a merged or queued PR; inspect GitHub before retrying")
+    task.update(status="merge_waiting", error="Merge is pending on GitHub; rerun devrelay merge to read back the result")
+    return state.save(task)
 
 
 def advance(config, state, identifier):
@@ -328,5 +455,5 @@ def advance(config, state, identifier):
                 state.save(task)
                 raise
             return task
-        return review(config, state, identifier)
+        return review(config, state, identifier, recover=task["status"] == "reviewing")
     return state.get(str(identifier))

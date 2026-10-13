@@ -25,6 +25,8 @@ max_attempts = 2
 
 [delivery]
 auto_review = false
+# true: watch waits for protected merge and post-merge acceptance before the next issue.
+# false: watch delivers draft PRs for manual integration.
 auto_merge = false
 cleanup_worktrees = false
 # Removes local, remote and remote-tracking task branches; requires cleanup_worktrees=true.

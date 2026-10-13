@@ -117,3 +117,7 @@ implementation session; it does not recover the external host's conversation.
 配置或要求改变后重新验收。仓库锁仅覆盖工具执行，不保留两次调用之间的编辑独占权。
 宿主须保证同一任务只有一个实现者，交给可选 `run/resume/watch` 前停止原编辑者。
 DevRelay 不检测任意外层 Agent；`resume` 只恢复 DevRelay 自己启动的 Codex 实现会话。
+
+The optional adapter recovers a completed review checkpoint only from canonical, task-owned, non-symlink evidence matching the successful configured read-only process. Missing or mismatched evidence requires explicit `review ID`; this does not resume the external host’s session. Automatic merge remains an explicit project opt-in, defaulting to false.
+
+可选编排仅从实际归属本任务、无符号链接且与成功只读审查进程匹配的证据恢复完整审查检查点。证据缺失或不符需显式 `review ID`；这不会恢复外层宿主会话。自动合并仍须由项目显式开启，默认关闭。
