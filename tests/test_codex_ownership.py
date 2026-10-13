@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from devrelay.codex import _implementation_sessions, _observe_line, _recover_previous_run, build_command
+from devrelay.codex import _implementation_sessions, _observe_line, _recover_previous_run, _review_sessions, build_command
 from devrelay.errors import RelayError
 from devrelay.providers import add_local
 from devrelay.runner import run_task, start
@@ -309,6 +309,75 @@ class CodexOwnershipTests(RepositoryTest):
         self.task["session_id"] = "implementation-session"
         self.state.save(self.task)
         self.assert_resume_rejected("Cannot read saved Codex review evidence")
+
+    def historical_review(self):
+        owner = self.state.get("fix-other")
+        receipt = {"session_id": "historical-review-session", "verdict": "approve",
+                   "head_sha": "a" * 40, "pr_url": "https://github.com/example/project/pull/7"}
+        path = self.state.directory / "integration" / ("b" * 32) / "review.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(receipt))
+        owner.update(status="completed", head_sha=receipt["head_sha"], pr_url=receipt["pr_url"],
+                     review=receipt, review_path=str(path))
+        self.state.save(owner)
+        return owner, path
+
+    def test_completed_integration_review_does_not_block_unrelated_implementation(self):
+        owner, path = self.historical_review()
+        original = path.read_bytes()
+        with self.state.lock():
+            result = run_task(self.config, self.state, self.task["id"], resume=True)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.state.get(owner["id"])["review_path"], str(path))
+
+    def test_completed_integration_review_still_reserves_its_session(self):
+        owner, path = self.historical_review()
+        self.task["session_id"] = owner["review"]["session_id"]
+        self.state.save(self.task)
+        self.assert_resume_rejected("another task's review")
+
+    def test_integration_review_requires_completed_task_and_matching_identity(self):
+        owner, path = self.historical_review()
+        for changes in ({"status": "reviewed"}, {"head_sha": "c" * 40},
+                        {"pr_url": "https://github.com/example/project/pull/8"}, {"head_sha": None}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(RelayError, "completed task with matching"):
+                _review_sessions(self.state, {**owner, **changes})
+
+    def test_integration_receipt_mismatch_corruption_or_missing_file_fails_closed(self):
+        owner, path = self.historical_review()
+        for content, error in ((json.dumps({**owner["review"], "session_id": "changed-session"}), "differs"),
+                               ('{"session_id":', "Cannot read")):
+            with self.subTest(content=content):
+                path.write_text(content)
+                with self.assertRaisesRegex(RelayError, error):
+                    _review_sessions(self.state, owner)
+        path.unlink()
+        with self.assertRaisesRegex(RelayError, "Cannot read"):
+            _review_sessions(self.state, owner)
+
+    def test_integration_symlinks_do_not_widen_evidence_scope(self):
+        owner, path = self.historical_review()
+        outside = Path(self.temporary.name) / "external-review.json"
+        outside.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(outside)
+        with self.assertRaisesRegex(RelayError, "outside its owned directory"):
+            _review_sessions(self.state, owner)
+        path.unlink()
+        path.parent.rmdir()
+        path.parent.symlink_to(outside.parent)
+        with self.assertRaisesRegex(RelayError, "outside its owned directory"):
+            _review_sessions(self.state, owner)
+
+    def test_unknown_integration_layout_is_not_accepted(self):
+        owner, path = self.historical_review()
+        unknown = path.parent.parent / "arbitrary" / "review.json"
+        unknown.parent.mkdir()
+        unknown.write_bytes(path.read_bytes())
+        owner["review_path"] = str(unknown)
+        with self.assertRaisesRegex(RelayError, "outside this task's run directory"):
+            _review_sessions(self.state, owner)
 
 
 if __name__ == "__main__":

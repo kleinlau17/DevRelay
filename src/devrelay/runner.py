@@ -1,4 +1,4 @@
-"""Single-task orchestration. External delivery is an explicit submit command."""
+"""Agent-callable engineering operations and optional single-task orchestration."""
 
 import json
 from pathlib import Path
@@ -17,6 +17,39 @@ from .state import now
 def assert_config(config):
     if load(config.root).fingerprint != config.fingerprint:
         raise RelayError("Project configuration changed during this operation; rerun with the new configuration")
+
+
+def require_prepared(config, task):
+    if config.data["setup"] and task.get("setup_fingerprint") != config.fingerprint:
+        raise RelayError(f"Project setup is missing or stale; run devrelay prepare {task['id']} before acceptance or delivery")
+
+
+def editable_task(config, task):
+    if task.get("merge_sha") or task["status"] in ("completed", "merging", "merged", "post_merge_failed", "cleaning", "cleanup_failed"):
+        raise RelayError("Task is merging or already integrated; recover delivery instead of preparing its environment")
+    if task.get("pr_url"):
+        from .delivery import pull_snapshot
+        validate_remote(config)
+        pull = pull_snapshot(config, task)
+        if (pull["state"] != "OPEN" or pull["headRefName"] != task["branch"]
+                or pull["headRefOid"] != task.get("head_sha") or pull["baseRefName"] != config.base
+                or pull["isCrossRepository"]):
+            raise RelayError("PR is closed, merged or differs from the saved submission; recover delivery before preparation")
+
+
+def submission_evidence(config, state, task, record, *, head=None):
+    """Re-read every mutable input before each publication boundary."""
+    assert_config(config)
+    require_prepared(config, task)
+    fresh = authorized(config, state, task["id"])
+    path = Path(task["worktree"])
+    if (not record or not record.get("passed") or record["source_tree"] != source_tree(path)
+            or record["config_sha256"] != config.fingerprint or record["base_sha"] != base_commit(config)
+            or record["task_body"] != fresh["body"] or record["task_title"] != fresh["title"]):
+        raise RelayError("Verification is missing or stale; task requirements/source/configuration/base may have changed; run devrelay check before submitting")
+    if head is not None and git(path, "rev-parse", "HEAD") != head:
+        raise RelayError("HEAD changed before publication; rerun verification")
+    return fresh
 
 
 def base_commit(config):
@@ -80,21 +113,49 @@ def start(config, state, identifier):
 
 
 def prepare(config, state, task):
-    task["status"] = "preparing"
-    state.save(task)
-    directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-setup")
-    for entry in config.data["setup"]:
-        execute(state, entry["argv"], task["worktree"], directory / (entry["id"] + ".log"), entry["timeout_seconds"])
     assert_config(config)
+    editable_task(config, task)
+    task["status"] = "preparing"
+    task["setup_fingerprint"] = None
+    task["verification"] = None
+    task["review"] = None
+    task["merge_gates"] = None
+    directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-setup")
+    task["setup_path"] = str(directory)
+    state.save(task)
+    try:
+        directory.mkdir(parents=True)
+        for entry in config.data["setup"]:
+            assert_config(config)
+            authorized(config, state, task["id"])
+            execute(state, entry["argv"], task["worktree"], directory / (entry["id"] + ".log"), entry["timeout_seconds"])
+        assert_config(config)
+        authorized(config, state, task["id"])
+        editable_task(config, task)
+    except (RelayError, OSError, KeyboardInterrupt) as error:
+        task.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+                    error=str(error) or "Interrupted")
+        state.save(task)
+        raise
     task["setup_fingerprint"] = config.fingerprint
     task["status"] = "prepared"
+    task["error"] = None
     return state.save(task)
+
+
+def prepare_task(config, state, identifier):
+    """Explicit setup for an external agent; never start a Codex session."""
+    task = claimed_task(config, state, identifier)
+    fresh = authorized(config, state, identifier)
+    task.update({key: fresh[key] for key in ("body", "title", "labels")})
+    return prepare(config, state, task)
 
 
 def verify(config, state, identifier):
     if not config.data["checks"]:
         raise RelayError("Configure at least one [[checks]] acceptance command before verification")
     task = claimed_task(config, state, identifier)
+    require_prepared(config, task)
     fresh = authorized(config, state, identifier)
     task.update({key: fresh[key] for key in ("body", "title", "labels")})
     path = Path(task["worktree"])
@@ -231,15 +292,12 @@ def submit(config, state, identifier, *, local=False):
     task = claimed_task(config, state, identifier)
     if task.get("pr_url") and task["status"] not in ("verified", "committed") and not local:
         from .delivery import advance
+        if not (config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]):
+            submission_evidence(config, state, task, task.get("verification"), head=task.get("head_sha"))
         return advance(config, state, identifier)
-    fresh = authorized(config, state, identifier)
     record = task.get("verification")
     path = Path(task["worktree"])
-    assert_config(config)
-    if (not record or not record.get("passed") or record["source_tree"] != source_tree(path)
-            or record["config_sha256"] != config.fingerprint or record["base_sha"] != base_commit(config)
-            or record["task_body"] != fresh["body"] or record["task_title"] != fresh["title"]):
-        raise RelayError("Verification is missing or stale; run devrelay check before submitting")
+    fresh = submission_evidence(config, state, task, record)
     # Support retry after a commit/push/API timeout without creating a duplicate commit.
     current = git(path, "rev-parse", "HEAD")
     if current != record["head_sha"] and current != task.get("head_sha"):
@@ -255,16 +313,12 @@ def submit(config, state, identifier, *, local=False):
         raise RelayError("Commit hooks changed verified content; rerun checks")
     if not int(git(path, "rev-list", "--count", f"{config.base_ref}..HEAD")):
         raise RelayError("No implementation commit to submit")
+    submission_evidence(config, state, task, record, head=head)
     task.update(status="committed", head_sha=head)
     state.save(task)
     if local:
         return task
-    assert_config(config)
-    authorized(config, state, identifier)
-    if base_commit(config) != record["base_sha"]:
-        raise RelayError("Base changed before push; integrate it and rerun verification")
-    if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
-        raise RelayError("Source or HEAD changed before push; rerun verification")
+    submission_evidence(config, state, task, record, head=head)
     push_url = validate_remote(config, path)
     ref = "refs/heads/" + task["branch"]
     # Pin the exact validated endpoint in the transport invocation. A remote
@@ -278,8 +332,7 @@ def submit(config, state, identifier, *, local=False):
     # covered by remote.<name>.fetch (single-branch clones commonly are not).
     git(path, "config", "branch." + task["branch"] + ".remote", config.remote)
     git(path, "config", "branch." + task["branch"] + ".merge", ref)
-    if source_tree(path) != record["source_tree"] or git(path, "rev-parse", "HEAD") != head:
-        raise RelayError("Source or HEAD changed during push; rerun verification before opening a PR")
+    submission_evidence(config, state, task, record, head=head)
     summary = task.get("summary") or "Implementation verified by configured project checks."
     check_lines = "\n".join(f"- `{item['id']}`: exit {item['returncode']}" for item in record["checks"])
     body = (f"{summary}\n\nVerification\n\n{check_lines}\n\n"
@@ -287,6 +340,7 @@ def submit(config, state, identifier, *, local=False):
             f"Configuration SHA-256: `{record['config_sha256']}`\n\nRefs #{identifier}\n")
     existing = gh_json(config, "pr", "list", "--head", task["branch"], "--base", config.base,
                        "--state", "open", "--json", "number,url")
+    submission_evidence(config, state, task, record, head=head)
     if existing:
         url = existing[0]["url"]
         gh(config, "pr", "edit", str(existing[0]["number"]), "--body-file", "-", input=body)
@@ -299,6 +353,7 @@ def submit(config, state, identifier, *, local=False):
         raise RelayError("PR readback differs from the verified submission; inspect it before retrying")
     task.update(status="pr_open", pr_url=pull["url"])
     state.save(task)
+    submission_evidence(config, state, task, record, head=head)
     from .delivery import advance
     return advance(config, state, identifier)
 
@@ -307,7 +362,19 @@ def complete_local(config, state, identifier):
     if config.provider != "local":
         raise RelayError("GitHub task completion is recorded on GitHub after reviewed integration")
     task = claimed_task(config, state, identifier)
-    if not task.get("head_sha") or not is_ancestor(config.root, task["head_sha"], config.base_ref):
+    assert_config(config)
+    require_prepared(config, task)
+    fresh = task if task["status"] == "completed" else authorized(config, state, identifier)
+    record = task.get("verification") or {}
+    path = Path(task["worktree"])
+    head = task.get("head_sha")
+    if (not head or not record.get("passed") or record.get("config_sha256") != config.fingerprint
+            or record.get("task_body") != fresh["body"] or record.get("task_title") != fresh["title"]
+            or git(path, "rev-parse", "HEAD") != head
+            or git(path, "rev-parse", head + "^{tree}") != record.get("source_tree")
+            or source_tree(path) != record.get("source_tree")):
+        raise RelayError("Latest verified content is not the delivered commit; check and submit before completing the task")
+    if not is_ancestor(config.root, head, config.base_ref):
         raise RelayError("The submitted task commit must be integrated into the configured base before completion")
     task.update(status="completed", open=False)
     return state.save(task)

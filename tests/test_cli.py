@@ -2,17 +2,65 @@ from contextlib import chdir, redirect_stderr, redirect_stdout
 import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
 from devrelay import __version__
-from devrelay.cli import main
+from devrelay.cli import main, parser
 
 from helpers import RepositoryTest
+
+
+class WatchArgumentTests(unittest.TestCase):
+    def test_poll_interval_alias_uses_same_destination_and_default(self):
+        self.assertEqual(parser().parse_args(["watch"]).poll_interval, 60)
+        for option in ("--poll-interval", "--interval"):
+            with self.subTest(option=option):
+                args = parser().parse_args(["watch", option, "30"])
+                self.assertEqual(args.poll_interval, 30)
+
+    def test_poll_interval_alias_rejects_non_positive_integers(self):
+        for option in ("--poll-interval", "--interval"):
+            for value in ("0", "-1", "1.5", "invalid"):
+                with self.subTest(option=option, value=value):
+                    with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as raised:
+                        parser().parse_args(["watch", option, value])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn("must be a positive integer", err.getvalue())
+
+    def test_max_tasks_alias_uses_same_destination_and_default(self):
+        self.assertIsNone(parser().parse_args(["watch"]).max_tasks)
+        for option in ("--max-tasks", "--limit"):
+            with self.subTest(option=option):
+                args = parser().parse_args(["watch", option, "2"])
+                self.assertEqual(args.max_tasks, 2)
+
+    def test_max_tasks_alias_rejects_non_positive_integers(self):
+        for option in ("--max-tasks", "--limit"):
+            for value in ("0", "-1", "1.5", "invalid"):
+                with self.subTest(option=option, value=value):
+                    with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as raised:
+                        main(["watch", option, value])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn("must be a positive integer", err.getvalue())
+
+    def test_watch_help_lists_all_aliases_without_side_effects(self):
+        with patch("devrelay.cli.repository_root") as repository_root, patch("devrelay.cli.watch") as watch, \
+                patch("devrelay.cli.subprocess.run") as subprocess_run:
+            with redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as raised:
+                main(["watch", "--help"])
+            self.assertEqual(raised.exception.code, 0)
+            self.assertIn("--poll-interval", out.getvalue())
+            self.assertIn("--interval", out.getvalue())
+            self.assertIn("--max-tasks", out.getvalue())
+            self.assertIn("--limit", out.getvalue())
+            repository_root.assert_not_called()
+            watch.assert_not_called()
+            subprocess_run.assert_not_called()
 
 
 class VersionTests(unittest.TestCase):
