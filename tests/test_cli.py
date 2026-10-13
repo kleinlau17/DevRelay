@@ -1,10 +1,15 @@
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 import io
 import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+from devrelay import __version__
 from devrelay.cli import main, parser
 
 from helpers import RepositoryTest
@@ -56,6 +61,39 @@ class WatchArgumentTests(unittest.TestCase):
             repository_root.assert_not_called()
             watch.assert_not_called()
             subprocess_run.assert_not_called()
+
+
+class VersionTests(unittest.TestCase):
+    def test_version_skips_project_initialization(self):
+        with tempfile.TemporaryDirectory() as directory, chdir(directory):
+            for flag in ("--version", "-V"):
+                with self.subTest(flag=flag):
+                    out, err = io.StringIO(), io.StringIO()
+                    with (redirect_stdout(out), redirect_stderr(err),
+                          patch("devrelay.cli.repository_root") as repository,
+                          patch("devrelay.cli.load") as load,
+                          patch("devrelay.cli.State") as state,
+                          self.assertRaises(SystemExit) as exit):
+                        main([flag])
+                    self.assertEqual(exit.exception.code, 0)
+                    self.assertEqual(out.getvalue(), f"{__version__}\n")
+                    self.assertEqual(err.getvalue(), "")
+                    repository.assert_not_called()
+                    load.assert_not_called()
+                    state.assert_not_called()
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_version_process_succeeds_outside_git_repository(self):
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+        with tempfile.TemporaryDirectory() as directory:
+            for flag in ("--version", "-V"):
+                with self.subTest(flag=flag):
+                    result = subprocess.run([sys.executable, "-m", "devrelay", flag], cwd=directory,
+                                            env=environment, text=True, capture_output=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, f"{__version__}\n")
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 class CliTests(RepositoryTest):

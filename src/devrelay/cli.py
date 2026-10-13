@@ -23,7 +23,7 @@ def parser():
     root = argparse.ArgumentParser(
         prog="devrelay", description="Agent-driven engineering tools with verified delivery gates",
         epilog="Agents use next/start/prepare/check/submit. Optional Codex orchestration: run/resume/watch.")
-    root.add_argument("--version", action="version", version=__version__)
+    root.add_argument("-V", "--version", action="version", version=__version__)
     root.add_argument("--project", type=Path, default=Path.cwd(), help="Project directory (default: current directory)")
     sub = root.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="Create project configuration and initialize GitHub issue management")
