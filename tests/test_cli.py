@@ -3,10 +3,39 @@ import io
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
-from devrelay.cli import main
+from devrelay.cli import main, parser
 
 from helpers import RepositoryTest
+
+
+class WatchArgumentTests(unittest.TestCase):
+    def test_poll_interval_alias_uses_same_destination_and_default(self):
+        self.assertEqual(parser().parse_args(["watch"]).poll_interval, 60)
+        for option in ("--poll-interval", "--interval"):
+            with self.subTest(option=option):
+                args = parser().parse_args(["watch", option, "30"])
+                self.assertEqual(args.poll_interval, 30)
+
+    def test_poll_interval_alias_rejects_non_positive_integers(self):
+        for option in ("--poll-interval", "--interval"):
+            for value in ("0", "-1", "1.5", "invalid"):
+                with self.subTest(option=option, value=value):
+                    with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as raised:
+                        parser().parse_args(["watch", option, value])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn("must be a positive integer", err.getvalue())
+
+    def test_watch_help_lists_both_options_without_starting_worker(self):
+        with patch("devrelay.cli.repository_root") as repository_root, patch("devrelay.cli.watch") as watch:
+            with redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as raised:
+                main(["watch", "--help"])
+            self.assertEqual(raised.exception.code, 0)
+            self.assertIn("--poll-interval", out.getvalue())
+            self.assertIn("--interval", out.getvalue())
+            repository_root.assert_not_called()
+            watch.assert_not_called()
 
 
 class CliTests(RepositoryTest):

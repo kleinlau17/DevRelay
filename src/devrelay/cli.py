@@ -61,7 +61,7 @@ def parser():
     run.add_argument("id", nargs="?")
     run.add_argument("--submit", action="store_true", help="Submit a draft PR after checks pass")
     worker = sub.add_parser("watch", help="Optional orchestration: continuously run Codex tasks through draft PRs; merge manually")
-    worker.add_argument("--poll-interval", type=positive_integer, default=60,
+    worker.add_argument("--poll-interval", "--interval", type=positive_integer, default=60,
                         help="Seconds to wait when the queue is empty (default: 60)")
     worker.add_argument("--max-tasks", type=positive_integer,
                         help="Stop after this many delivered PRs (default: keep watching)")
