@@ -33,6 +33,29 @@ class WorkflowTests(RepositoryTest):
         with self.state.lock():
             return run_task(self.config, self.state, identifier, **kwargs)
 
+    def test_explicit_plan_id_is_rejected_before_worktree_or_codex(self):
+        add_local(self.config, self.state, "plan", "Overall plan",
+                  "Task kind: plan\nDepends on: none", "priority:P1")
+        with patch("devrelay.runner.codex.implement") as implement:
+            with self.assertRaisesRegex(RelayError, "Tracking plan parents are not executable"):
+                self.run_task("plan")
+        implement.assert_not_called()
+        self.assertFalse((self.root / ".devrelay/worktrees/plan").exists())
+        self.assertEqual(self.state.get("plan")["status"], "queued")
+
+    def test_resume_rechecks_parent_status_and_preserves_existing_work(self):
+        with self.state.lock():
+            task = start(self.config, self.state, "fix-1")
+        worktree = Path(task["worktree"])
+        (worktree / "unfinished.txt").write_text("Keep this work\n")
+        task["body"] = "Task kind: plan\nDepends on: none"
+        self.state.save(task)
+        with patch("devrelay.runner.codex.implement") as implement:
+            with self.assertRaisesRegex(RelayError, "Tracking plan parents are not executable"):
+                self.run_task(resume=True)
+        implement.assert_not_called()
+        self.assertEqual((worktree / "unfinished.txt").read_text(), "Keep this work\n")
+
     def test_real_worktree_and_verified_local_delivery(self):
         result = self.run_task()
         self.assertEqual(result["status"], "verified")

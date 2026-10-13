@@ -2,11 +2,15 @@
 name: "DevRelay plan / 总体计划"
 about: "Track independent child deliveries / 跟踪独立子任务交付"
 title: ''
-labels: "enhancement"
+labels: "scope:plan"
 assignees: ''
 ---
 
 <!-- Maintainer triage / 维护者分诊:
+One issue delivers one observable, reviewable result. Keep its required code, config, tests and docs together.
+一个 Issue 对应一个可观察、可审查结果；实现该结果所需的代码、配置、测试和文档放在一起。
+Split child issues only for independent value or acceptance criteria, not merely by file, layer or phase.
+只有具备独立价值或验收标准才拆子项，不仅按文件、层或阶段拆分。
 Choose one primary work type, relevant area labels and exactly one priority.
 选择一个主要任务类型、相关 area 标签及唯一优先级。
 Priorities / 优先级: ["priority:P0", "priority:P1", "priority:P2"]
@@ -44,9 +48,13 @@ Depends on: none
 
 <!-- State required data/decisions and recovery conditions; never include credentials. -->
 
+Task kind: plan
+
 ## Child issues and delivery plan / 子任务与交付计划
 
 - [ ] Link independently deliverable child issues / 链接可独立验收的子任务
 
 <!-- This is a tracking parent, not an executable task. Do not add execution
-authorization. / 此 Issue 只跟踪总体交付，不应添加执行授权标签。 -->
+authorization. Keep Task kind: plan or scope:plan; the queue rejects this parent
+even if authorized. / 此 Issue 只跟踪总体交付，不应添加执行授权标签；
+保留 Task kind: plan 或 scope:plan，误加授权也会被队列拒绝。 -->
