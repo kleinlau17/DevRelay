@@ -91,6 +91,24 @@ Tracking updates after push and tracking cleanup use the first matching positive
 
 Transport preserves Git's `GIT_CONFIG_NOSYSTEM` boolean policy: `0`/`false` keeps the original system settings, while `1`/`true` disables them. Other Git boolean spellings are supported; invalid values stop the transport.
 
+## Continuous issue dispatch
+
+Run from an onboarded GitHub project:
+
+```bash
+devrelay --project /path/to/project watch
+# Change the empty-queue interval, or stop after delivering two PRs:
+devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
+```
+
+`watch` serially claims authorized issues with integrated dependencies, ordered by configured priority and creation time. It implements, verifies and submits a draft PR, including fresh read-only review when `auto_review` is enabled, then immediately moves to the next eligible issue. It neither waits for earlier PRs to merge nor repeats already submitted tasks. An empty queue is checked every 60 seconds by default, so newly authorized issues can be picked up. Existing authorization, blockers, dependency, duplicate-claim and acceptance gates still apply.
+
+Merging stays with the maintainer: `watch` requires `[delivery] auto_merge = false`, rejects automatic merge configurations and leaves drafts as drafts. It runs in the foreground; keep the terminal and machine running. It does not install a background service or startup job. Output is flushed JSON Lines events followed by a final status. `--max-tasks` counts successfully delivered PRs during this invocation, including recovered deliveries; omit it to keep watching.
+
+The repository worker lock remains held even while idle. `status` / `next` remain available, and PRs can be merged manually on GitHub; stop `watch` before other DevRelay mutations. `Ctrl+C` or `SIGTERM` stops the loop, retains work and exits with code 130. Restarting prioritizes interrupted implementations and unfinished submission/review. Already verified tasks attempt submission directly, subject to evidence checks. PRs awaiting manual merge are left for the maintainer.
+
+Failures, external blockers, rejected reviews and other states requiring attention stop dispatch with a nonzero exit code, preserving worktrees and logs. Network/API errors, configuration changes and stale verification also stop the worker. Inspect `devrelay status`, explicitly recover through the existing `resume` / `check` / `submit` / `review` commands, then restart `watch`. Each new task starts from the latest target base; issues depending on an earlier task wait until that dependency is closed and its linked delivery PR is integrated.
+
 ## Automatic review and merge
 
 Configure and commit this policy before running tasks:
@@ -116,7 +134,7 @@ devrelay resume 12 --submit
 
 Review uses a fresh Codex session with the `read-only` sandbox, preserving the implementation session. Reports remain local; AI review does not submit a GitHub APPROVE or replace required human approvals. Negative/incomplete review, source/head/base/configuration/issue drift, withdrawn authorization, unresolved threads and GitHub merge restrictions block merging. API errors or truncated inventories fail closed; up to 100 checks, reviews and threads are supported per snapshot.
 
-Merge uses `--squash --match-head-commit SHA`, with no admin bypass. A successful request is not completion: DevRelay reads back the merged state and commit. CI waits and merge queues return `merge_waiting`; rerun `merge` or `run --submit` to advance. Each invocation is bounded; there is no background polling.
+Merge uses `--squash --match-head-commit SHA`, with no admin bypass. A successful request is not completion: DevRelay reads back the merged state and commit. CI waits and merge queues return `merge_waiting`; rerun `merge` or `run --submit` to advance. Merge commands are bounded and do not poll continuously; `watch` continuously dispatches only through draft PR delivery and never merges.
 
 After merge, DevRelay fetches the base, verifies commit ancestry and tree equality, then runs every setup/check command in a fresh detached worktree. Only successful acceptance records `completed`. API timeout recovery reads GitHub first and never re-merges an already merged PR. Unexpected trees or failed post-merge checks record `post_merge_failed`, retain evidence and failed worktrees, and block automatic dispatch without an ID. GitHub's head condition does not atomically lock the base, so pre-merge refresh and post-merge tree verification both matter. A post-merge failure needs maintainer remediation; DevRelay does not automatically revert a completed remote merge.
 

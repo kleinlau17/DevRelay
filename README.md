@@ -101,6 +101,24 @@ devrelay submit 12
 
 传输保留 Git 对 `GIT_CONFIG_NOSYSTEM` 的布尔值规则：`0`/`false` 保留原有系统设置，`1`/`true` 禁用它们。其他 Git 布尔值写法同样支持；无效值会停止传输。
 
+## 持续自动领取 Issues
+
+在已接入的 GitHub 项目中运行：
+
+```bash
+devrelay --project /path/to/project watch
+# 调整空队列等待时间，或处理两条后退出：
+devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
+```
+
+`watch` 按配置的优先级和创建时间串行领取已授权、依赖已交付的 Issue，自动实现、验收并提交 draft PR；开启 `auto_review` 时还会执行独立只读审查。成功提交（及启用的审查）后立即领取下一条，不等待前一个 PR 合并，也不重复处理已经提交的任务。队列为空时默认每 60 秒重新检查，新 Issue 授权后即可被领取。原有授权、阻塞、依赖、重复领取和验收门禁全部保留。
+
+合并由维护者决定：`watch` 要求 `[delivery] auto_merge = false`，不接受开启自动合并的配置，也不将 draft 标为 ready。它是前台长运行命令，终端和机器需要保持运行；不会安装后台服务或开机启动。输出为实时刷新的 JSON Lines 事件及最终状态。`--max-tasks` 计算本次成功交付的 PR 数（包括恢复的交付），省略则持续等待。
+
+运行期间一直持有单 worker 锁，包括空队列等待时；可以使用 `status` / `next` 查看状态，在 GitHub 人工合并 PR，但其他 DevRelay 写操作需要先停止 `watch`。`Ctrl+C` 或 `SIGTERM` 会结束运行并保留现场，退出码为 130。重新启动会优先恢复中断的实现或未完成的提交/审查；已经验收的任务直接尝试提交，仍须通过证据校验。等待人工合并的 PR 留给维护者处理。
+
+失败、外部阻塞、审查拒绝或其他需要人工处理的状态会停止领取，返回非零退出码，并保留工作树和日志。网络/API 错误、配置变动、验收证据过期也会停止；检查 `devrelay status`，按现有 `resume` / `check` / `submit` / `review` 流程明确恢复后，再启动 `watch`。新任务仍从最新目标分支开始；依赖前一个任务的 Issue 必须等到依赖关闭且交付关联的 PR 已合并后才会执行。
+
 ## 自动审查与合并
 
 在项目 `.devrelay/config.toml` 中配置，并在运行任务前纳入版本管理：
@@ -126,7 +144,7 @@ devrelay resume 12 --submit
 
 审查使用新的 Codex 会话，固定 `read-only`，不复用实现会话。结论、发现和日志保存本地；AI 审查不会替你提交 GitHub APPROVE，也不能代替分支保护要求的人工批准。审查拒绝、源码/提交/base/配置/Issue 要求变化、撤销任务授权、未解决的审查线程或 GitHub 阻塞条件均阻止合并。每次读取最多 100 个 CI、审查及线程；数据不完整或 API 出错会阻止推进。
 
-合并通过 `--squash --match-head-commit SHA` 固定已审查的提交，不使用 `--admin` 或跳过保护。请求成功不等于已经合并：必须回读 `MERGED` 与合并提交；进入合并队列或 CI 未完成时保存 `merge_waiting`，下次执行 `merge` 或 `run --submit` 继续。命令每次有界运行，没有常驻轮询。
+合并通过 `--squash --match-head-commit SHA` 固定已审查的提交，不使用 `--admin` 或跳过保护。请求成功不等于已经合并：必须回读 `MERGED` 与合并提交；进入合并队列或 CI 未完成时保存 `merge_waiting`，下次执行 `merge` 或 `run --submit` 继续。合并命令每次有界运行，不常驻轮询；`watch` 只持续调度到 draft PR，不执行合并。
 
 合并后刷新目标分支，核对合并提交的祖先关系与源码树，再在新的 detached 工作树执行全部 setup 和 checks，通过后记录 `completed`。API 超时会先回读远端，已合并时只恢复验收。合并后树不一致或验收失败保存 `post_merge_failed`，阻止无 ID 自动派发；保留失败工作树与证据。GitHub 的 HEAD 条件不原子锁定 base，因此合并前刷新与合并后树核对都需要；失败后合并已发生，需要维护者处理，DevRelay 不自动回滚。
 

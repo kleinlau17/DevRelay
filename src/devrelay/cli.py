@@ -1,4 +1,4 @@
-"""Small JSON-output CLI for project onboarding and bounded task runs."""
+"""JSON-output CLI for project onboarding, task runs and continuous dispatch."""
 
 import argparse
 import json
@@ -16,6 +16,7 @@ from .onboarding import setup_github
 from .providers import add_local, queue_report, snapshot
 from .runner import complete_local, run_task, start, submit, verify
 from .state import State
+from .worker import watch
 
 
 def parser():
@@ -54,7 +55,22 @@ def parser():
     run = sub.add_parser("run", help="Implement and verify one task, recovering interrupted work first")
     run.add_argument("id", nargs="?")
     run.add_argument("--submit", action="store_true", help="Submit a draft PR after checks pass")
+    worker = sub.add_parser("watch", help="Continuously implement authorized GitHub issues and submit draft PRs; merge manually")
+    worker.add_argument("--poll-interval", type=positive_integer, default=60,
+                        help="Seconds to wait when the queue is empty (default: 60)")
+    worker.add_argument("--max-tasks", type=positive_integer,
+                        help="Stop after this many delivered PRs (default: keep watching)")
     return root
+
+
+def positive_integer(value):
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
 
 
 def probe(argv, cwd):
@@ -126,6 +142,11 @@ def main(argv=None):
                 result = {"project": str(root), "tasks": state.tasks()}
             elif args.command == "next":
                 result = queue_report(config, snapshot(config, state))
+            elif args.command == "watch":
+                result = watch(config, state, poll_interval=args.poll_interval, max_tasks=args.max_tasks,
+                               emit=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True))
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                return 1 if result["status"] == "needs_attention" else 0
             else:
                 with state.lock():
                     if args.command == "task" and args.task_command == "add":
