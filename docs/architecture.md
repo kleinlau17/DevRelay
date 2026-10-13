@@ -12,6 +12,7 @@
 | `codex` | Noninteractive CLI, explicit sessions, structured outcomes / CLI、精确会话与结构化结果 |
 | `process` | Timeout, process groups and unique receipts / 超时、进程组与独立回执 |
 | `runner` | Claim → prepare → implement → verify → submit / 工作流 |
+| `worker` | Continuous serial GitHub dispatch through draft PRs, idle polling and recovery / 持续串行领取、空队列轮询及恢复，交付停在 draft PR |
 | `delivery` | Fresh AI review, GitHub merge gates, post-merge acceptance / 审查、合并门禁及合并后验收 |
 | `cleanup` | Opt-in exact-ref cleanup after acceptance, durable recovery / 验收后清理与恢复 |
 
@@ -37,7 +38,7 @@ State is saved before long-running phases. Main-checkout configuration controls 
 
 - One controller, one worker per Git repository; POSIX lock, no distributed leases.
 - GitHub onboarding creates only missing repository labels and local template files under the worker lock. It never assigns issue labels or authorization. Existing files/definitions remain intact; uncertain creates are read back and `init --sync-github` repairs partial setup. Templates become public only after normal Git delivery to the default branch.
-- Each invocation has bounded attempts and command timeouts; explicit resume may grant a new bounded attempt window.
+- Each task has bounded attempts and command timeouts; explicit resume may grant a new bounded attempt window. `watch` is a foreground loop holding the repository worker lock through execution and idle waits; it stops on errors or attention states, and reuses the existing evidence and authorization gates. Submitted/reviewed drafts do not block new dispatch. It requires automatic merge to be disabled, and configuration changes stop it before further dispatch.
 - Default Codex sandbox is workspace-write; approval policy is never, so permission failures become actionable failures rather than unattended prompts.
 - Delivery defaults to draft PR. Project configuration may opt into fresh read-only AI review and exact-head squash merging; GitHub human approvals and protection still apply.
 - Review binds PR URL, head, base, tree, configuration and task requirements; CI is read from the exact head commit. Truncated API data fails closed. Default no-CI policy blocks, with an explicit project opt-out.
@@ -45,8 +46,8 @@ State is saved before long-running phases. Main-checkout configuration controls 
 - Cleanup defaults off for task resources. Successful acceptance scratch trees are removed; failed trees/evidence remain. Optional task worktree and exact-head branch cleanup checkpoints each step; recovery reads actual refs without assuming the original checkout still exists.
 - Remote deletion uses an explicit expected SHA lease; local/remote-tracking ref deletion uses compare-and-swap. Worktree removal is never forced. Git operations outside DevRelay still require coordination with the repository worker.
 - Completed GitHub tasks stay claimed in shared state even after their branches/worktrees are removed, preventing repeat dispatch of still-open scoped Issues.
-- No scheduler, remote compute adapter, automatic conflict resolution, release adapter or cross-repository transaction in version 0.4.
+- No OS service installer, remote compute adapter, automatic conflict resolution, release adapter or cross-repository transaction. Continuous issue dispatch is explicitly started with `watch`; it does not create background schedules.
 - Project commands may require services, credentials or hardware; DevRelay does not provision them.
 - Process markers detect remaining foreground groups after controller crashes. Commands must not daemonize or escape the group. There is a brief spawn-to-marker crash window; this is cooperative recovery, not an OS isolation guarantee.
 
-默认单仓库、单 worker、有限重试并停在 draft PR；项目可明确开启审查与合并。审查绑定准确提交与 base；CI、GitHub 审查意见和保护条件另行核验。合并后在独立工作树重跑 setup/checks；失败保留远端已合并的事实和本地证据。调度、远端执行、多仓库事务与发布留给后续适配。项目命令负责业务环境。进程组恢复要求命令不脱离前台进程组；进程启动与标记之间仍有短暂中断窗口，不能宣称操作系统级隔离。
+默认单仓库、单 worker、有限重试并停在 draft PR；项目可明确开启审查与合并。`watch` 持续串行调度，空队列等待期间也保留 worker 锁，要求关闭自动合并；已提交/审查的 draft 不阻止领取下一任务，错误或人工处理状态会停止调度。审查绑定准确提交与 base；CI、GitHub 审查意见和保护条件另行核验。合并后在独立工作树重跑 setup/checks；失败保留远端已合并的事实和本地证据。后台服务安装、远端执行、多仓库事务与发布留给后续适配。项目命令负责业务环境。进程组恢复要求命令不脱离前台进程组；进程启动与标记之间仍有短暂中断窗口，不能宣称操作系统级隔离。
