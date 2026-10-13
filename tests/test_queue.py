@@ -34,6 +34,40 @@ class QueueTests(RepositoryTest):
         report = self.report(tasks)
         self.assertEqual([task["id"] for task in report["eligible"]], ["3", "2", "1"])
 
+    def test_authorized_plan_parent_is_skipped_and_child_remains_eligible(self):
+        parent = issue(1, labels=["scope:plan", "auto:approved", "priority:P0"])
+        child = issue(2, body="Parent: #1\nDeliver one tested fix.\nDepends on: none")
+        report = self.report([parent, child])
+        self.assertEqual([task["id"] for task in report["eligible"]], ["2"])
+        self.assertIn("Tracking plan parents are not executable", str(report["excluded"]))
+
+    def test_plan_markers_block_selection_and_recovery_for_both_providers(self):
+        markers = ("Task kind: plan", "Task kind: PLAN\r\n",
+                   "Task kind: implementation\nTask kind: plan",
+                   "## Child issues and delivery plan / 子任务与交付计划",
+                   "## Child issues and delivery plan")
+        for provider in ("local", "github"):
+            self.config.data["project"]["provider"] = provider
+            for marker in markers:
+                for exclude_claimed in (True, False):
+                    with self.subTest(provider=provider, marker=marker, recovery=not exclude_claimed):
+                        parent = issue(1, body=marker + "\nDepends on: none")
+                        report = queue_report(self.config, Snapshot([parent], set(), set()),
+                                              exclude_claimed=exclude_claimed)
+                        self.assertIsNone(report["selected"])
+                        self.assertIn("Tracking plan parents are not executable", str(report["excluded"]))
+
+    def test_custom_authorization_cannot_override_plan_label(self):
+        self.config.data["queue"].update(approval_label="execute", priorities=["urgent"])
+        parent = issue(1, labels=["SCOPE:PLAN", "execute", "urgent"])
+        self.assertIsNone(self.report([parent])["selected"])
+
+    def test_child_mentions_of_plan_markers_do_not_classify_it_as_parent(self):
+        child = issue(2, body="Parent: #1 (scope:plan).\nRemove the old Task kind: plan marker.\n"
+                     "Depends on: none")
+        child["title"] = "Implement the plan's independent validation result"
+        self.assertEqual(self.report([child])["selected"]["id"], "2")
+
     def test_dependencies_require_closed_integrated_results(self):
         tasks = [issue(1, opened=False), issue(2, body="Depends on: #1")]
         self.assertIsNone(self.report(tasks)["selected"])

@@ -2,6 +2,7 @@ from contextlib import ExitStack
 import json
 from pathlib import Path
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -11,12 +12,88 @@ from devrelay.errors import RelayError
 from devrelay.git import git as real_git, has_ref
 from devrelay.process import execute
 from devrelay.providers import queue_report, snapshot
-from devrelay.runner import run_task, start, submit
+from devrelay.runner import prepare_task, run_task, start, submit, verify
 
 from test_delivery import GitHubDeliveryFixture
 
 
 class MergeTests(GitHubDeliveryFixture):
+    def test_open_pr_repreparation_invalidates_review_and_requires_new_acceptance(self):
+        self.enable(auto_merge=False, auto_review=True)
+        task = self.deliver()
+        old_review = Path(task["review_path"])
+        with self.state.lock():
+            prepared = prepare_task(self.config, self.state, "12")
+            self.assertEqual(prepared["status"], "prepared")
+            self.assertIsNone(prepared["verification"])
+            self.assertIsNone(prepared["review"])
+            with self.assertRaisesRegex(RelayError, "missing or stale"):
+                review(self.config, self.state, "12")
+            verify(self.config, self.state, "12")
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["status"], "reviewed")
+        self.assertNotEqual(recovered["review_path"], str(old_review))
+        self.assertTrue(old_review.is_file())
+        self.assertEqual(self.create_count, 1)
+        self.assertEqual(recovered["pr_url"], task["pr_url"])
+
+    def test_open_pr_recovers_new_environment_configuration_without_a_model(self):
+        with self.state.lock():
+            task = start(self.config, self.state, "12")
+            (Path(task["worktree"]) / "value.txt").write_text("fixed\n")
+            verify(self.config, self.state, "12")
+            task = submit(self.config, self.state, "12")
+        config_path = self.root / ".devrelay/config.toml"
+        config_path.write_text(config_path.read_text() +
+            '\n[[setup]]\nid = "new-env"\nargv = ' + json.dumps([
+                sys.executable, "-c", "from pathlib import Path; p=Path('.devrelay/runtime/new-env'); p.parent.mkdir(parents=True, exist_ok=True); p.touch()"
+            ]) + '\n[[checks]]\nid = "new-env-check"\nargv = ' + json.dumps([
+                sys.executable, "-c", "from pathlib import Path; assert Path('.devrelay/runtime/new-env').exists()"
+            ]) + '\n')
+        self.git("add", ".devrelay/config.toml")
+        self.git("commit", "-qm", "updated setup configuration")
+        self.git("push", "-q", "origin", "main")
+        self.config = load(self.root)
+        self.git("merge", "--no-edit", "origin/main", cwd=task["worktree"])
+        with self.state.lock(), patch("devrelay.runner.codex.implement", side_effect=AssertionError("Unexpected model")):
+            with self.assertRaisesRegex(RelayError, "setup is missing or stale"):
+                verify(self.config, self.state, "12")
+            prepared = prepare_task(self.config, self.state, "12")
+            self.assertEqual(prepared["setup_fingerprint"], self.config.fingerprint)
+            with self.assertRaisesRegex(RelayError, "missing or stale"):
+                submit(self.config, self.state, "12")
+            verify(self.config, self.state, "12")
+            recovered = submit(self.config, self.state, "12")
+        self.assertEqual(recovered["status"], "pr_open")
+        self.assertEqual(recovered["pr_url"], task["pr_url"])
+        self.assertEqual(self.create_count, 1)
+        self.assertEqual(self.edit_count, 1)
+
+    def test_prepare_rejects_closed_or_changed_pr_without_touching_evidence(self):
+        task = self.deliver()
+        original = self.state.get("12")
+        for changes in ({"state": "CLOSED"}, {"headRefOid": "0" * 40}, {"baseRefName": "other"}):
+            def change_pull(pull):
+                pull.update(changes)
+                if "headRefOid" in changes:
+                    pull["commits"]["nodes"][0]["commit"]["oid"] = changes["headRefOid"]
+            self.query_hook = change_pull
+            with self.subTest(changes=changes), self.state.lock():
+                with self.assertRaisesRegex(RelayError, "closed, merged or differs"):
+                    prepare_task(self.config, self.state, "12")
+            self.assertEqual(self.state.get("12"), original)
+        self.assertTrue(Path(task["worktree"]).exists())
+
+    def test_prepare_rejects_completed_merge_and_retains_acceptance(self):
+        self.enable()
+        task = self.deliver()
+        original = self.state.get("12")
+        with self.state.lock():
+            with self.assertRaisesRegex(RelayError, "already integrated"):
+                prepare_task(self.config, self.state, "12")
+        self.assertEqual(self.state.get("12"), original)
+        self.assertTrue(task["post_merge"]["passed"])
+
     def setUp(self):
         super().setUp()
         self.draft = True

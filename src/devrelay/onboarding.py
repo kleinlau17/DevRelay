@@ -7,6 +7,7 @@ import tempfile
 
 from .errors import RelayError
 from .git import command, validate_remote
+from .providers import PLAN_LABEL
 from .runner import assert_config
 
 
@@ -16,6 +17,7 @@ LABELS = (
     ("documentation", "0075ca", "Documentation improvements / 文档完善"),
     ("experiment", "5319e7", "A bounded experiment with independent acceptance / 有界实验"),
     ("infrastructure", "bfd4f2", "Runtime, queue or reproducibility infrastructure / 运行基础设施"),
+    (PLAN_LABEL, "5319e7", "Tracking plan parent; never executable / 总体计划父任务，不允许执行"),
     ("area:backend", "c5def5", "Engine and adapter qualification / 引擎适配资格"),
     ("area:benchmark", "c5def5", "Protocols, comparisons and cost / 基准协议与成本"),
     ("area:cloth", "c5def5", "Cloth mechanics and collision / 布料力学"),
@@ -80,6 +82,10 @@ def _existing_labels(config):
 def templates(config):
     queue = config.data["queue"]
     policy = f"""<!-- Maintainer triage / 维护者分诊:
+One issue delivers one observable, reviewable result. Keep its required code, config, tests and docs together.
+一个 Issue 对应一个可观察、可审查结果；实现该结果所需的代码、配置、测试和文档放在一起。
+Split child issues only for independent value or acceptance criteria, not merely by file, layer or phase.
+只有具备独立价值或验收标准才拆子项，不仅按文件、层或阶段拆分。
 Choose one primary work type, relevant area labels and exactly one priority.
 选择一个主要任务类型、相关 area 标签及唯一优先级。
 Priorities / 优先级: {json.dumps(queue['priorities'], ensure_ascii=False)}
@@ -119,17 +125,21 @@ Depends on: none
 <!-- State required data/decisions and recovery conditions; never include credentials. -->
 """
     tracking = """
+Task kind: plan
+
 ## Child issues and delivery plan / 子任务与交付计划
 
 - [ ] Link independently deliverable child issues / 链接可独立验收的子任务
 
 <!-- This is a tracking parent, not an executable task. Do not add execution
-authorization. / 此 Issue 只跟踪总体交付，不应添加执行授权标签。 -->
+authorization. Keep Task kind: plan or scope:plan; the queue rejects this parent
+even if authorized. / 此 Issue 只跟踪总体交付，不应添加执行授权标签；
+保留 Task kind: plan 或 scope:plan，误加授权也会被队列拒绝。 -->
 """
     definitions = (("devrelay-bug.md", "DevRelay bug / 问题修复", "Reproduce and fix a bounded bug / 复现并修复明确问题", "bug"),
                    ("devrelay-task.md", "DevRelay task / 工程任务", "One observable engineering deliverable / 一个可核验工程交付", "enhancement"),
                    ("devrelay-experiment.md", "DevRelay experiment / 有界实验", "Evidence and independent acceptance / 实验证据与独立验收", "experiment"),
-                   ("devrelay-plan.md", "DevRelay plan / 总体计划", "Track independent child deliveries / 跟踪独立子任务交付", "enhancement"))
+                   ("devrelay-plan.md", "DevRelay plan / 总体计划", "Track independent child deliveries / 跟踪独立子任务交付", PLAN_LABEL))
     result = {}
     controls = {name.casefold() for name in (queue["approval_label"], *queue["priorities"], *queue["blockers"])}
     for filename, name, about, label in definitions:

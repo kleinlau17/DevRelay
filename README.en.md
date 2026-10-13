@@ -2,9 +2,9 @@
 
 English | [简体中文](README.md)
 
-Move explicit development tasks to verified pull requests and optional automatic merges with Codex and a small project configuration.
+General engineering tools for agents: agents plan, explore and implement, while DevRelay provides isolated worktrees, project acceptance and gated delivery.
 
-DevRelay owns task selection, Git worktrees, Codex execution, acceptance evidence and PR delivery. Projects own setup commands and acceptance rules. Version 0.4 supports macOS / Linux, Python 3.11+ and Git, with no third-party runtime dependencies.
+The primary workflow is driven by an external agent calling `next/start/prepare/check/submit`; DevRelay records engineering state and verification evidence. `run/resume/watch` remain optional Codex orchestration. Projects own setup commands and acceptance rules. Version 0.4 supports macOS / Linux, Python 3.11+ and Git, with no third-party runtime dependencies.
 
 ## Install and onboard
 
@@ -15,7 +15,7 @@ python3 -m venv .venv
 .venv/bin/devrelay --help
 ```
 
-Alternatively, use `pipx install /path/to/DevRelay` for a global command. AI execution requires an installed, signed-in Codex CLI. GitHub tasks and PR submission also require authenticated `gh`. Existing authentication is reused; credential files are not read or copied.
+Alternatively, use `pipx install /path/to/DevRelay` for a global command. Engineering tools do not require Codex CLI; optional orchestration and AI review require an installed, signed-in Codex CLI. GitHub tasks and PR submission require authenticated `gh`. Existing authentication is reused; credential files are not read or copied.
 
 ```bash
 devrelay --project /path/to/project init
@@ -34,6 +34,7 @@ repository = "owner/project"
 base_branch = "main"
 
 [codex]
+# Optional orchestration and AI review; omit this table for engineering tools alone.
 sandbox = "workspace-write"
 max_attempts = 2
 
@@ -41,6 +42,27 @@ max_attempts = 2
 id = "test"
 argv = ["python3", "-m", "unittest", "discover", "-s", "tests"]
 ```
+
+## Primary workflow: agent-driven
+
+The external agent investigates goals, explores alternatives, defines independently verifiable tasks, implements and adjusts its plan from results. Explicitly authorized child tasks enter the existing queue; DevRelay provides engineering operations and delivery gates. Plans and experimental conclusions can live in Issues, task files and project artifacts.
+
+```bash
+devrelay --project /path/to/project next
+devrelay --project /path/to/project start 12
+devrelay --project /path/to/project prepare 12
+# The agent investigates, implements and repairs in the returned worktree.
+devrelay --project /path/to/project check 12
+devrelay --project /path/to/project submit 12
+```
+
+Call tools from the controller checkout and read worktree, state and evidence paths from JSON results. `start` only claims and creates or recovers the worktree. `prepare` runs all configured setup commands in an already claimed worktree without invoking a model. Each explicit call reruns setup and invalidates previous acceptance, AI review and merge-gate records while preserving historical logs; run `check` afterwards. Failed or interrupted preparation preserves work and logs; fix the cause and retry `prepare`. When setup is configured, missing, failed or stale preparation blocks acceptance and delivery. `check` never starts an implementation agent; the external agent inspects failures, repairs and checks again. `submit` defaults to a draft PR, but still advances explicitly configured automatic review/merge policy.
+
+Tasks with a local commit or an unmerged PR can run `prepare`, then `check/submit`, retaining their original branch and PR. Existing PRs are read back to verify repository, state, head and base. Closed, merged, actively merging or mismatched tasks reject preparation and require delivery recovery instead. Integrate the latest target base into the task branch after environment configuration changes. Submission rechecks title, body, authorization, source, configuration and base at commit, push, PR publication and readback boundaries. Observed drift stops progression while preserving commits, pushes and any read-back PR identity; revalidate to recover, without automatic rollback.
+
+The external host owns agent sessions, plans, experiment budgets and exclusive editing between tool calls. DevRelay's worker lock covers tool execution, not editing between calls; do not start `watch` for that repository at the same time. Recover by inspecting `status` and the actual worktree, then continue editing or retry the tool. `resume` is specific to optional DevRelay Codex orchestration and cannot resume an external agent's session.
+
+`doctor` checks engineering tools and configured AI delivery dependencies by default; enabling `auto_review` or `auto_merge` still requires Codex. Run `doctor --with-codex` before optional orchestration or explicit `review`. See the [agent workflow](docs/agent-workflow.md) for the complete operating agreement.
 
 ## GitHub queue
 
@@ -53,12 +75,17 @@ Defaults follow DexLab's management rules:
 | Dimension | Labels |
 |---|---|
 | Primary work type | `bug`, `enhancement`, `documentation`, `experiment`, `infrastructure` |
+| Overall plan | `scope:plan` (tracks children; rejected for execution) |
 | Relevant area | `area:backend`, `area:benchmark`, `area:cloth`, `area:contact`, `area:evaluation`, `area:hardware` |
 | Exactly one priority | `priority:P0` (urgent fixes), `priority:P1` (core delivery), `priority:P2` (extensions) |
 | Authorization | `auto:approved` |
 | Blockers | `blocked`, `needs-input` |
 
-Templates record evidence, scope, acceptance commands, one `Depends on: none` declaration, resources and recovery conditions. Bug, task and experiment templates pre-apply only the work type. The plan template tracks bounded child deliveries and explicitly excludes execution authorization on the parent. **Generated templates never automatically apply `auto:approved`, a configured authorization label, or a priority to new issues.** Creating a repository label does not authorize an issue. Maintainers separately select one priority and grant execution authorization after confirming the scope and acceptance; dependencies and blockers still apply.
+One issue delivers one observable, reviewable result. Keep the code, configuration, tests and documentation necessary for that result together. Split child issues only when they have independent value or acceptance criteria, not merely by file, layer or phase. Maintainers confirm this scope before authorization; implementation and AI review prompts carry the same rule. The queue does not automatically judge whether a natural-language task should be split.
+
+Templates record evidence, scope, acceptance commands, one `Depends on: none` declaration, resources and recovery conditions. Bug, task and experiment templates pre-apply only the work type. The plan template pre-applies `scope:plan` and includes `Task kind: plan` in its body to track child deliveries. **Generated templates never automatically apply `auto:approved`, a configured authorization label, or a priority to new issues.** Creating a repository label does not authorize an issue. Maintainers separately select one priority and grant execution authorization after confirming the scope and acceptance; dependencies and blockers still apply.
+
+Tracking parents carrying `scope:plan` or a standalone body line `Task kind: plan` are rejected even if accidentally authorized. The original template's `## Child issues and delivery plan / 子任务与交付计划` heading is also recognized. This applies to GitHub and local tasks, automatic selection and authorization for explicit-ID execution, resume and submission. A child's `Parent: #N` link does not affect eligibility; do not declare its tracking parent as a prerequisite that must be completed first. Maintainers must mark custom plans without these indicators; `init --sync-github` preserves existing templates rather than upgrading them.
 
 Existing label names, colors and descriptions, template files and other forms are preserved. Preserved project templates retain their own defaults and should be reviewed separately. Add project-specific area labels as needed. For already-onboarded projects or recovery after network/permission errors:
 
@@ -75,13 +102,13 @@ Tasks must be open, carry `auto:approved`, exactly one `priority:P0/P1/P2`, no `
 ```bash
 devrelay next
 devrelay start 12
-devrelay run 12
+devrelay prepare 12
 devrelay status
 devrelay check 12
 devrelay submit 12
 ```
 
-`next` explains selection and exclusions without claiming work; it reads GitHub and fetches the base. `start` creates or recovers a worktree. `run` handles one task, recovering interrupted work first when no ID is given; failed or blocked work returns `needs_attention` until explicitly addressed. Codex implements in `.devrelay/worktrees/ID`; DevRelay runs configured checks. Failed checks feed back into the same saved Codex session within `max_attempts`. External blockers are retained.
+`next` explains selection and exclusions without claiming work; it reads GitHub and fetches the base. Engineering tools and optional orchestration share the same task authorization, dependency and acceptance rules. An agent report does not replace current evidence produced by `check`.
 
 `submit` requires current verification evidence, commits, pushes and creates or updates a **draft PR**. `run --submit` combines the steps. A GitHub remote must resolve to exactly one fetch URL and one push URL, both targeting `project.repository`; SSH and HTTPS may be mixed. Multiple fetch/push URLs are rejected instead of allowing Git push fan-out. To bind the actual endpoint, `insteadOf` / `pushInsteadOf` URL rewrites affecting that remote are also rejected explicitly; configure the GitHub URLs directly. Git configuration is validated from the worktree that performs each transport, so branch- or path-conditional `includeIf` configuration cannot bypass the check. Submission and cleanup use an absolute-path transport argument that cannot select a named remote, bound to the validated URL in the same Git invocation. Neither a rewrite nor a URL-named remote alias added after validation can redirect or fan out the transport; existing credential and CA settings remain available. Submission records the configured remote/merge tracking settings directly even for single-branch clones, and updates the tracking reference selected by the existing fetch refspec rather than assuming `refs/remotes/<remote>/<branch>`. Cleanup uses the same mapping. By default delivery stops at draft; opt into review and merge below. PRs use `Refs #N`, preserving issue scope. DevRelay does not close whole issues, release, deploy or create background schedules.
 
@@ -91,15 +118,34 @@ Tracking updates after push and tracking cleanup use the first matching positive
 
 Transport preserves Git's `GIT_CONFIG_NOSYSTEM` boolean policy: `0`/`false` keeps the original system settings, while `1`/`true` disables them. Other Git boolean spellings are supported; invalid values stop the transport.
 
-## Continuous issue dispatch
+## Optional mode: Codex orchestration
+
+Explicitly invoke these commands when DevRelay should launch the implementation agent:
+
+```bash
+devrelay doctor --with-codex
+devrelay run 12             # Setup → Codex implementation → acceptance
+devrelay run 12 --submit    # Then deliver under the project policy
+devrelay resume 12          # Resume the saved DevRelay implementation session
+```
+
+`run` handles one task, recovering interrupted work first when no ID is given; failed or blocked work returns `needs_attention` until explicitly addressed. Codex implements in `.devrelay/worktrees/ID`; DevRelay runs configured checks. Failed checks feed back into the same saved Codex session within `max_attempts`. External blockers are retained.
+
+Do not let no-ID `run` or `watch` take over tasks still being edited by an external agent. Stop the previous executor and inspect the worktree before switching modes. Both paths use the same authorization, dependency, verification and delivery gates; an agent report does not replace current verification evidence.
+
+### Continuous issue dispatch
 
 Run from an onboarded GitHub project:
 
 ```bash
 devrelay --project /path/to/project watch
-# Change the empty-queue/merge interval, or stop after two deliveries:
+# Change the empty-queue interval, or stop after delivering two PRs:
 devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
 ```
+
+`--interval` is a shorter alias for `--poll-interval`, for example `watch --interval 30`; both accept positive integers and default to 60 seconds.
+
+`--limit` is a shorter alias for `--max-tasks`, for example `watch --limit 2`; both accept positive integers, with no task limit by default when omitted.
 
 `watch` serially claims authorized issues with integrated dependencies, ordered by configured priority and creation time. It implements, verifies, submits a draft PR and runs enabled independent read-only review. `[delivery] auto_merge` in the project's `.devrelay/config.toml` explicitly selects the delivery mode; it defaults to `false`, and the CLI does not enable authorization:
 
@@ -131,7 +177,7 @@ cleanup_branches = true
 Both automatic switches default to `false`. Review alone retains draft status. Automatic merge includes review, marks an approved draft ready and requests squash merging when gates pass. Named required checks prevent missing or not-yet-created CI from being ignored; all reported checks must also succeed. Skipped, neutral, failing and pending checks do not pass. No CI evidence blocks by default. Explicitly set `allow_no_ci = true` only for projects without GitHub CI; local acceptance, AI review and any named required checks still apply.
 
 ```bash
-devrelay run 12 --submit   # Implement → check → draft → review → merge → post-merge checks
+devrelay submit 12         # Verified implementation → draft → enabled review/merge policy
 devrelay review 12         # Explicit fresh, read-only AI review
 devrelay merge 12          # Requires auto_merge; recheck gates or recover a merge
 devrelay resume 12 --submit
@@ -144,6 +190,8 @@ Merge uses `--squash --match-head-commit SHA`, with no admin bypass. A successfu
 Before issuing the merge command, DevRelay persists `merge_request` with the head, base, source, configuration and task evidence. Queued requests are only read back, without repeated mutations; timeout/crash recovery also reads first. If the PR is still unmerged and neither a queue entry nor remote auto-merge exists, delivery blocks. Inspect GitHub, then explicitly use `devrelay merge ID --retry-request` to retry. This still requires current acceptance, independent review, authorization and all gates; an existing queued request only waits.
 
 Revoked authorization, changed configuration/evidence or blocking feedback on a queued request triggers an attempt to cancel the recorded remote auto-merge/queue entry and verify readback, saving `merge_cancellation`. Cancellation failures preserve a clear error and require removing the pending request on GitHub before recovery. `Ctrl+C`/`SIGTERM` retain queued requests for restart readback; GitHub may continue processing while the controller is stopped. Authorization checks, cancellation and remote merging can race: an already merged PR is recorded and stops for inspection; a completed remote merge cannot be cancelled.
+
+Crash recovery reads only the task’s direct, canonical review run and non-symlink evidence files. The successful process receipt must match its worktree, log and configured read-only review command. Missing, mismatched or out-of-scope evidence blocks recovery and requires explicit `review ID`; unrelated approvals are not reused and approval output stays in the owned run.
 
 After merge, DevRelay fetches the base, verifies commit ancestry and tree equality, then runs every setup/check command in a fresh detached worktree. Only successful acceptance records `completed`. API timeout recovery reads GitHub first and never re-merges an already merged PR. Unexpected trees or failed post-merge checks record `post_merge_failed`, retain evidence and failed worktrees, and block automatic dispatch without an ID. GitHub's head condition does not atomically lock the base, so pre-merge refresh and post-merge tree verification both matter. A post-merge failure needs maintainer remediation; DevRelay does not automatically revert a completed remote merge.
 
@@ -164,11 +212,14 @@ Cleanup errors record `cleanup_failed` separately from successful acceptance and
 ```bash
 devrelay init --provider local
 devrelay task add fix-1 --title "Fix a bounded issue" --file /path/to/task.md
-devrelay run fix-1
+devrelay start fix-1
+devrelay prepare fix-1
+# The external agent implements in the returned worktree.
+devrelay check fix-1
 devrelay submit fix-1 --local
 ```
 
-Adding a local task explicitly approves it; a missing dependency declaration becomes `Depends on: none`. Local dependencies may use `Depends on: #fix-1`. Local submission creates only a verified local commit. Integrate it into the configured base, then call `devrelay task complete fix-1` before dependent tasks can run. See the [task template](examples/task.md).
+Adding a local task explicitly approves it; a missing dependency declaration becomes `Depends on: none`. Local dependencies may use `Depends on: #fix-1`. Local submission creates only a verified local commit. Integrate it into the configured base, then call `devrelay task complete fix-1` before dependent tasks can run. Completion requires current verification matching the requirements and configuration, a worktree and HEAD matching the delivered commit and verified tree, and that commit in the target base ancestry. Newly verified content must also be submitted and integrated; failed completion does not unlock dependencies. See the [task template](examples/task.md).
 
 ## Evidence and recovery
 
@@ -188,7 +239,9 @@ SQLite state, a repository-wide worker lock, command logs, resource receipts, ve
 
 Ctrl+C and controller crashes cannot silently switch recovery to a new session. On timeout or interruption, DevRelay sends SIGTERM to the entire command process group, then sends SIGKILL if non-zombie members survive the bounded grace period and waits a bounded time for exit. It clears `active_process` only after the group is gone; a group that cannot be stopped retains the marker and blocks another worker. Every command launch, including automatic retries within the same worker, checks the previous marker. If that group is alive or a bounded inspection cannot confirm its exit, the launch is refused and the original marker is preserved.
 
-Session ownership includes saved IDs, retained implementation events (including uncheckpointed IDs after a controller crash), and review receipts/events under each task's run directory, even after acceptance or review is invalidated. Implementation recovery rejects other tasks' sessions and review sessions, including its own; unsafe or unreadable evidence blocks recovery without reading outside the repository's owned run directories.
+Session ownership includes saved IDs, retained implementation events (including uncheckpointed IDs after a controller crash), and review receipts/events under each task's run directory, even after acceptance or review is invalidated. Implementation recovery rejects other tasks' sessions and review sessions, including its own; unsafe or unreadable evidence blocks recovery. Reads remain within owned run directories except for the strictly validated legacy receipt described below.
+
+Completed legacy tasks may also reference `devrelay/integration/<32 lowercase hex characters>/review.json` in the Git common directory. This compatibility reader accepts only a non-symlink receipt that exactly matches the saved review and the completed task's PR URL and HEAD. It reserves the review session without changing the task or original evidence. Active tasks, mismatched or unreadable receipts, unknown layouts and symlinks still block recovery; arbitrary paths are never read.
 
 Ownership harvesting retains every known session reservation without validating other tasks' entire turns. A clearly identified truncated non-session message does not block unrelated recovery; damaged or ambiguous session events still block it. The recovering task's own log remains fully validated, so its incomplete or conflicting events cannot be bypassed.
 
@@ -198,13 +251,15 @@ New implementation runs record `events.jsonl.format.json` before launch and reta
 
 Acceptance commands are trusted project code. A zero exit code does not establish business correctness or independent review. Projects control scoring rules, official engine requirements and delivery authorization.
 
+The implementation session runs in a development sandbox; the controller runs all configured acceptance commands in its host environment. When implementation is ready but sandbox permissions prevent validation (such as `ps`, temporary-directory or filename access), the implementation policy directs Codex to report `ready` with the actual diagnostics in its summary. This does not claim acceptance or skip any check: host checks must still pass before submission. Genuine code defects must be fixed, and missing resources that prevent implementation remain blockers. The controller does not reinterpret or override a `blocked` result.
+
 Source, HEAD and recursive submodule cleanliness are checked after each acceptance command, before the next command can run, as well as at finalization. Post-merge acceptance applies the same checks after setup and between acceptance commands. A dirty submodule fails verification immediately, retaining its changes and command evidence; a later command cannot restore it to hide the mutation. These are command-boundary snapshots, not continuous monitoring of changes restored within a single command.
 
 ## Develop
 
 This repository's `.devrelay/config.toml` enables self-maintenance: approved GitHub Issues are implemented in isolated worktrees, verified with the full test suite, submitted as draft PRs, and reviewed in fresh read-only AI sessions. Automatic merge is disabled; run `devrelay merge ID` after merging to perform post-merge acceptance and cleanup.
 
-The self-maintenance executor is pinned to `gpt-6.1-sol`, verified with Codex CLI `0.162.1`. Upgrade an older CLI if it rejects this model. Changing the model configuration requires fresh acceptance and review of existing tasks.
+The optional self-maintenance executor and AI reviewer are pinned to `gpt-6.1-sol`, verified with Codex CLI `0.162.1`. Upgrade an older CLI if it rejects this model. Changing the model configuration requires fresh acceptance and review of existing tasks. The external agent's model is controlled by its host.
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v

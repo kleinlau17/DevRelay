@@ -67,28 +67,38 @@ class GitHubOnboardingTests(RepositoryTest):
         expected = {"bug", "enhancement", "documentation", "experiment", "infrastructure",
                     "area:backend", "area:benchmark", "area:cloth", "area:contact",
                     "area:evaluation", "area:hardware", "auto:approved", "priority:P0",
-                    "priority:P1", "priority:P2", "blocked", "needs-input"}
+                    "priority:P1", "priority:P2", "blocked", "needs-input", "scope:plan"}
         self.assertEqual(set(self.labels), expected)
         self.assertEqual(self.labels["bug"], original)
         self.assertEqual(result["labels"]["preserved"], ["bug"])
-        self.assertEqual(len(result["labels"]["created"]), 16)
+        self.assertEqual(len(result["labels"]["created"]), 17)
         self.assertEqual(len(result["templates"]["created"]), 4)
         for filename in result["templates"]["created"]:
             text = (self.root / filename).read_text()
             front, body = text.split("---\n", 2)[1:]
             label = json.loads(next(line.removeprefix("labels: ") for line in front.splitlines()
                                     if line.startswith("labels: ")))
-            self.assertIn(label, ("bug", "enhancement", "experiment"))
+            self.assertIn(label, ("bug", "enhancement", "experiment", "scope:plan"))
             self.assertNotIn("auto:approved", front)
             self.assertEqual(len(re.findall(r"^Depends on:", body, re.M)), 1)
             self.assertIn("Depends on: none", body)
+            self.assertIn("One issue delivers one observable, reviewable result", body)
+            self.assertIn("Split child issues only for independent value or acceptance criteria", body)
             task = {"id": "12", "title": "New task", "body": body, "labels": [label, "priority:P1"],
                     "open": True, "created_at": "2026-10-10"}
             report = queue_report(self.config, Snapshot([task], set(), set()))
             self.assertIsNone(report["selected"])
             self.assertIn("Missing auto:approved", report["excluded"][0]["reasons"])
             task["labels"].append("auto:approved")
-            self.assertEqual(queue_report(self.config, Snapshot([task], set(), set()))["selected"]["id"], "12")
+            authorized = queue_report(self.config, Snapshot([task], set(), set()))
+            if filename.endswith("devrelay-plan.md"):
+                self.assertIsNone(authorized["selected"])
+                self.assertIn("Tracking plan parents are not executable", str(authorized["excluded"]))
+                # Removing only the label must not turn a tracking parent into work.
+                task["labels"].remove("scope:plan")
+                self.assertIsNone(queue_report(self.config, Snapshot([task], set(), set()))["selected"])
+            else:
+                self.assertEqual(authorized["selected"]["id"], "12")
         self.assertIn("tracking parent", (self.root / ".github/ISSUE_TEMPLATE/devrelay-plan.md").read_text())
 
     def test_repeat_sync_preserves_custom_templates_config_ignore_rules_and_labels(self):
@@ -211,9 +221,10 @@ class GitHubOnboardingTests(RepositoryTest):
         self.assertIn("waiting", self.labels)
         self.assertNotIn("auto:approved", self.labels)
         self.assertEqual(len(result["templates"]["created"]), 4)
-        for text in templates(config).values():
+        for filename, text in templates(config).items():
             front = text.split("---\n", 2)[1]
-            self.assertIn('labels: ""', front)
+            expected = 'labels: "scope:plan"' if filename == "devrelay-plan.md" else 'labels: ""'
+            self.assertIn(expected, front)
             self.assertIn('Authorization / 执行授权: "enhancement"', text)
 
     def test_archived_or_differently_spelled_queue_labels_require_maintainer_resolution(self):

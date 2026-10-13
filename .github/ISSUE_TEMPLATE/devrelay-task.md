@@ -7,6 +7,10 @@ assignees: ''
 ---
 
 <!-- Maintainer triage / 维护者分诊:
+One issue delivers one observable, reviewable result. Keep its required code, config, tests and docs together.
+一个 Issue 对应一个可观察、可审查结果；实现该结果所需的代码、配置、测试和文档放在一起。
+Split child issues only for independent value or acceptance criteria, not merely by file, layer or phase.
+只有具备独立价值或验收标准才拆子项，不仅按文件、层或阶段拆分。
 Choose one primary work type, relevant area labels and exactly one priority.
 选择一个主要任务类型、相关 area 标签及唯一优先级。
 Priorities / 优先级: ["priority:P0", "priority:P1", "priority:P2"]

@@ -1,4 +1,4 @@
-"""JSON-output CLI for project onboarding, task runs and continuous dispatch."""
+"""JSON engineering tools for agents, with optional Codex orchestration."""
 
 import argparse
 import json
@@ -14,13 +14,15 @@ from .errors import RelayError
 from .git import has_ref, repository_root, validate_remote, worktrees
 from .onboarding import setup_github
 from .providers import add_local, queue_report, snapshot
-from .runner import complete_local, run_task, start, submit, verify
+from .runner import complete_local, prepare_task, run_task, start, submit, verify
 from .state import State
 from .worker import watch
 
 
 def parser():
-    root = argparse.ArgumentParser(prog="devrelay", description="Codex-powered, verified issue-to-PR development")
+    root = argparse.ArgumentParser(
+        prog="devrelay", description="Agent-driven engineering tools with verified delivery gates",
+        epilog="Agents use next/start/prepare/check/submit. Optional Codex orchestration: run/resume/watch.")
     root.add_argument("--version", action="version", version=__version__)
     root.add_argument("--project", type=Path, default=Path.cwd(), help="Project directory (default: current directory)")
     sub = root.add_subparsers(dest="command", required=True)
@@ -29,7 +31,9 @@ def parser():
     init.add_argument("--base", help="Target branch; detected from origin/HEAD, main, master or current branch")
     init.add_argument("--sync-github", action="store_true",
                       help="Add missing GitHub labels/templates using existing configuration; do not overwrite it")
-    sub.add_parser("doctor", help="Check configuration, tools, login and base")
+    diagnostics = sub.add_parser("doctor", help="Check engineering tools and configured delivery requirements")
+    diagnostics.add_argument("--with-codex", action="store_true",
+                             help="Also check Codex CLI/login for optional run/resume/watch orchestration")
     sub.add_parser("next", help="Explain eligible tasks and exclusions; does not claim work")
     sub.add_parser("status", help="Read local task state and evidence locations")
     task = sub.add_parser("task", help="Manage explicit local tasks").add_subparsers(dest="task_command", required=True)
@@ -40,11 +44,12 @@ def parser():
     add.add_argument("--priority", default="priority:P1")
     task.add_parser("list", help="List local task state")
     task.add_parser("complete", help="Mark a local task complete after integration into the base").add_argument("id")
-    for name in ("start", "check", "submit", "resume", "review", "merge"):
+    for name in ("start", "prepare", "check", "submit", "resume", "review", "merge"):
         item = sub.add_parser(name, help={"start": "Claim a task and create or recover its worktree",
+                                         "prepare": "Run project setup in a claimed worktree without invoking a model",
                                          "check": "Run configured acceptance and save exact-source evidence",
                                          "submit": "Commit verified changes and create/update a draft PR",
-                                         "resume": "Continue one saved worktree and its exact Codex session",
+                                         "resume": "Optional orchestration: continue a saved Codex implementation session",
                                          "review": "Review a submitted PR in a fresh read-only Codex session",
                                          "merge": "Apply enabled merge gates and verify the merged commit"}[name])
         item.add_argument("id")
@@ -55,13 +60,13 @@ def parser():
                               help="Explicitly retry a saved merge request only after remote queue/auto-merge is absent")
         if name == "resume":
             item.add_argument("--submit", action="store_true", help="Submit a draft PR after checks pass")
-    run = sub.add_parser("run", help="Implement and verify one task, recovering interrupted work first")
+    run = sub.add_parser("run", help="Optional orchestration: invoke Codex to implement and verify one task")
     run.add_argument("id", nargs="?")
     run.add_argument("--submit", action="store_true", help="Submit a draft PR after checks pass")
-    worker = sub.add_parser("watch", help="Continuously deliver authorized GitHub issues using configured review/merge policy")
-    worker.add_argument("--poll-interval", type=positive_integer, default=60,
+    worker = sub.add_parser("watch", help="Optional orchestration: serial Codex tasks through configured delivery policy")
+    worker.add_argument("--poll-interval", "--interval", type=positive_integer, default=60,
                         help="Seconds between empty-queue and merge-gate polls (default: 60)")
-    worker.add_argument("--max-tasks", type=positive_integer,
+    worker.add_argument("--max-tasks", "--limit", type=positive_integer,
                         help="Stop after this many deliveries (post-merge acceptance in auto mode; default: keep watching)")
     return root
 
@@ -83,14 +88,16 @@ def probe(argv, cwd):
         return False
 
 
-def doctor(config):
+def doctor(config, *, with_codex=False):
     executable = config.data["codex"]["executable"]
     checks = [{"id": "git", "ok": shutil.which("git") is not None},
               {"id": "base", "ok": has_ref(config.root, config.base_ref), "value": config.base_ref},
               {"id": "acceptance", "ok": bool(config.data["checks"]), "count": len(config.data["checks"])},
-              {"id": "codex", "ok": shutil.which(executable) is not None},
-              {"id": "codex_login", "ok": probe([executable, "login", "status"], config.root)},
               {"id": "git_identity", "ok": probe(["git", "var", "GIT_AUTHOR_IDENT"], config.root)}]
+    codex_required = with_codex or config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]
+    if codex_required:
+        checks += [{"id": "codex", "ok": shutil.which(executable) is not None},
+                   {"id": "codex_login", "ok": probe([executable, "login", "status"], config.root)}]
     if config.provider == "github":
         try:
             validate_remote(config)
@@ -101,7 +108,9 @@ def doctor(config):
                    {"id": "github_login", "ok": probe(["gh", "auth", "status", "--hostname", "github.com"], config.root)},
                    {"id": "remote_matches_repository", "ok": matches}]
     return {"ready": all(item["ok"] for item in checks), "provider": config.provider,
-            "checks": checks, "notes": ["Login checks do not call a model or verify model access.",
+            "checks": checks, "codex_required": codex_required,
+            "notes": ["Use doctor --with-codex before optional run/resume/watch or explicit AI review.",
+                      "Login checks do not call a model or verify model access.",
                                          "Review setup and acceptance commands before execution."]}
 
 
@@ -138,7 +147,7 @@ def main(argv=None):
         else:
             config = load(root)
             if args.command == "doctor":
-                result = doctor(config)
+                result = doctor(config, with_codex=args.with_codex)
                 print(json.dumps(result, indent=2, ensure_ascii=False))
                 return 0 if result["ready"] else 1
             elif args.command in ("status", "task") and (args.command == "status" or args.task_command == "list"):
@@ -158,6 +167,8 @@ def main(argv=None):
                         result = complete_local(config, state, args.id)
                     elif args.command == "start":
                         result = start(config, state, args.id)
+                    elif args.command == "prepare":
+                        result = prepare_task(config, state, args.id)
                     elif args.command == "check":
                         result = verify(config, state, args.id)
                     elif args.command == "submit":
@@ -174,7 +185,8 @@ def main(argv=None):
         print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print(json.dumps({"error": "Interrupted; saved work is retained. Use devrelay status and resume."}), file=sys.stderr)
+        print(json.dumps({"error": "Interrupted; saved work is retained. Inspect devrelay status; "
+                                   "retry the engineering tool, or resume a DevRelay-managed Codex task."}), file=sys.stderr)
         return 130
     finally:
         if state:

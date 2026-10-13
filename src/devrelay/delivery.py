@@ -11,7 +11,7 @@ from .errors import RelayError
 from .git import command, git, is_ancestor, source_tree, validate_remote
 from .process import execute
 from .providers import authorized, gh, task_id
-from .runner import assert_config, base_commit, claimed_task
+from .runner import assert_config, base_commit, claimed_task, require_prepared
 from .state import now
 
 
@@ -94,6 +94,7 @@ def current_review(task, config):
 
 def open_evidence(config, state, task, pull):
     assert_config(config)
+    require_prepared(config, task)
     fresh = authorized(config, state, task["id"])
     record = task.get("verification") or {}
     path = Path(task["worktree"])
@@ -120,17 +121,19 @@ def review(config, state, identifier, *, recover=False):
         pull = pull_snapshot(config, task)
         open_evidence(config, state, task, pull)
         if recover:
-            directory = Path(task.get("review_run", ""))
-            expected = state.directory / "runs" / task["id"]
-            if (directory.parent != expected or not directory.name.endswith("-review")
-                    or task.get("review_identity") != identity(task, config)):
+            if task.get("review_identity") != identity(task, config):
                 raise RelayError("Saved review identity is missing or stale; explicitly review again")
+            directory = codex.review_directory(state, task, Path(task.get("review_run", "")))
             try:
-                receipt = json.loads((directory / "events.jsonl.receipt.json").read_text())
-                if (not isinstance(receipt, dict) or receipt.get("returncode") != 0
-                        or receipt.get("timed_out") is not False):
-                    raise ValueError("Review process did not succeed")
-                result = codex.read_review(task, directory)
+                receipt_path = codex.review_file(state, task, directory, "events.jsonl.receipt.json")
+                receipt = json.loads(receipt_path.read_text())
+                if (not isinstance(receipt, dict) or type(receipt.get("returncode")) is not int
+                        or receipt["returncode"] != 0 or receipt.get("timed_out") is not False
+                        or receipt.get("cwd") != task["worktree"]
+                        or receipt.get("log") != str(directory / "events.jsonl")
+                        or receipt.get("argv") != codex.build_command(config, directory, sandbox="read-only")):
+                    raise ValueError("Review process receipt does not match this successful review run")
+                result = codex.read_review(state, task, directory)
             except (OSError, ValueError) as error:
                 raise RelayError("Interrupted review has no complete evidence; explicitly review again") from error
         else:
@@ -141,7 +144,7 @@ def review(config, state, identifier, *, recover=False):
             result = codex.review(config, state, task, directory)
         open_evidence(config, state, task, pull_snapshot(config, task))
         record = {**result, **identity(task, config), "finished_at": now()}
-        receipt = directory / "review.json"
+        receipt = codex.review_file(state, task, directory, "review.json")
         receipt.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
         task.update(review=record, review_path=str(receipt),
                     status="reviewed" if result["verdict"] == "approve" else "review_blocked")

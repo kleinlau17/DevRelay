@@ -14,6 +14,8 @@ priorities = ["priority:P0", "priority:P1", "priority:P2"]
 blockers = ["blocked", "needs-input"]
 
 [codex]
+# Optional run/resume/watch and AI review only. External agents use their own host/model;
+# omit this table when using only next/start/prepare/check/submit with AI delivery disabled.
 executable = "codex"
 sandbox = "workspace-write"
 timeout_seconds = 1800
