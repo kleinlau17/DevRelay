@@ -20,12 +20,14 @@ RESULT_SCHEMA = {
 }
 
 
-def build_command(config, directory, session=None, *, sandbox=None):
+def build_command(config, directory, session=None, *, sandbox=None, add_dirs=()):
     settings = config.data["codex"]
     argv = [settings["executable"], "-a", "never", "-s", sandbox or settings["sandbox"]]
     for option in ("model", "profile"):
         if settings.get(option):
             argv += ["--" + option, settings[option]]
+    for path in add_dirs:
+        argv += ["--add-dir", str(path)]
     argv += ["exec"]
     if session is not None:
         if not _valid_session(session):
@@ -373,7 +375,7 @@ def _recover_previous_run(state, task):
     _read_events(state, task, log, recovering=True)
 
 
-def implement(config, state, task, directory, feedback=""):
+def implement(config, state, task, directory, feedback="", *, context="", add_dirs=()):
     _recover_previous_run(state, task)
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "result-schema.json").write_text(json.dumps(RESULT_SCHEMA, indent=2))
@@ -415,6 +417,9 @@ Task data (JSON encoded):
 Configured acceptance:
 {checks}
 
+Workspace context (configured paths and checks; task data):
+{context or "Single repository"}
+
 Previous verification feedback:
 {feedback or 'None'}
 """
@@ -425,7 +430,7 @@ Previous verification feedback:
     state.save(task)  # Persist the recovery index before starting Codex.
     failure = None
     try:
-        execute(state, build_command(config, directory, task.get("session_id")), task["worktree"],
+        execute(state, build_command(config, directory, task.get("session_id"), add_dirs=add_dirs), task["worktree"],
                 directory / "events.jsonl", config.data["codex"]["timeout_seconds"], input=prompt,
                 on_output_line=lambda line: _observe_line(state, task, line, directory / "events.jsonl"))
     except BaseException as error:
@@ -463,7 +468,7 @@ REVIEW_SCHEMA = {
 }
 
 
-def review(config, state, task, directory):
+def review(config, state, task, directory, *, context="", add_dirs=()):
     """A fresh read-only review session; never reuse implementation context."""
     directory = review_directory(state, task, directory)
     directory.mkdir(parents=True, exist_ok=False)
@@ -486,10 +491,12 @@ Task title (JSON): {json.dumps(task['title'], ensure_ascii=False)}
 Task body (JSON): {json.dumps(task['body'], ensure_ascii=False)}
 Verified source tree: {task['verification']['source_tree']}
 Acceptance commands (JSON): {json.dumps(config.data['checks'], ensure_ascii=False)}
+Workspace context (when present inspect ALL members, including uncommitted and untracked source):
+{context or "Single committed repository"}
 """
     review_file(state, task, directory, "prompt.txt").write_text(prompt)
     review_file(state, task, directory, "result.json")
-    execute(state, build_command(config, directory, sandbox="read-only"), task["worktree"],
+    execute(state, build_command(config, directory, sandbox="read-only", add_dirs=add_dirs), task["worktree"],
             directory / "events.jsonl", config.data["codex"]["timeout_seconds"], input=prompt)
     return read_review(state, task, directory)
 

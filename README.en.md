@@ -6,6 +6,21 @@ General engineering tools for agents: agents plan, explore and implement, while 
 
 The primary workflow is driven by an external agent calling `next/start/prepare/check/submit`; DevRelay records engineering state and verification evidence. `run/resume/watch` remain optional Codex orchestration. Projects own setup commands and acceptance rules. Version 0.4 supports macOS / Linux, Python 3.11+ and Git, with no third-party runtime dependencies.
 
+## Multi-repository autodev MVP
+
+One authorized outcome can coordinate multiple repositories through an explicit
+workspace manifest, run member and joint acceptance, and deliver linked draft PRs.
+`run/resume` uses one implementation session and bounded check/independent-review
+repair loops. This MVP delivers drafts only, with no automatic merge. See
+[workspace operation and recovery](docs/workspace.md) and the
+[configuration example](examples/workspace.toml). Existing `--project` behavior remains.
+
+```bash
+devrelay --workspace /path/workspace.toml task add terrain-edit --title "Local terrain edit" --file /path/task.md
+devrelay --workspace /path/workspace.toml run terrain-edit --submit
+```
+
+
 ## Install and onboard
 
 ```bash

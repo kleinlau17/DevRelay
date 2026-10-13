@@ -121,3 +121,12 @@ DevRelay 不检测任意外层 Agent；`resume` 只恢复 DevRelay 自己启动�
 The optional adapter recovers a completed review checkpoint only from canonical, task-owned, non-symlink evidence matching the successful configured read-only process. Missing or mismatched evidence requires explicit `review ID`; this does not resume the external host’s session. Automatic merge remains an explicit project opt-in, defaulting to false.
 
 可选编排仅从实际归属本任务、无符号链接且与成功只读审查进程匹配的证据恢复完整审查检查点。证据缺失或不符需显式 `review ID`；这不会恢复外层宿主会话。自动合并仍须由项目显式开启，默认关闭。
+
+## Multi-repository outcomes / 多仓业务结果
+
+Use `--workspace manifest.toml` for one authorized result spanning repositories.
+Member work units share task requirements and joint verification; they are not
+independent product tasks. See [workspace commands and recovery](workspace.md).
+
+同一业务结果涉及多仓时使用 --workspace；成员工作单元共用要求与联合验收，无需按仓
+拆成独立业务需求。操作与恢复见上述文档。
