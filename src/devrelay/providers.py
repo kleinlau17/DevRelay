@@ -10,6 +10,18 @@ from .state import now
 
 
 ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
+PLAN_LABEL = "scope:plan"
+
+
+def is_tracking_parent(task):
+    """Recognize explicit plan markers, including the original DevRelay template."""
+    if PLAN_LABEL in {label.casefold() for label in task["labels"]}:
+        return True
+    return bool(re.search(
+        r"^(?:Task kind:[ \t]*plan[ \t]*\r?$|"
+        r"##[ \t]+Child issues and delivery plan(?:[ \t]*/[ \t]*子任务与交付计划)?[ \t]*\r?$)",
+        task["body"], re.M | re.I,
+    ))
 
 
 def task_id(value):
@@ -133,6 +145,8 @@ def queue_report(config, view, *, exclude_claimed=True):
             continue
         labels = set(task["labels"])
         reasons = []
+        if is_tracking_parent(task):
+            reasons.append("Tracking plan parents are not executable; authorize independently deliverable child issues")
         if queue["approval_label"] not in labels:
             reasons.append(f"Missing {queue['approval_label']}")
         reasons.extend(label for label in queue["blockers"] if label in labels)
