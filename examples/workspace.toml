@@ -1,0 +1,43 @@
+# Run from any directory with: devrelay --workspace /absolute/path/workspace.toml ...
+# Runtime is kept beside this manifest in .devrelay/workspace-runtime/<manifest-stem>/.
+# Keep this configuration in version control; ignore the runtime directory.
+[codex]
+sandbox = "workspace-write"
+timeout_seconds = 1800
+max_attempts = 2
+# model/profile are optional; defaults follow the user's existing Codex configuration.
+
+[[repositories]]
+key = "backend"
+path = "../../backend"
+[repositories.project]
+provider = "github"
+repository = "owner/backend"
+base_branch = "dev"
+[[repositories.setup]]
+id = "install"
+argv = ["uv", "sync", "--frozen"]
+[[repositories.checks]]
+id = "test"
+argv = ["uv", "run", "pytest", "-q"]
+
+[[repositories]]
+key = "frontend"
+path = "../../frontend"
+[repositories.project]
+provider = "github"
+repository = "owner/frontend"
+base_branch = "dev"
+[[repositories.setup]]
+id = "install"
+argv = ["npm", "ci"]
+[[repositories.checks]]
+id = "check"
+argv = ["npm", "run", "check"]
+
+[[checks]]
+id = "joint-contract"
+cwd = "frontend"
+# This project-owned script uses DEVRELAY_WORKTREE_BACKEND/FRONTEND and fails when absent.
+argv = ["node", "scripts/check-backend-contract.mjs"]
+timeout_seconds = 600

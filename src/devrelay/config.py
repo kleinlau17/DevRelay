@@ -61,6 +61,11 @@ def load(root):
         data = tomllib.loads(path.read_text())
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise RelayError(f"Cannot read {path}; run devrelay init: {error}") from error
+    return validate(root, data)
+
+
+def validate(root, data):
+    """Validate explicit configuration without running discovery or writing files."""
     _keys(data, ("project", "queue", "codex", "delivery", "setup", "checks"), "configuration")
     project = _table(data, "project")
     _keys(project, ("provider", "base_branch", "remote", "branch_prefix", "repository"), "project")

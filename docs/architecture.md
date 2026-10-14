@@ -26,12 +26,13 @@ the actual delivered commit and its integration, rather than an older ancestor a
 `run/resume/watch` are optional adapters that launch Codex and manage its implementation
 session. They are explicitly invoked, not required for engineering tools. AI review is
 also optional and currently uses Codex. `doctor` only checks Codex when requested with
-`--with-codex` or required by enabled automatic delivery. No planning scheduler or
-second task database is introduced; Issues and task files carry plans and requirements.
+`--with-codex` or required by enabled automatic delivery. No planning scheduler is introduced; Issues and task files carry plans and requirements.
+An explicit workspace registers its task once in workspace state; member repository
+state stores reservations, not duplicate task requirements.
 
 `run/resume/watch` 是显式调用的可选 Codex 编排，管理它启动的实现会话；工程工具不依赖
 该路径。可选 AI 审查当前也使用 Codex。`doctor` 仅在指定 `--with-codex` 或启用自动 AI
-交付时检查 Codex。计划与要求由 Issues 和任务文件承载，不增加规划调度器或第二套任务库。
+交付时检查 Codex。计划与要求由 Issues 和任务文件承载，不增加规划调度器；多仓任务只在工作区状态登记一次，各仓状态只保存占用。
 
 ## Responsibilities / 职责
 
@@ -45,6 +46,7 @@ second task database is introduced; Issues and task files carry plans and requir
 | `codex` | Optional implementation/review adapter, explicit sessions and structured outcomes / 可选实现与审查适配器、精确会话与结构化结果 |
 | `process` | Timeout, process groups and unique receipts / 超时、进程组与独立回执 |
 | `runner` | Agent-callable claim/setup/check/submit plus optional implementation loop / Agent 工程操作与可选实现循环 |
+| `workspace` | Explicit multi-repository tasks, joint acceptance, reservations and linked drafts / 多仓任务、联合验收、占用与关联草稿 |
 | `worker` | Optional serial Codex dispatch with configured delivery and recovery / 可选串行 Codex 调度、配置的交付策略与恢复 |
 | `delivery` | Fresh AI review, GitHub merge gates, post-merge acceptance / 审查、合并门禁及合并后验收 |
 | `cleanup` | Opt-in exact-ref cleanup after acceptance, durable recovery / 验收后清理与恢复 |
@@ -96,7 +98,8 @@ State is saved before long-running phases. Main-checkout configuration controls 
 - Cleanup defaults off for task resources. Successful acceptance scratch trees are removed; failed trees/evidence remain. Optional task worktree and exact-head branch cleanup checkpoints each step; recovery reads actual refs without assuming the original checkout still exists.
 - Remote deletion uses an explicit expected SHA lease; local/remote-tracking ref deletion uses compare-and-swap. Worktree removal is never forced. Git operations outside DevRelay still require coordination with the repository worker.
 - Completed GitHub tasks stay claimed in shared state even after their branches/worktrees are removed, preventing repeat dispatch of still-open scoped Issues.
-- No OS service installer, remote compute adapter, automatic conflict resolution, release adapter or cross-repository transaction. Continuous issue dispatch is explicitly started with `watch`; it does not create background schedules.
+- Explicit multi-repository workspaces reuse per-repository locks, source hashing, command execution and Codex sessions. A workspace receipt binds all participating sources and draft PR checkpoints; see [workspace MVP](workspace.md).
+- No OS service installer, remote compute adapter, automatic conflict resolution, release adapter or atomic cross-repository transaction. Continuous issue dispatch is explicitly started with `watch`; it does not create background schedules.
 - Project commands may require services, credentials or hardware; DevRelay does not provision them.
 - Process markers detect remaining foreground groups after controller crashes. Commands must not daemonize or escape the group. There is a brief spawn-to-marker crash window; this is cooperative recovery, not an OS isolation guarantee.
 

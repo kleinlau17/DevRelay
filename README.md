@@ -6,6 +6,22 @@
 
 主要工作流由外层 Agent 驱动，逐步调用 `next/start/prepare/check/submit`；DevRelay 管理工程状态和验收证据。`run/resume/watch` 保留为可选的 Codex 程序编排。项目负责定义安装命令与验收规则。0.4 版支持 macOS / Linux、Python 3.11+ 和 Git；核心没有第三方运行依赖。
 
+## 多仓 autodev MVP
+
+一个业务任务可通过显式工作区配置协调多个仓库，执行各仓检查和联合验收，并交付互相
+关联的草稿 PR。`run/resume` 使用一个实现会话并在有界循环内根据检查/独立审查结果回修。
+本版仅草稿交付，不自动合并。详见 [多仓使用与恢复](docs/workspace.md) 和
+[工作区配置](examples/workspace.toml)。原有 `--project` 单仓工作流不变。
+每轮验收保留独立且绑定摘要的日志/产物；进入独立审查后，回修必须重新获批。
+部分发布按远端提交检查点恢复；已交付任务的 `submit` 只重试占用释放。
+确认推送后清除其恢复意图，外部回退会阻止发布；仓内与联合检查分别保存日志，允许同名 ID。
+
+```bash
+devrelay --workspace /path/workspace.toml task add terrain-edit --title "地形局部编辑" --file /path/task.md
+devrelay --workspace /path/workspace.toml run terrain-edit --submit
+```
+
+
 ## 安装
 
 ```bash

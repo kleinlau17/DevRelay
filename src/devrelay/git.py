@@ -1,9 +1,11 @@
 """Git operations that preserve the caller's working tree and index."""
 
 from contextlib import contextmanager
+import hashlib
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 
@@ -94,6 +96,9 @@ def _submodule_heads(root, paths):
 
 
 def _submodule_content_matches_head(root):
+    algorithm = _evidence_git(root, "rev-parse", "--show-object-format")
+    if algorithm not in ("sha1", "sha256"):
+        raise RelayError("Unsupported Git object format for submodule evidence")
     for entry in _evidence_git(root, "ls-tree", "-r", "-z", "HEAD", text=False).split(b"\0"):
         if not entry:
             continue
@@ -108,15 +113,35 @@ def _submodule_content_matches_head(root):
                 link_target = os.readlink(os.fsencode(target))
             except OSError as error:
                 raise RelayError(f"Cannot read submodule symlink {path}: {error}") from error
-            if _evidence_git(root, "hash-object", "--no-filters", "--stdin", input=link_target,
-                             text=False).strip() != object_id:
+            digest = hashlib.new(algorithm, usedforsecurity=False)
+            digest.update(b"blob " + str(len(link_target)).encode() + b"\0" + link_target)
+            if digest.hexdigest().encode() != object_id:
                 return False
             continue
         if mode not in (b"100644", b"100755"):
             continue
         if target.is_symlink() or not target.is_file():
             return False
-        if _evidence_git(root, "hash-object", "--no-filters", "--", path, text=False).strip() != object_id:
+        # Hash raw blob bytes in-process. Do not trust the index stat cache, Git
+        # filters or assume-unchanged flags. One Git process per file is prohibitive
+        # for large pinned submodules used in joint evidence snapshots.
+        try:
+            descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    return False
+                digest = hashlib.new(algorithm, usedforsecurity=False)
+                digest.update(b"blob " + str(metadata.st_size).encode() + b"\0")
+                count = 0
+                while chunk := stream.read(1024 * 1024):
+                    count += len(chunk)
+                    digest.update(chunk)
+                if count != metadata.st_size:
+                    return False
+        except OSError as error:
+            raise RelayError(f"Cannot hash raw submodule source {path}: {error}") from error
+        if digest.hexdigest().encode() != object_id:
             return False
     return True
 

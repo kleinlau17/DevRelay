@@ -41,8 +41,8 @@ def group_alive(group, timeout=None):
 
 
 class State:
-    def __init__(self, root):
-        self.directory = common_dir(root) / "devrelay"
+    def __init__(self, root, *, directory=None):
+        self.directory = Path(directory) if directory is not None else common_dir(root) / "devrelay"
         self.directory.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.directory / "state.sqlite3", timeout=10)
         self.connection.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
@@ -76,13 +76,16 @@ class State:
                                     (key, json.dumps(value)))
 
     @contextmanager
-    def lock(self):
+    def lock(self, *, owner=None):
         with (self.directory / "worker.lock").open("a+") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise RelayError("Another DevRelay worker holds this repository's lock") from error
             try:
+                reservation = self.metadata("workspace_owner")
+                if reservation and reservation != owner:
+                    raise RelayError("Repository is reserved by a multi-repository task; inspect workspace status")
                 active = self.metadata("active_process")
                 if active and group_alive(active["group"]):
                     raise RelayError(f"Previous command still runs in process group {active['group']}; wait for it to finish")
