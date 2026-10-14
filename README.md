@@ -14,6 +14,7 @@
 [工作区配置](examples/workspace.toml)。原有 `--project` 单仓工作流不变。
 每轮验收保留独立且绑定摘要的日志/产物；进入独立审查后，回修必须重新获批。
 部分发布按远端提交检查点恢复；已交付任务的 `submit` 只重试占用释放。
+确认推送后清除其恢复意图，外部回退会阻止发布；仓内与联合检查分别保存日志，允许同名 ID。
 
 ```bash
 devrelay --workspace /path/workspace.toml task add terrain-edit --title "地形局部编辑" --file /path/task.md

@@ -356,6 +356,14 @@ class WorkspaceTest(RepositoryTest):
         self.manifest.write_text(self.manifest.read_text().replace('key = "bp"', 'key = "workspace"'))
         self.assertEqual(self.invoke("doctor")[0], 1)
 
+    def test_member_and_joint_checks_with_same_id_retain_distinct_logs(self):
+        self.manifest.write_text(self.manifest.read_text().replace('id = "integration"',
+            'id = "contract"\ncwd = "bp"'))
+        task = self.fixed()
+        receipts = task['verification']['checks']
+        self.assertEqual(len({r['log'] for r in receipts}), 3)
+        self.assertTrue(all(Path(r['log']).is_file() for r in receipts))
+
     def test_branch_creation_interruption_recovers_only_owned_base(self):
         self.add_task()
         real = ws.git
@@ -437,6 +445,25 @@ class WorkspaceTest(RepositoryTest):
         self.assertNotEqual(old, result['members']['bp']['published_head'])
         self.assertEqual(sum(1 for repo, args in service['calls'] if repo == 'example/bp' and args[:2] == ('pr', 'create')), 1)
         self.assertFalse(any(args[:2] == ('pr', 'merge') for _, args in service['calls']))
+
+    def test_confirmed_publication_rewind_blocks_before_any_mutation(self):
+        with self.remote_delivery() as (space, state, task, service, remotes):
+            service['fail_create'] = 'example/pro'
+            with ws.member_locks(space, task) as states:
+                with self.assertRaisesRegex(RelayError, 'API publication failed'):
+                    ws.submit(space, state, task, states)
+                earlier = task['members']['bp']['published_head']
+                Path(task['members']['bp']['worktree'], 'repair.txt').write_text('verified repair')
+                ws.check(space, state, task)
+                with self.assertRaisesRegex(RelayError, 'API publication failed'):
+                    ws.submit(space, state, task, states)
+                self.assertNotEqual(earlier, task['members']['bp']['published_head'])
+                self.git('update-ref', 'refs/heads/' + task['members']['bp']['branch'], earlier,
+                         cwd=remotes[self.root])
+                with patch('devrelay.workspace.git', wraps=ws.git) as calls:
+                    with self.assertRaisesRegex(RelayError, 'identity changed'):
+                        ws.submit(space, state, task, states)
+                self.assertFalse(any(call.args[1] in ('push', 'commit') for call in calls.call_args_list))
 
     def test_uncertain_create_closed_draft_stops_before_any_push(self):
         with self.remote_delivery() as (space, state, task, service, remotes):

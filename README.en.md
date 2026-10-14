@@ -17,6 +17,8 @@ repair loops. This MVP delivers drafts only, with no automatic merge. See
 Each acceptance round retains separate, digest-bound logs/artifacts; once independent
 review starts, repairs require fresh approval. Partial publication uses remote commit
 checkpoints. For delivered tasks, `submit` only retries reservation release.
+Confirmed pushes resolve their recovery intent; external rewinds block publication.
+Member and joint checks retain separate logs even when their IDs match.
 
 ```bash
 devrelay --workspace /path/workspace.toml task add terrain-edit --title "Local terrain edit" --file /path/task.md

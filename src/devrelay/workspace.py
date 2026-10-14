@@ -266,13 +266,13 @@ def check(workspace, state, task):
     task["checks_path"] = str(directory)
     state.save(task)
     results = []
-    entries = [(key, entry) for key, config in workspace.members.items() for entry in config.data["checks"]]
-    entries += [(entry["cwd"], entry) for entry in workspace.checks]
-    for key, entry in entries:
+    entries = [("member", key, entry) for key, config in workspace.members.items() for entry in config.data["checks"]]
+    entries += [("joint", entry["cwd"], entry) for entry in workspace.checks]
+    for scope, key, entry in entries:
         cwd = workspace.path.parent if key == "workspace" else Path(task["members"][key]["worktree"])
-        receipt = execute(state, entry["argv"], cwd, directory / (key + "-" + entry["id"] + ".log"),
+        receipt = execute(state, entry["argv"], cwd, directory / scope / (key + "-" + entry["id"] + ".log"),
                           entry["timeout_seconds"], env=paths_env(workspace, task, directory))
-        results.append({"repository": key, "id": entry["id"], **receipt})
+        results.append({"scope": scope, "repository": key, "id": entry["id"], **receipt})
         if snapshot(workspace, task) != before:
             raise RelayError("Participating source, HEAD or base changed during joint verification; rerun checks")
     record = {"passed": True, "members": before, "config_sha256": workspace.fingerprint,
@@ -494,6 +494,7 @@ def submit(workspace, state, task, states, *, local=False):
         if remote_branch_head(config, member) != member["head_sha"]:
             raise RelayError("Pushed member branch differs from the accepted commit")
         member["published_head"] = member["head_sha"]
+        member.pop("push_intent", None)
         state.save(task)
         evidence(workspace, task)
         pulls = gh_json(config, "pr", "list", "--state", "all", "--head", member["branch"], "--json",
@@ -567,9 +568,12 @@ def remote_branch_head(config, member):
 
 def publication_preflight(config, member):
     """Remote identity uses publication checkpoints, never the new local verification HEAD."""
-    allowed = {member.get("published_head")}
-    if member.get("push_intent"):
-        allowed.update((member["push_intent"]["head_sha"], member["push_intent"]["previous_sha"]))
+    published = member.get("published_head")
+    allowed = {published}
+    intent = member.get("push_intent")
+    pending = bool(intent and intent["head_sha"] != published and intent["previous_sha"] == published)
+    if pending:
+        allowed.add(intent["head_sha"])
     if member.get("pr_url") and not member.get("published_head"):
         # Compatibility for an older partial delivery, before any new accepted commit.
         allowed.add(member.get("head_sha"))
@@ -577,17 +581,21 @@ def publication_preflight(config, member):
                     "url,state,baseRefName,headRefName,headRefOid,isDraft")
     if len(pulls) > 1:
         raise RelayError("Multiple PRs own this member branch; inspect partial delivery")
+    pull = None
     if pulls:
         if member.get("pr_url") and member["pr_url"] != pulls[0]["url"]:
             raise RelayError("Member PR identity changed; preserve partial delivery")
         member["pr_url"] = pulls[0]["url"]
         pull = validate_pull(config, member, heads=allowed - {None})
-        member["published_head"] = pull["headRefOid"]
     elif member.get("pr_url"):
         raise RelayError("Recorded member PR disappeared; preserve partial delivery")
     head = remote_branch_head(config, member)
-    if head not in allowed or (member.get("published_head") and head != member["published_head"]):
+    if head not in allowed or (pull and head != pull["headRefOid"]):
         raise RelayError("Member remote branch changed or is unowned; preserve partial delivery")
+    if head is not None:
+        member["published_head"] = head
+        if not pending or head == intent["head_sha"]:
+            member.pop("push_intent", None)
     return head
 
 

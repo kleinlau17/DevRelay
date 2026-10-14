@@ -135,11 +135,19 @@ token; `submit` on delivered tasks retries release without republishing. Revoke 
 registered identities even if the manifest is invalid. Legacy tasks need their
 original manifest once to recover repository identities.
 
+Confirmed publication resolves push intent; its previous HEAD is never accepted as
+a later remote rewind. An unresolved intent can accept only its recorded predecessor
+or intended successor. Member and joint check logs use separate namespaces, so a
+joint check may use the same ID and cwd as a member check without losing evidence.
+
 远端发布提交与新验收本地 HEAD 分开保存。推送前预检全部 PR/分支，含结果不确定的创建；
 持久推送意图恢复「推送成功但响应丢失」。保持提交祖先关系，以精确 ref 租约防竞争。
 封存交付前再核对全部草稿。占用释放可重试且仅清除本任务 token；已交付任务 submit
 只做释放，不再发布。revoke 使用登记身份，配置损坏也能撤销；旧任务需先恢复原配置
 一次以迁移仓库身份。
+
+确认发布后即解除推送恢复意图，之前的 HEAD 不再能掩盖外部回退。未确认的意图只允许
+已登记的前驱或目标提交。仓内与联合检查日志分目录保存，同名 ID/cwd 不冲突。
 
 MVP limits: local macOS/Linux controllers, explicit local task registration, one
 implementation session, bounded `run/resume`, and draft delivery. GitHub multi-repo
