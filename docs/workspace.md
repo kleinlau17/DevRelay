@@ -25,10 +25,10 @@ key or `workspace` (the manifest directory). Setup and check processes receive:
 
 - `DEVRELAY_WORKTREE_<UPPERCASE_KEY>`: the exact claimed worktree for each member.
 - `DEVRELAY_WORKSPACE`: the manifest directory.
-- `DEVRELAY_EVIDENCE_DIR`: this task's retained artifact directory.
+- `DEVRELAY_EVIDENCE_DIR`: the current setup/check round's separate `artifacts/` directory.
 
 命令使用参数数组，不做 shell 展开。联合检查的 cwd 选择仓库 key 或 workspace。
-环境变量提供每仓实际工作树、配置目录和任务证据目录。脚本由项目负责，可启动本地依赖，
+环境变量提供每仓实际工作树、配置目录和本轮独立的 `artifacts/` 证据目录。脚本由项目负责，可启动本地依赖，
 但必须保持前台、有界执行并在退出前关闭服务；DevRelay 不准备业务服务或凭据。
 
 Runtime is `.devrelay/workspace-runtime/<manifest-stem>/` beside the manifest.
@@ -72,10 +72,14 @@ workspace authorization and evidence gates. `submit` does not start a model; a s
 rejected or stale review blocks it. `run` always performs independent review before
 successful return/delivery. `submit ID --local` creates accepted member commits
 without any push or PR; it keeps the reservation for later delivery/revocation.
+Once review starts (including `run`), preparation/checks clear its verdict but retain
+the review requirement: fresh approval is required even for local commits.
 
 外层 Agent 可逐步 start、prepare、编辑、check、可选 review、submit，使用同一授权与
 证据门禁。submit 不启动模型；已有拒绝或过期审查会阻止交付。run 成功返回/交付前必须
 独立审查。submit --local 只创建验收过的各仓提交，不推送；保留占用直到交付或撤销。
+一旦进入 review 或 run，prepare/check 虽清空旧结论，仍保留审查要求；回修后连本地提交
+也必须重新获批，不能靠重跑检查绕过拒绝。
 
 ## Verification and recovery / 验收与恢复
 
@@ -89,12 +93,20 @@ reservation prevents single-repository DevRelay workers or other bundles from cl
 the repositories between commands. Arbitrary external editors still require host
 coordination, as in single-project mode. All participating DevRelay workers must use
 the upgraded runtime; older installations do not understand workspace reservations.
+Failed checks invalidate old acceptance before inspecting the snapshot. Every round
+uses a new directory; its receipt binds the SHA-256 of all retained logs and artifacts.
+Deleting, replacing or adding evidence blocks delivery. Legacy receipts without file
+digests require fresh checks. Unfinished single-repository work, including reviewed,
+rejected or open-PR tasks, blocks workspace claims until explicitly completed.
 
 联合回执绑定全部仓库的源码树、HEAD、最新目标基线、配置指纹、任务要求及真实命令回执。
 检查期间变化会失败，之后变化会阻止发布，直到重新联合验收。控制器创建的提交只允许在
 源码树一致时推进 HEAD。prepare 使旧验收/审查失效。稳定顺序获取各仓锁，并持久保存
 工作区占用，防止跨命令期间其他 DevRelay worker 抢占；外部编辑器仍由宿主协调。
 参与的 DevRelay worker 必须使用升级后的运行时，旧安装不识别工作区占用。
+check 在读取快照之前即使旧验收失效。每轮目录独立，回执绑定全部日志/产物 SHA-256；
+删除、替换或新增证据均阻止交付。无文件摘要的旧回执须重新检查。单仓任务尚未完成时，
+包括已审查、拒绝及已有 PR 的任务，均不能让多仓任务抢占。
 
 `submit` commits all accepted members, pushes each changed branch and creates or
 updates associated **draft** PRs. Unchanged members are verified but need no empty PR.
@@ -113,6 +125,21 @@ submit 提交各仓验收源码，为有改动的仓推送分支、创建或更�
 不确定创建通过分支回读恢复，不重复创建。已关闭、合并、ready 或身份不符时停止。
 本版不自动 ready、批准、合并、部署或清理。全部草稿交付后释放占用；task revoke 撤销
 授权、释放占用并保留现场。
+
+Remote publication checkpoints are separate from freshly verified local HEADs.
+Preflight reads all member PRs and refs before any push, including uncertain creation.
+Persisted push intent recovers a successful push with a lost response. Pushes preserve
+ancestry and use an exact ref lease to reject concurrent changes. All drafts are read
+again before sealing delivery. Release is idempotent and only removes this task's
+token; `submit` on delivered tasks retries release without republishing. Revoke uses
+registered identities even if the manifest is invalid. Legacy tasks need their
+original manifest once to recover repository identities.
+
+远端发布提交与新验收本地 HEAD 分开保存。推送前预检全部 PR/分支，含结果不确定的创建；
+持久推送意图恢复「推送成功但响应丢失」。保持提交祖先关系，以精确 ref 租约防竞争。
+封存交付前再核对全部草稿。占用释放可重试且仅清除本任务 token；已交付任务 submit
+只做释放，不再发布。revoke 使用登记身份，配置损坏也能撤销；旧任务需先恢复原配置
+一次以迁移仓库身份。
 
 MVP limits: local macOS/Linux controllers, explicit local task registration, one
 implementation session, bounded `run/resume`, and draft delivery. GitHub multi-repo

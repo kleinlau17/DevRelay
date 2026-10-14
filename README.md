@@ -12,6 +12,8 @@
 关联的草稿 PR。`run/resume` 使用一个实现会话并在有界循环内根据检查/独立审查结果回修。
 本版仅草稿交付，不自动合并。详见 [多仓使用与恢复](docs/workspace.md) 和
 [工作区配置](examples/workspace.toml)。原有 `--project` 单仓工作流不变。
+每轮验收保留独立且绑定摘要的日志/产物；进入独立审查后，回修必须重新获批。
+部分发布按远端提交检查点恢复；已交付任务的 `submit` 只重试占用释放。
 
 ```bash
 devrelay --workspace /path/workspace.toml task add terrain-edit --title "地形局部编辑" --file /path/task.md

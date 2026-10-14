@@ -14,6 +14,9 @@ workspace manifest, run member and joint acceptance, and deliver linked draft PR
 repair loops. This MVP delivers drafts only, with no automatic merge. See
 [workspace operation and recovery](docs/workspace.md) and the
 [configuration example](examples/workspace.toml). Existing `--project` behavior remains.
+Each acceptance round retains separate, digest-bound logs/artifacts; once independent
+review starts, repairs require fresh approval. Partial publication uses remote commit
+checkpoints. For delivered tasks, `submit` only retries reservation release.
 
 ```bash
 devrelay --workspace /path/workspace.toml task add terrain-edit --title "Local terrain edit" --file /path/task.md

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tomllib
 import uuid
 
@@ -57,8 +58,8 @@ def load(path):
         if not isinstance(entry, dict) or set(entry) - {"key", "path", "project", "setup", "checks"}:
             raise RelayError("Invalid workspace repository entry")
         key, location = entry.get("key"), entry.get("path")
-        if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", key) or key in members:
-            raise RelayError("Repository keys must be unique lowercase identifiers")
+        if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", key) or key in members or key == "workspace":
+            raise RelayError("Repository keys must be unique lowercase identifiers; workspace is reserved")
         if not isinstance(location, str) or not location:
             raise RelayError("Each repository requires an explicit path")
         root = repository_root(path.parent / location)
@@ -128,6 +129,8 @@ def add(workspace, state, identifier, title, requirements, priority="priority:P1
     token = hashlib.sha256(str(workspace.path).encode()).hexdigest()[:12] + "-" + identifier
     return state.save({"id": identifier, "title": title, "body": body, "requirements_path": str(requirements),
                        "approved": True, "config_sha256": workspace.fingerprint,
+                       "registered_members": {key: {"root": str(c.root), "common_dir": str(common_dir(c.root))}
+                                              for key, c in workspace.members.items()},
                        "owner": token, "priority": priority, "status": "queued", "members": {}, "attempts": 0, "created_at": now()})
 
 
@@ -148,7 +151,7 @@ def reserve(workspace, states, task):
     for key, member_state in states.items():
         # A saved external editor is an unfinished implementation even between CLI calls.
         active = [t for t in member_state.tasks() if t.get("worktree") and t["status"] not in
-                  ("completed", "pr_open", "reviewed", "review_blocked")]
+                  ("completed",)]
         if active:
             raise RelayError(f"Repository {key} has unfinished single-repository work; preserve and finish it first")
     for member_state in states.values():
@@ -178,10 +181,16 @@ def start(workspace, state, task, states):
         registered = worktrees(config.root)
         if any(t.get("branch") == "refs/heads/" + branch for t in registered):
             raise RelayError("Task branch belongs to another worktree; left unchanged")
-        # An existing branch without our registered checkout may belong to another operation.
+        # A crash may leave our branch at the recorded base before the checkout was materialized.
         from .git import has_ref
         if has_ref(config.root, "refs/heads/" + branch):
-            raise RelayError("Task branch already exists without its worktree; inspect before recovery")
+            if (saved.get("checkout_intent") != saved["base_sha"] or
+                    git(config.root, "rev-parse", "refs/heads/" + branch) != saved["base_sha"]):
+                raise RelayError("Task branch already exists without its worktree; inspect before recovery")
+            git(config.root, "worktree", "add", str(expected), branch)
+            continue
+        saved["checkout_intent"] = saved["base_sha"]
+        state.save(task)
         git(config.root, "worktree", "add", "-b", branch, str(expected), saved["base_sha"])
     task["status"] = "claimed"
     task["error"] = None
@@ -198,9 +207,9 @@ def inspect_member(config, member):
         raise RelayError("Workspace member is not registered on the owned task branch")
 
 
-def paths_env(workspace, task):
+def paths_env(workspace, task, directory):
     return {**os.environ, "DEVRELAY_WORKSPACE": str(workspace.path.parent),
-            "DEVRELAY_EVIDENCE_DIR": str(workspace.directory / "runs" / task["id"]),
+            "DEVRELAY_EVIDENCE_DIR": str(directory / "artifacts"),
             **{"DEVRELAY_WORKTREE_" + key.upper(): member["worktree"] for key, member in task["members"].items()}}
 
 
@@ -211,7 +220,8 @@ def prepare(workspace, state, task):
     for key, config in workspace.members.items():
         if task["members"][key].get("pr_url"):
             validate_pull(config, task["members"][key])
-    task.update(status="preparing", prepared=False, verification=None, review=None)
+    task.update(status="preparing", prepared=False, verification=None, review=None,
+                review_required=task.get("review_required", False) or bool(task.get("review")))
     state.save(task)
     directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-setup")
     task["setup_path"] = str(directory)
@@ -222,7 +232,7 @@ def prepare(workspace, state, task):
             assert_current(workspace, task)
             execute(state, entry["argv"], task["members"][key]["worktree"],
                     directory / (key + "-" + entry["id"] + ".log"), entry["timeout_seconds"],
-                    env=paths_env(workspace, task))
+                    env=paths_env(workspace, task, directory))
     assert_current(workspace, task)
     task.update(status="prepared", prepared=True, setup_path=str(directory), error=None)
     return state.save(task)
@@ -248,9 +258,10 @@ def snapshot(workspace, task):
 
 
 def check(workspace, state, task):
-    before = snapshot(workspace, task)
-    task.update(status="verifying", verification=None, review=None)
+    task.update(status="verifying", verification=None, review=None,
+                review_required=task.get("review_required", False) or bool(task.get("review")))
     state.save(task)
+    before = snapshot(workspace, task)
     directory = state.directory / "runs" / task["id"] / (uuid.uuid4().hex + "-checks")
     task["checks_path"] = str(directory)
     state.save(task)
@@ -260,16 +271,20 @@ def check(workspace, state, task):
     for key, entry in entries:
         cwd = workspace.path.parent if key == "workspace" else Path(task["members"][key]["worktree"])
         receipt = execute(state, entry["argv"], cwd, directory / (key + "-" + entry["id"] + ".log"),
-                          entry["timeout_seconds"], env=paths_env(workspace, task))
+                          entry["timeout_seconds"], env=paths_env(workspace, task, directory))
         results.append({"repository": key, "id": entry["id"], **receipt})
         if snapshot(workspace, task) != before:
             raise RelayError("Participating source, HEAD or base changed during joint verification; rerun checks")
     record = {"passed": True, "members": before, "config_sha256": workspace.fingerprint,
-              "task_body": task["body"], "checks": results, "finished_at": now()}
+              "task_body": task["body"], "task_title": task["title"], "checks": results,
+              "files": retained_files(directory), "finished_at": now()}
     directory.mkdir(parents=True, exist_ok=True)
     evidence = directory / "verification.json"
     evidence.write_text(json.dumps(record, indent=2) + "\n")
     for key, value in before.items():
+        member = task["members"][key]
+        if member.get("pr_url") and "published_head" not in member:
+            member["published_head"] = member.get("head_sha", value["head_sha"])
         task["members"][key]["head_sha"] = value["head_sha"]
     task.update(status="verified", verification=record, verification_path=str(evidence), error=None)
     return state.save(task)
@@ -280,11 +295,40 @@ def evidence(workspace, task):
     current = snapshot(workspace, task)
     if not record or not record.get("passed") or record["config_sha256"] != workspace.fingerprint:
         raise RelayError("Joint verification is missing or stale")
+    receipt = Path(task["verification_path"])
+    try:
+        saved = json.loads(receipt.read_text())
+    except (OSError, ValueError) as error:
+        raise RelayError("Joint verification receipt is missing or damaged; rerun checks") from error
+    if ("files" not in record or receipt.is_symlink() or saved != record
+            or retained_files(receipt.parent) != record["files"]):
+        raise RelayError("Joint verification logs or artifacts changed; rerun checks")
     expected = {key: {**value, "head_sha": task["members"][key].get("head_sha", value["head_sha"])}
                 for key, value in record["members"].items()}
-    if current != expected or record["task_body"] != task["body"]:
+    if current != expected or record["task_body"] != task["body"] or record.get("task_title") != task["title"]:
         raise RelayError("Participating source, HEAD or base changed; rerun joint verification")
     return current
+
+
+def retained_files(directory):
+    """Bind the actual logs and native artifacts to one retained acceptance round."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise RelayError("Joint evidence directory is missing or replaced")
+    files = {}
+    for path in sorted(directory.rglob("*")):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise RelayError("Joint evidence contains a symlink or special file")
+        if path == directory / "verification.json":
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        files[str(path.relative_to(directory))] = digest.hexdigest()
+    return files
 
 
 def run(workspace, state, task, states, *, submit_after=False):
@@ -293,6 +337,7 @@ def run(workspace, state, task, states, *, submit_after=False):
     if task.get("publication_started"):
         raise RelayError("Task has partial delivery; recover with check/submit, preserve existing PRs")
     feedback = task.get("error") or ""
+    task["review_required"] = True
     start(workspace, state, task, states)
     if not task.get("prepared"):
         prepare(workspace, state, task)
@@ -335,6 +380,8 @@ def run(workspace, state, task, states, *, submit_after=False):
 
 
 def review(workspace, state, task):
+    task["review_required"] = True
+    state.save(task)
     before = evidence(workspace, task)
     first = next(iter(workspace.members))
     task["worktree"] = task["members"][first]["worktree"]
@@ -387,13 +434,19 @@ def recover_commits(workspace, state, task):
 def submit(workspace, state, task, states, *, local=False):
     recover_commits(workspace, state, task)
     evidence(workspace, task)
-    if task.get("review") and (task["review"]["verdict"] != "approve" or any(task["review"]["members"][key][field] != value[field] for key, value in snapshot(workspace, task).items() for field in ("source_tree", "base_sha"))):
+    if ((task.get("review_required") and not task.get("review")) or task.get("review") and
+            (task["review"]["verdict"] != "approve" or any(task["review"]["members"][key][field] != value[field]
+             for key, value in snapshot(workspace, task).items() for field in ("source_tree", "base_sha")))):
         raise RelayError("Joint review is rejected or stale; recheck and review before delivery")
     if not local and any(c.provider != "github" for c in workspace.members.values()):
         raise RelayError("Draft PR delivery requires GitHub configuration for every member; use --local for local commits")
     if not local:
         for config in workspace.members.values():
             validate_remote(config)
+        # Discover uncertain PR creation and reject remote drift for ALL members before any publication.
+        for key, config in workspace.members.items():
+            publication_preflight(config, task["members"][key])
+            state.save(task)
     task.update(status="submitting", publication_started=True)
     state.save(task)
     # Commit every verified member before any remote mutation. Record each checkpoint for recovery.
@@ -401,8 +454,6 @@ def submit(workspace, state, task, states, *, local=False):
         evidence(workspace, task)
         member = task["members"][key]
         path = Path(member["worktree"])
-        if member.get("pr_url") and not local:
-            validate_pull(config, member)
         git(path, "add", "-A")
         stage_submodule_gitlinks(path)
         if git(path, "write-tree") != task["verification"]["members"][key]["source_tree"]:
@@ -428,11 +479,22 @@ def submit(workspace, state, task, states, *, local=False):
         if not member["changed"]:
             continue
         evidence(workspace, task)
-        # Persist a submitted SHA before push; uncertain publication is recovered by exact branch lookup.
+        remote_head = publication_preflight(config, member)
+        if remote_head and not is_ancestor(member["worktree"], remote_head, member["head_sha"]):
+            raise RelayError("Published member history diverged; preserve the draft and integrate before recovery")
+        # Persist intent before push, including the only remote predecessor we may replace.
+        member["push_intent"] = {"head_sha": member["head_sha"], "previous_sha": remote_head}
+        state.save(task)
         url = validate_remote(config, Path(member["worktree"]))
         ref = "refs/heads/" + member["branch"]
         with pinned_transport(Path(member["worktree"]), url) as (target, env):
-            git(member["worktree"], "push", target, member["head_sha"] + ":" + ref, env=env)
+            # An explicit lease protects a race after preflight; the ancestry gate above forbids rewriting history.
+            git(member["worktree"], "push", "--force-with-lease=" + ref + ":" + (remote_head or ""),
+                target, member["head_sha"] + ":" + ref, env=env)
+        if remote_branch_head(config, member) != member["head_sha"]:
+            raise RelayError("Pushed member branch differs from the accepted commit")
+        member["published_head"] = member["head_sha"]
+        state.save(task)
         evidence(workspace, task)
         pulls = gh_json(config, "pr", "list", "--state", "all", "--head", member["branch"], "--json",
                         "url,state,baseRefName,headRefName,headRefOid,isDraft")
@@ -476,34 +538,134 @@ def submit(workspace, state, task, states, *, local=False):
             gh(config, "pr", "edit", member["pr_url"], "--body-file", str(body_file))
             validate_pull(config, member)
             evidence(workspace, task)
-    task.update(status="delivered", error=None)
+    # Re-read every member at the boundary, including the first PR while others were being published.
+    for key, config in workspace.members.items():
+        member = task["members"][key]
+        if member.get("pr_url"):
+            validate_pull(config, member)
+            if remote_branch_head(config, member) != member["head_sha"]:
+                raise RelayError("Member remote branch changed before bundle delivery completed")
+    evidence(workspace, task)
+    task.update(status="delivered", error=None, reservations_released=False)
     state.save(task)
-    for member_state in states.values():
-        member_state.set_metadata("workspace_owner", None)
+    release_reservations(state, task, states)
     return task
 
 
-def validate_pull(config, member):
+def remote_branch_head(config, member):
+    path = Path(member["worktree"])
+    url = validate_remote(config, path)
+    ref = "refs/heads/" + member["branch"]
+    with pinned_transport(path, url) as (target, env):
+        lines = git(path, "ls-remote", "--refs", target, ref, env=env).splitlines()
+    if not lines:
+        return None
+    if len(lines) != 1 or lines[0].split()[1:] != [ref]:
+        raise RelayError("Ambiguous remote member branch")
+    return lines[0].split()[0]
+
+
+def publication_preflight(config, member):
+    """Remote identity uses publication checkpoints, never the new local verification HEAD."""
+    allowed = {member.get("published_head")}
+    if member.get("push_intent"):
+        allowed.update((member["push_intent"]["head_sha"], member["push_intent"]["previous_sha"]))
+    if member.get("pr_url") and not member.get("published_head"):
+        # Compatibility for an older partial delivery, before any new accepted commit.
+        allowed.add(member.get("head_sha"))
+    pulls = gh_json(config, "pr", "list", "--state", "all", "--head", member["branch"], "--json",
+                    "url,state,baseRefName,headRefName,headRefOid,isDraft")
+    if len(pulls) > 1:
+        raise RelayError("Multiple PRs own this member branch; inspect partial delivery")
+    if pulls:
+        if member.get("pr_url") and member["pr_url"] != pulls[0]["url"]:
+            raise RelayError("Member PR identity changed; preserve partial delivery")
+        member["pr_url"] = pulls[0]["url"]
+        pull = validate_pull(config, member, heads=allowed - {None})
+        member["published_head"] = pull["headRefOid"]
+    elif member.get("pr_url"):
+        raise RelayError("Recorded member PR disappeared; preserve partial delivery")
+    head = remote_branch_head(config, member)
+    if head not in allowed or (member.get("published_head") and head != member["published_head"]):
+        raise RelayError("Member remote branch changed or is unowned; preserve partial delivery")
+    return head
+
+
+def validate_pull(config, member, *, heads=None):
     if not re.fullmatch(r"https://github\.com/" + re.escape(config.repo) + r"/pull/[1-9]\d*", member["pr_url"]):
         raise RelayError("Member PR URL differs from its configured repository")
     pull = gh_json(config, "pr", "view", member["pr_url"], "--json",
                    "state,isDraft,baseRefName,headRefName,headRefOid,isCrossRepository")
     if (pull["state"] != "OPEN" or not pull["isDraft"] or pull["isCrossRepository"]
             or pull["baseRefName"] != config.base or pull["headRefName"] != member["branch"]
-            or pull["headRefOid"] != member["head_sha"]):
+            or pull["headRefOid"] not in (heads if heads is not None else {member.get("published_head", member["head_sha"])})):
         raise RelayError("Member PR identity changed; preserve partial delivery and inspect GitHub")
+    return pull
+
+
+def release_reservations(state, task, states):
+    for member_state in states.values():
+        if member_state.metadata("workspace_owner") == task["owner"]:
+            member_state.set_metadata("workspace_owner", None)
+    task["reservations_released"] = True
+    state.save(task)
+
+
+@contextmanager
+def release_locks(task):
+    """Cleanup uses registered identities even if the manifest or another owner's reservation changed."""
+    registered = task.get("registered_members")
+    if not registered:
+        raise RelayError("Legacy task has no registered repository identities; restore its manifest to recover")
+    with ExitStack() as stack:
+        states = {}
+        for key, member in sorted(registered.items(), key=lambda pair: pair[1]["common_dir"]):
+            if str(common_dir(Path(member["root"]))) != member["common_dir"]:
+                raise RelayError("Registered repository identity changed; preserve its reservation")
+            member_state = State(Path(member["root"]))
+            stack.callback(member_state.close)
+            # Accept the observed owner only to inspect/release our own token, never to claim work.
+            stack.enter_context(member_state.lock(owner=member_state.metadata("workspace_owner")))
+            states[key] = member_state
+        yield states
 
 
 def dispatch(args):
-    workspace = load(args.workspace)
+    manifest = Path(args.workspace).absolute()
+    if manifest.is_symlink():
+        raise RelayError("Workspace manifest must not be a symlink")
+    manifest = manifest.resolve()
+    directory = manifest.parent / ".devrelay/workspace-runtime" / manifest.stem
     # Avoid following a planted runtime directory into another task's evidence.
-    for path in [workspace.directory, workspace.directory / "state.sqlite3", workspace.directory / "worker.lock",
-                 *workspace.directory.parents]:
+    for path in [directory, directory / "state.sqlite3", directory / "worker.lock", *directory.parents]:
         if path.is_symlink():
             raise RelayError("Workspace runtime must not contain symlink directories")
-    state = State(workspace.path.parent, directory=workspace.directory)
+    state = State(manifest.parent, directory=directory)
     try:
         with state.lock():
+            identity = state.metadata("workspace_manifest")
+            if identity and identity != str(manifest):
+                raise RelayError("Workspace runtime belongs to another manifest with the same name")
+            state.set_metadata("workspace_manifest", str(manifest))
+            if args.command == "status" or args.command == "task" and args.task_command == "list":
+                return {"workspace": str(manifest), "tasks": state.tasks()}
+            if (args.command == "task" and args.task_command == "revoke") or args.command == "submit":
+                task = get_task(state, args.id)
+                if args.command == "task" or task["status"] == "delivered":
+                    # Migrate old receipts only against their exact original configuration.
+                    if not task.get("registered_members"):
+                        original = load(manifest)
+                        if original.fingerprint != task["config_sha256"]:
+                            raise RelayError("Restore the registered manifest before releasing legacy reservations")
+                        task["registered_members"] = {key: {"root": str(c.root), "common_dir": str(common_dir(c.root))}
+                                                      for key, c in original.members.items()}
+                    with release_locks(task) as states:
+                        if args.command == "task":
+                            task.update(approved=False, status="revoked", verification=None, review=None)
+                            state.save(task)
+                        release_reservations(state, task, states)
+                    return task
+            workspace = load(manifest)
             if args.command == "doctor":
                 from .cli import doctor
                 reports = {key: doctor(config, with_codex=False) for key, config in workspace.members.items()}
@@ -512,9 +674,12 @@ def dispatch(args):
                     reports["codex"] = {"ready": probe([workspace.codex_config["executable"], "login", "status"], workspace.path.parent)}
                 return {"ready": all(r["ready"] for r in reports.values()), "members": reports,
                         "integration_checks": len(workspace.checks), "delivery": "draft-only"}
-            if args.command == "status" or args.command == "task" and args.task_command == "list":
-                return {"workspace": str(workspace.path), "tasks": state.tasks()}
             if args.command == "next":
+                releasing = [t["id"] for t in state.tasks() if t["status"] == "delivered"
+                             and t.get("reservations_released") is False]
+                if releasing:
+                    return {"status": "needs_attention", "tasks": releasing, "selected": None,
+                            "reason": "Retry submit to finish releasing delivered reservations"}
                 pending = [t for t in state.tasks() if t["status"] != "delivered" and t.get("approved")]
                 attention = [t["id"] for t in pending if t["status"] in ("failed", "blocked", "review_blocked")]
                 if attention:
@@ -530,16 +695,15 @@ def dispatch(args):
             if not args.id:
                 raise RelayError("Workspace run requires an explicit authorized task ID")
             task = get_task(state, args.id)
+            if task["status"] == "delivered":
+                raise RelayError("Workspace task already delivered; submit only retries reservation release")
             with member_locks(workspace, task) as states:
-                if args.command == "task":
-                    task.update(approved=False, status="revoked", verification=None)
-                    state.save(task)
-                    for member_state in states.values():
-                        if member_state.metadata("workspace_owner") == task["owner"]:
-                            member_state.set_metadata("workspace_owner", None)
-                    return task
                 try:
                     assert_current(workspace, task)
+                    if not task.get("registered_members"):
+                        task["registered_members"] = {key: {"root": str(c.root), "common_dir": str(common_dir(c.root))}
+                                                      for key, c in workspace.members.items()}
+                        state.save(task)
                     if args.command not in ("start", "run", "resume"):
                         reserve(workspace, states, task)
                     if args.command == "start":
@@ -554,7 +718,8 @@ def dispatch(args):
                         return submit(workspace, state, task, states, local=args.local)
                     return run(workspace, state, task, states, submit_after=args.submit)
                 except (RelayError, OSError, KeyboardInterrupt) as error:
-                    task.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+                    task.update(status=task["status"] if task["status"] == "delivered" else
+                                "interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
                                 error=str(error) or "Interrupted")
                     state.save(task)
                     raise

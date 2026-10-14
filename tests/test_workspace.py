@@ -292,49 +292,224 @@ class WorkspaceTest(RepositoryTest):
         first = json.loads(trace.read_text().splitlines()[0])
         self.assertIn("Provide dataset", first["prompt"])
 
-    def test_remote_partial_delivery_retry_reuses_draft(self):
+    def test_rejected_review_cannot_be_bypassed_by_new_checks(self):
+        self.fixed()
+        with patch.dict(os.environ, DEVRELAY_TEST_REVIEW="changes_requested"):
+            code, reviewed = self.invoke("review", "fix")
+            self.assertEqual(code, 0, reviewed)
+            self.assertEqual(reviewed['review']['verdict'], 'changes_requested')
+        self.assertEqual(self.invoke("check", "fix")[0], 0)
+        code, report = self.invoke("submit", "fix", "--local")
+        self.assertEqual(code, 1)
+        self.assertIn("review", report["error"])
+        self.assertEqual(self.invoke("review", "fix")[0], 0)
+        self.assertEqual(self.invoke("submit", "fix", "--local")[0], 0)
+
+    def test_failed_snapshot_discards_previous_acceptance(self):
+        self.fixed()
+        with patch("devrelay.workspace.snapshot", side_effect=RelayError("Snapshot unavailable")):
+            self.assertEqual(self.invoke("check", "fix")[0], 1)
+        code, report = self.invoke("submit", "fix", "--local")
+        self.assertEqual(code, 1)
+        self.assertIn("verification is missing", report["error"])
+
+    def test_joint_artifacts_are_retained_and_tampering_blocks_delivery(self):
+        command = [sys.executable, "-c", "import os; from pathlib import Path; p=Path(os.environ['DEVRELAY_EVIDENCE_DIR']); p.mkdir(parents=True); (p/'native.zip').write_bytes(b'compiled')"]
+        self.manifest.write_text(self.manifest.read_text() + '\n[[checks]]\nid = "artifact"\nargv = ' + json.dumps(command) + '\n')
         task = self.fixed()
-        # Member configuration remains local for checks; replace only immutable runtime objects for transport tests.
+        first = Path(task["verification_path"])
+        artifact = first.parent / "artifacts/native.zip"
+        self.assertIn("artifacts/native.zip", task["verification"]["files"])
+        artifact.write_bytes(b'replaced')
+        code, report = self.invoke("submit", "fix", "--local")
+        self.assertEqual(code, 1)
+        self.assertIn("artifacts changed", report["error"])
+        code, task = self.invoke("check", "fix")
+        self.assertEqual(code, 0, task)
+        self.assertNotEqual(first, Path(task["verification_path"]))
+        self.assertEqual(artifact.read_bytes(), b'replaced', 'Old evidence must not be overwritten')
+        self.assertEqual(self.invoke("submit", "fix", "--local")[0], 0)
+
+    def test_revoke_uses_registered_roots_when_manifest_is_invalid(self):
+        task = self.started()
+        self.manifest.write_text('not a valid manifest [')
+        self.assertEqual(self.invoke("status")[0], 0)
+        code, task = self.invoke("task", "revoke", "fix")
+        self.assertEqual(code, 0, task)
+        for root in (self.root, self.second):
+            member_state = State(root)
+            self.addCleanup(member_state.close)
+            with member_state.lock():
+                pass
+        self.assertTrue(Path(task["members"]["pro"]["worktree"]).exists())
+
+    def test_unfinished_single_repo_reviews_block_workspace_claim(self):
+        self.add_task()
+        state = State(self.root)
+        self.addCleanup(state.close)
+        state.save({"id": "single", "status": "review_blocked", "worktree": str(self.root)})
+        code, report = self.invoke("start", "fix")
+        self.assertEqual(code, 1)
+        self.assertIn("unfinished", report["error"])
+
+    def test_workspace_is_a_reserved_repository_key(self):
+        self.manifest.write_text(self.manifest.read_text().replace('key = "bp"', 'key = "workspace"'))
+        self.assertEqual(self.invoke("doctor")[0], 1)
+
+    def test_branch_creation_interruption_recovers_only_owned_base(self):
+        self.add_task()
+        real = ws.git
+        def interrupt(root, *args, **kwargs):
+            if root == self.second and args[:2] == ('worktree', 'add'):
+                self.git('branch', args[3], args[5], cwd=root)
+                raise RelayError('Checkout interrupted after branch creation')
+            return real(root, *args, **kwargs)
+        with patch('devrelay.workspace.git', side_effect=interrupt):
+            self.assertEqual(self.invoke('start', 'fix')[0], 1)
+        code, task = self.invoke('start', 'fix')
+        self.assertEqual(code, 0, task)
+        self.assertTrue(Path(task['members']['pro']['worktree']).is_dir())
+
+    @contextlib.contextmanager
+    def remote_delivery(self):
+        """Real commits, refs, leases and pushes to bare Git; only the GitHub API is simulated."""
+        task = self.fixed()
         space = ws.load(self.manifest)
-        for config in space.members.values():
-            config.data["project"].update(provider="github", repository="example/" + config.root.name)
+        base = self.git("rev-parse", "HEAD")
+        remotes = {}
+        for key, config in space.members.items():
+            remote = Path(self.temporary.name) / (key + '.git')
+            subprocess.check_call(['git', 'init', '--bare', '-q', str(remote)])
+            self.git('push', str(remote), 'main', cwd=config.root)
+            remotes[config.root] = remote
+            config.data["project"].update(provider="github", repository="example/" + key)
         state = State(space.path.parent, directory=space.directory)
         self.addCleanup(state.close)
-        task = state.get("fix")
-        pulls, calls = {}, []
+        service = {"pulls": {}, "calls": [], "fail_create": None, "uncertain_create": False}
+        def branch_head(config, branch):
+            result = subprocess.run(['git', 'rev-parse', '--verify', 'refs/heads/' + branch],
+                                    cwd=remotes[config.root], text=True, capture_output=True)
+            return result.stdout.strip() if result.returncode == 0 else None
         def gh(config, *args, **kwargs):
-            calls.append((config.root, args))
-            if args[:2] == ("pr", "create"):
-                if config.root == self.second and not pulls.get("first_failed"):
-                    pulls["first_failed"] = True
-                    raise RelayError("Second API publication failed")
-                url = "https://github.com/" + config.repo + "/pull/1"
-                pulls[config.root] = url
+            service['calls'].append((config.repo, args))
+            if args[:2] == ('pr', 'create'):
+                fail = service['fail_create'] == config.repo
+                if fail and not service['uncertain_create']:
+                    raise RelayError('API publication failed')
+                branch = args[args.index('--head') + 1]
+                url = 'https://github.com/' + config.repo + '/pull/1'
+                service['pulls'][config.repo] = {'url': url, 'state': 'OPEN', 'isDraft': True,
+                    'isCrossRepository': False, 'baseRefName': 'main', 'headRefName': branch}
+                if fail:
+                    raise RelayError('API publication outcome uncertain')
                 return url
-            return ""
+            return ''
         def gh_json(config, *args):
-            if args[:2] == ("pr", "list"):
-                if config.root not in pulls:
-                    return []
-                return [{"url": pulls[config.root], "state": "OPEN", "baseRefName": "main", "isDraft": True,
-                         "headRefOid": task["members"]["bp" if config.root == self.root else "pro"]["head_sha"]}]
-            member = task["members"]["bp" if config.root == self.root else "pro"]
-            return {"state": "OPEN", "isDraft": True, "isCrossRepository": False, "baseRefName": "main",
-                    "headRefName": member["branch"], "headRefOid": member["head_sha"]}
+            pull = service['pulls'].get(config.repo)
+            value = {**pull, 'headRefOid': branch_head(config, pull['headRefName'])} if pull else None
+            return ([value] if value else []) if args[:2] == ('pr', 'list') else value
         @contextlib.contextmanager
         def transport(root, url):
-            yield str(self.root), os.environ
-        real = ws.git
-        def git(root, *args, **kwargs):
-            if args[0] == "push":
-                return ""
-            return real(root, *args, **kwargs)
-        with patch("devrelay.workspace.assert_current"), patch("devrelay.workspace.base_commit", return_value=self.git("rev-parse", "HEAD")), patch("devrelay.workspace.validate_remote", return_value="https://github.com/example/project.git"), patch("devrelay.workspace.pinned_transport", side_effect=transport), patch("devrelay.workspace.git", side_effect=git), patch("devrelay.workspace.gh", side_effect=gh), patch("devrelay.workspace.gh_json", side_effect=gh_json):
+            yield url, os.environ
+        def endpoint(config, root=None):
+            return str(remotes[config.root])
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch('devrelay.workspace.assert_current'))
+            stack.enter_context(patch('devrelay.workspace.base_commit', return_value=base))
+            stack.enter_context(patch('devrelay.workspace.validate_remote', side_effect=endpoint))
+            stack.enter_context(patch('devrelay.workspace.pinned_transport', side_effect=transport))
+            stack.enter_context(patch('devrelay.workspace.gh', side_effect=gh))
+            stack.enter_context(patch('devrelay.workspace.gh_json', side_effect=gh_json))
+            yield space, state, task, service, remotes
+
+    def test_remote_partial_delivery_rechecks_edits_and_reuses_existing_draft(self):
+        with self.remote_delivery() as (space, state, task, service, remotes):
+            service['fail_create'] = 'example/pro'
             with ws.member_locks(space, task) as states:
-                with self.assertRaisesRegex(RelayError, "Second API"):
+                with self.assertRaisesRegex(RelayError, 'API publication failed'):
                     ws.submit(space, state, task, states)
-                self.assertIn("pr_url", state.get("fix")["members"]["bp"])
+                old = task['members']['bp']['published_head']
+                Path(task['members']['bp']['worktree'], 'extra.txt').write_text('Reviewed repair')
+                ws.check(space, state, task)
+                service['fail_create'] = None
                 result = ws.submit(space, state, task, states)
-        self.assertEqual(result["status"], "delivered")
-        self.assertEqual(sum(1 for root,args in calls if root == self.root and args[:2] == ("pr", "create")), 1)
-        self.assertFalse(any(args[:2] == ("pr", "merge") for _,args in calls))
+        self.assertEqual(result['status'], 'delivered')
+        self.assertNotEqual(old, result['members']['bp']['published_head'])
+        self.assertEqual(sum(1 for repo, args in service['calls'] if repo == 'example/bp' and args[:2] == ('pr', 'create')), 1)
+        self.assertFalse(any(args[:2] == ('pr', 'merge') for _, args in service['calls']))
+
+    def test_uncertain_create_closed_draft_stops_before_any_push(self):
+        with self.remote_delivery() as (space, state, task, service, remotes):
+            service.update(fail_create='example/bp', uncertain_create=True)
+            with ws.member_locks(space, task) as states:
+                with self.assertRaisesRegex(RelayError, 'uncertain'):
+                    ws.submit(space, state, task, states)
+                self.assertNotIn('pr_url', task['members']['bp'])
+                service['pulls']['example/bp']['state'] = 'CLOSED'
+                Path(task['members']['bp']['worktree'], 'repair.txt').write_text('new repair')
+                ws.check(space, state, task)
+                with patch('devrelay.workspace.git', wraps=ws.git) as calls:
+                    with self.assertRaisesRegex(RelayError, 'identity changed'):
+                        ws.submit(space, state, task, states)
+                self.assertFalse(any(call.args[1] in ('push', 'commit') for call in calls.call_args_list))
+
+    def test_uncertain_push_is_recovered_without_duplicate_commit_or_pr(self):
+        with self.remote_delivery() as (space, state, task, service, remotes):
+            real = ws.git
+            interrupted = []
+            def after_push(root, *args, **kwargs):
+                result = real(root, *args, **kwargs)
+                if args[0] == 'push' and not interrupted:
+                    interrupted.append(root)
+                    raise RelayError('Lost push receipt')
+                return result
+            with ws.member_locks(space, task) as states:
+                with patch('devrelay.workspace.git', side_effect=after_push):
+                    with self.assertRaisesRegex(RelayError, 'Lost push'):
+                        ws.submit(space, state, task, states)
+                result = ws.submit(space, state, state.get('fix'), states)
+                self.assertEqual(result['status'], 'delivered')
+                for member in result['members'].values():
+                    self.assertEqual(self.git('rev-list', '--count', 'main..HEAD', cwd=member['worktree']), '1')
+
+    def test_push_lease_rejects_remote_race(self):
+        with self.remote_delivery() as (space, state, task, service, remotes):
+            real = ws.git
+            raced = []
+            def race(root, *args, **kwargs):
+                if args[0] == 'push' and not raced:
+                    raced.append(root)
+                    config = space.members['bp']
+                    self.git('branch', task['members']['bp']['branch'], 'main', cwd=remotes[config.root])
+                return real(root, *args, **kwargs)
+            with ws.member_locks(space, task) as states, patch('devrelay.workspace.git', side_effect=race):
+                with self.assertRaises(RelayError):
+                    ws.submit(space, state, task, states)
+            self.assertEqual(service['pulls'], {})
+
+    def test_interrupted_release_is_idempotent_and_keeps_new_owner(self):
+        with self.remote_delivery() as (space, state, task, service, remotes):
+            real = State.set_metadata
+            released = []
+            def fail_release(member_state, key, value):
+                if key == 'workspace_owner' and value is None:
+                    if released:
+                        raise OSError('Release interrupted')
+                    released.append(member_state.directory)
+                return real(member_state, key, value)
+            with ws.member_locks(space, task) as states:
+                with patch.object(State, 'set_metadata', new=fail_release):
+                    with self.assertRaisesRegex(OSError, 'Release interrupted'):
+                        ws.submit(space, state, task, states)
+            saved = state.get('fix')
+            self.assertEqual(saved['status'], 'delivered')
+            first = State(self.root)
+            self.addCleanup(first.close)
+            first.set_metadata('workspace_owner', 'new-bundle')
+            # Cleanup does not parse the changed manifest or reclaim the now foreign reservation.
+            self.manifest.write_text('invalid [')
+            code, result = self.invoke('submit', 'fix')
+            self.assertEqual(code, 0, result)
+            self.assertTrue(result['reservations_released'])
+            self.assertEqual(first.metadata('workspace_owner'), 'new-bundle')
+            self.assertEqual(self.invoke('check', 'fix')[0], 1)
