@@ -27,7 +27,9 @@ def parser():
         prog="devrelay", description="Agent-driven engineering tools with verified delivery gates",
         epilog="Agents use next/start/prepare/check/submit. Optional task continuation: work/watch (run/resume compatible).")
     root.add_argument("-V", "--version", action="version", version=__version__)
-    root.add_argument("--project", type=Path, default=Path.cwd(), help="Project directory (default: current directory)")
+    locations = root.add_mutually_exclusive_group()
+    locations.add_argument("--workspace", type=Path, help="Explicit multi-repository TOML manifest (draft delivery only)")
+    locations.add_argument("--project", type=Path, default=Path.cwd(), help="Project directory (default: current directory)")
     sub = root.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="Create project configuration and initialize GitHub issue management")
     init.add_argument("--provider", choices=("local", "github"))
@@ -46,6 +48,7 @@ def parser():
     add.add_argument("--title", required=True)
     add.add_argument("--file", required=True, type=Path)
     add.add_argument("--priority", help="Optional configured priority label; defaults to normal priority")
+    task.add_parser("revoke", help="Revoke a workspace task; preserve its work and evidence").add_argument("id")
     task.add_parser("list", help="List local task state")
     task.add_parser("complete", help="Mark a local task complete after integration into the base").add_argument("id")
     task.add_parser("approve", help="Explicitly authorize a local discovered task").add_argument("id")
@@ -149,6 +152,13 @@ def main(argv=None):
     args = parser().parse_args(argv)
     state = None
     try:
+        if args.workspace:
+            from .workspace import dispatch
+            result = dispatch(args)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 1 if result.get("status") in ("failed", "blocked", "needs_attention") or result.get("ready") is False else 0
+        if args.command == "task" and args.task_command == "revoke":
+            raise RelayError("task revoke requires --workspace")
         root = repository_root(args.project)
         state = State(root)
         root = controller(root, state)

@@ -106,6 +106,22 @@ devrelay discover 12  # 重试保存的报告；不重新调用模型
 
 通过持久化标记和忽略大小写/连续空白的标题去重，已关闭的同名 Issue 也会复用，不自动重开；不同措辞的相同问题仍可能需要人工合并。已有人工 Issue 不会被覆盖或重新授权。来源识别需要本仓库保存的创建记录与对应 Issue 标记；仅复制正文标记、添加标签或用机器人账号创建 Issue，不会获得自动策略。请保留生成的来源标记和本地运行状态；跨机器迁移缺少记录时需显式授权。报告和重复观察保存在来源任务的 `discoveries`，发布失败保存在 `discovery_error`，不改变原任务的验收结论。若 GitHub 创建请求的结果不确定，普通重试只回读，不重复发送；确认远端没有该 Issue 后才用 `devrelay discover 12 --retry-create`。发布失败不阻断原任务交付，需按 `discovery_error.next` 单独恢复。
 
+## 多仓 autodev MVP
+
+一个业务任务可通过显式工作区配置协调多个仓库，执行各仓检查和联合验收，并交付互相
+关联的草稿 PR。`run/resume` 使用一个实现会话并在有界循环内根据检查/独立审查结果回修。
+本版仅草稿交付，不自动合并。详见 [多仓使用与恢复](docs/workspace.md) 和
+[工作区配置](examples/workspace.toml)。原有 `--project` 单仓工作流不变。
+每轮验收保留独立且绑定摘要的日志/产物；进入独立审查后，回修必须重新获批。
+部分发布按远端提交检查点恢复；已交付任务的 `submit` 只重试占用释放。
+确认推送后清除其恢复意图，外部回退会阻止发布；仓内与联合检查分别保存日志，允许同名 ID。
+
+```bash
+devrelay --workspace /path/workspace.toml task add terrain-edit --title "地形局部编辑" --file /path/task.md
+devrelay --workspace /path/workspace.toml run terrain-edit --submit
+```
+
+
 ## 安装
 
 ```bash

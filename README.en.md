@@ -106,6 +106,26 @@ The file is a JSON array with four nonempty strings per report: `title`, `descri
 
 Deduplication uses persistent markers and titles normalized for case and whitespace, including closed Issues; it never reopens, overwrites or reauthorizes a match. Source policy requires a retained controller publication receipt and the matching Issue marker. A copied marker, label or bot author alone cannot grant it. Preserve the generated marker and local runtime state; migration without those records requires explicit authorization. Differently worded reports of the same bug can still need manual reconciliation. Reports and repeated observations remain in the source task's `discoveries`; publication failures appear in `discovery_error` without changing the original acceptance result. After an uncertain GitHub creation request, ordinary retries only read back. Use `devrelay discover 12 --retry-create` only after confirming no remote Issue was created. A publication failure does not block delivery of the original task; recover it separately using `discovery_error.next`.
 
+## Multi-repository autodev MVP
+
+One authorized outcome can coordinate multiple repositories through an explicit
+workspace manifest, run member and joint acceptance, and deliver linked draft PRs.
+`run/resume` uses one implementation session and bounded check/independent-review
+repair loops. This MVP delivers drafts only, with no automatic merge. See
+[workspace operation and recovery](docs/workspace.md) and the
+[configuration example](examples/workspace.toml). Existing `--project` behavior remains.
+Each acceptance round retains separate, digest-bound logs/artifacts; once independent
+review starts, repairs require fresh approval. Partial publication uses remote commit
+checkpoints. For delivered tasks, `submit` only retries reservation release.
+Confirmed pushes resolve their recovery intent; external rewinds block publication.
+Member and joint checks retain separate logs even when their IDs match.
+
+```bash
+devrelay --workspace /path/workspace.toml task add terrain-edit --title "Local terrain edit" --file /path/task.md
+devrelay --workspace /path/workspace.toml run terrain-edit --submit
+```
+
+
 ## Install and onboard
 
 ```bash
