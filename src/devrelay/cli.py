@@ -10,6 +10,7 @@ import sys
 from . import __version__
 from .config import initialize, load
 from .delivery import merge, review
+from .discovery import attach_sources, discover
 from .errors import RelayError
 from .git import has_ref, repository_root, validate_remote, worktrees
 from .onboarding import setup_github
@@ -17,17 +18,20 @@ from .providers import add_local, queue_report, snapshot
 from .runner import complete_local, prepare_task, run_task, start, submit, verify
 from .state import State
 from .worker import watch
+from .workflow import guidance, work
+from .triage import automatic_enabled, triage
 
 
 def parser():
     root = argparse.ArgumentParser(
         prog="devrelay", description="Agent-driven engineering tools with verified delivery gates",
-        epilog="Agents use next/start/prepare/check/submit. Optional Codex orchestration: run/resume/watch.")
+        epilog="Agents use next/start/prepare/check/submit. Optional task continuation: work/watch (run/resume compatible).")
     root.add_argument("-V", "--version", action="version", version=__version__)
     root.add_argument("--project", type=Path, default=Path.cwd(), help="Project directory (default: current directory)")
     sub = root.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="Create project configuration and initialize GitHub issue management")
     init.add_argument("--provider", choices=("local", "github"))
+    init.add_argument("--mode", choices=("manual", "autonomous"), help="Project authorization mode (default: manual)")
     init.add_argument("--base", help="Target branch; detected from origin/HEAD, main, master or current branch")
     init.add_argument("--sync-github", action="store_true",
                       help="Add missing GitHub labels/templates using existing configuration; do not overwrite it")
@@ -41,9 +45,20 @@ def parser():
     add.add_argument("id")
     add.add_argument("--title", required=True)
     add.add_argument("--file", required=True, type=Path)
-    add.add_argument("--priority", default="priority:P1")
+    add.add_argument("--priority", help="Optional configured priority label; defaults to normal priority")
     task.add_parser("list", help="List local task state")
     task.add_parser("complete", help="Mark a local task complete after integration into the base").add_argument("id")
+    task.add_parser("approve", help="Explicitly authorize a local discovered task").add_argument("id")
+    investigation = sub.add_parser("triage", help="Investigate a task under project policy before automatic execution")
+    investigation.add_argument("id")
+    intake = investigation.add_mutually_exclusive_group()
+    intake.add_argument("--prepare", action="store_true", help="Prepare isolated checkout, prompt and schema for an external agent")
+    intake.add_argument("--file", type=Path, help="Accept an external agent's result bound to the prepared context")
+    investigation.add_argument("--retry", action="store_true", help="Start a fresh investigation, retaining earlier evidence")
+    discovery = sub.add_parser("discover", help="Record follow-ups for manual authorization or automatic triage")
+    discovery.add_argument("id", help="Source task ID")
+    discovery.add_argument("--file", type=Path, help="JSON array of title/description/evidence/acceptance reports")
+    discovery.add_argument("--retry-create", action="store_true", help="Retry an uncertain issue creation only after checking GitHub for duplicates")
     for name in ("start", "prepare", "check", "submit", "resume", "review", "merge"):
         item = sub.add_parser(name, help={"start": "Claim a task and create or recover its worktree",
                                          "prepare": "Run project setup in a claimed worktree without invoking a model",
@@ -63,11 +78,16 @@ def parser():
     run = sub.add_parser("run", help="Optional orchestration: invoke Codex to implement and verify one task")
     run.add_argument("id", nargs="?")
     run.add_argument("--submit", action="store_true", help="Submit a draft PR after checks pass")
+    continuation = sub.add_parser("work", help="Continue a task through checks, bounded repair and configured delivery")
+    continuation.add_argument("id", nargs="?", help="Task to continue; otherwise recover pending work or select an authorized task")
+    continuation.add_argument("--retry", action="store_true", help="After resolving a handoff, explicitly start another bounded attempt budget")
     worker = sub.add_parser("watch", help="Optional orchestration: serial Codex tasks through configured delivery policy")
     worker.add_argument("--poll-interval", "--interval", type=positive_integer, default=60,
                         help="Seconds between empty-queue and merge-gate polls (default: 60)")
     worker.add_argument("--max-tasks", "--limit", type=positive_integer,
                         help="Stop after this many deliveries (post-merge acceptance in auto mode; default: keep watching)")
+    worker.add_argument("--reset-budget", action="store_true",
+                        help="Explicitly renew autonomous dispatch budget; ordinary restarts retain usage")
     return root
 
 
@@ -94,7 +114,8 @@ def doctor(config, *, with_codex=False):
               {"id": "base", "ok": has_ref(config.root, config.base_ref), "value": config.base_ref},
               {"id": "acceptance", "ok": bool(config.data["checks"]), "count": len(config.data["checks"])},
               {"id": "git_identity", "ok": probe(["git", "var", "GIT_AUTHOR_IDENT"], config.root)}]
-    codex_required = with_codex or config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]
+    codex_required = (with_codex or config.data["delivery"]["auto_review"] or config.data["delivery"]["auto_merge"]
+                      or config.provider == "github" and config.data["discovery"]["auto_review"])
     if codex_required:
         checks += [{"id": "codex", "ok": shutil.which(executable) is not None},
                    {"id": "codex_login", "ok": probe([executable, "login", "status"], config.root)}]
@@ -134,12 +155,12 @@ def main(argv=None):
         if args.command == "init":
             with state.lock():
                 if args.sync_github:
-                    if args.provider or args.base:
-                        raise RelayError("--sync-github uses existing configuration; omit --provider and --base")
+                    if args.provider or args.base or args.mode:
+                        raise RelayError("--sync-github uses existing configuration; omit --provider and --base, and omit --mode")
                     config = load(root)
                     result = {"config": str(root / ".devrelay/config.toml"), "provider": config.provider}
                 else:
-                    result = initialize(root, args.provider, args.base)
+                    result = initialize(root, args.provider, args.base, mode=args.mode or "manual")
                     config = load(root)
                 state.set_metadata("controller_root", str(root))
                 if config.provider == "github" or args.sync_github:
@@ -151,11 +172,18 @@ def main(argv=None):
                 print(json.dumps(result, indent=2, ensure_ascii=False))
                 return 0 if result["ready"] else 1
             elif args.command in ("status", "task") and (args.command == "status" or args.task_command == "list"):
-                result = {"project": str(root), "tasks": state.tasks()}
+                result = {"project": str(root), "tasks": [{**task, "next_action": guidance(config, task)}
+                          for task in attach_sources(config, state, state.tasks())]}
+                if automatic_enabled(config):
+                    result.update(mode=config.data["queue"]["mode"], discovery_policy={
+                                      key: config.data["discovery"][key] for key in ("auto_triage", "auto_review")},
+                                  dispatch_budget=state.metadata("watch_budget"),
+                                  max_dispatches=config.data["queue"]["max_dispatches"])
             elif args.command == "next":
                 result = queue_report(config, snapshot(config, state))
             elif args.command == "watch":
                 result = watch(config, state, poll_interval=args.poll_interval, max_tasks=args.max_tasks,
+                               reset_budget=args.reset_budget,
                                emit=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True))
                 print(json.dumps(result, ensure_ascii=False), flush=True)
                 return 1 if result["status"] == "needs_attention" else 0
@@ -163,8 +191,25 @@ def main(argv=None):
                 with state.lock():
                     if args.command == "task" and args.task_command == "add":
                         result = add_local(config, state, args.id, args.title, args.file.read_text(), args.priority)
+                    elif args.command == "task" and args.task_command == "approve":
+                        from .providers import approve_local
+                        result = approve_local(config, state, args.id)
                     elif args.command == "task":
                         result = complete_local(config, state, args.id)
+                    elif args.command == "discover":
+                        try:
+                            reports = json.loads(args.file.read_text()) if args.file else None
+                        except ValueError as error:
+                            raise RelayError("Discovery file must be a JSON array") from error
+                        result = discover(config, state, args.id, reports, retry_create=args.retry_create, report_path=args.file)
+                    elif args.command == "triage":
+                        if args.file and args.retry:
+                            raise RelayError("Use triage --prepare --retry first, then submit the new context's result with --file")
+                        try:
+                            report = json.loads(args.file.read_text()) if args.file else None
+                        except ValueError as error:
+                            raise RelayError("Triage file must be a JSON object") from error
+                        result = triage(config, state, args.id, prepare_only=args.prepare, report=report, retry=args.retry)
                     elif args.command == "start":
                         result = start(config, state, args.id)
                     elif args.command == "prepare":
@@ -177,10 +222,17 @@ def main(argv=None):
                         result = review(config, state, args.id)
                     elif args.command == "merge":
                         result = merge(config, state, args.id, retry_request=args.retry_request)
+                    elif args.command == "work":
+                        if args.retry and not args.id:
+                            raise RelayError("work --retry requires a task ID")
+                        result = work(config, state, args.id, retry=args.retry)
                     else:
                         result = run_task(config, state, args.id, resume=args.command == "resume", submit_after=args.submit)
+        if isinstance(result, dict) and "id" in result and "status" in result:
+            result = {**result, "next_action": guidance(config, result)}
         print(json.dumps(result, indent=2, ensure_ascii=False))
-        return 0
+        return 1 if (result.get("handoff") or result.get("status") == "needs_attention"
+                     or args.command == "discover" and result.get("discovery_error")) else 0
     except (RelayError, OSError) as error:
         print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 1

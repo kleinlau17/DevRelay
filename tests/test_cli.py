@@ -97,6 +97,21 @@ class VersionTests(unittest.TestCase):
 
 
 class CliTests(RepositoryTest):
+    def test_work_delivers_local_task_and_status_explains_next_action(self):
+        self.configure(executable=self.fake_codex())
+        file = Path(self.temporary.name) / "task.md"
+        file.write_text("Fix one bounded behavior")
+        self.assertEqual(self.invoke("task", "add", "fix", "--title", "Fix value", "--file", str(file))[0], 0)
+        code, result = self.invoke("work", "fix")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "committed")
+        self.assertEqual(result["next_action"]["kind"], "delivered")
+        code, status = self.invoke("status")
+        self.assertEqual(status["tasks"][0]["next_action"]["kind"], "delivered")
+        code, error = self.invoke("work", "--retry")
+        self.assertEqual(code, 1)
+        self.assertIn("requires a task ID", error["error"])
+
     def invoke(self, *argv, project=None):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):

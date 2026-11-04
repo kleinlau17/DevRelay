@@ -4,7 +4,107 @@
 
 面向 Agent 的通用工程工具：让 Agent 自主规划、探索和实现，通过 DevRelay 完成工作树隔离、项目验收与受门禁约束的交付。
 
-主要工作流由外层 Agent 驱动，逐步调用 `next/start/prepare/check/submit`；DevRelay 管理工程状态和验收证据。`run/resume/watch` 保留为可选的 Codex 程序编排。项目负责定义安装命令与验收规则。0.4 版支持 macOS / Linux、Python 3.11+ 和 Git；核心没有第三方运行依赖。
+主要工作流由外层 Agent 驱动，逐步调用 `next/start/prepare/check/submit`；DevRelay 管理工程状态和验收证据。`work/watch` 提供可选的任务闭环，兼容 `run/resume`。项目负责定义安装命令与验收规则。0.4 版支持 macOS / Linux、Python 3.11+ 和 Git；核心没有第三方运行依赖。
+
+## 项目自动模式
+
+Agent 经 DevRelay 报告并创建的 Issue，默认自动分诊，符合范围后执行，生成的 PR 默认独立审查。人工 Issue 默认仍需逐条授权；将项目设为 `autonomous` 后，人工 Issue 也进入同一分诊流程。自动合并另行配置，默认关闭。
+
+新项目可用 `devrelay init --provider github --mode autonomous` 接入（工作中的新问题发现在两种模式下均默认启用）。已有项目在 `.devrelay/config.toml` 设置：
+
+```toml
+[queue]
+mode = "autonomous"  # 默认 manual：人工 Issue 仍逐条授权
+auto_kinds = ["bug"]
+scope = "修复已确认、预期行为明确的 Bug；产品和架构取舍交给维护者。"
+max_dispatches = 20
+
+[discovery]
+enabled = true
+
+[delivery]
+auto_review = true
+auto_merge = true
+required_checks = ["test"]  # 改为项目真实的必需 CI 名称
+```
+
+核对已有的 `[codex]` Agent 配置、`[[setup]]` 和 `[[checks]]` 后运行：
+
+```bash
+devrelay doctor --with-codex
+devrelay watch
+devrelay status  # 另一终端查看结果、待决问题与预算
+```
+
+流程为：**Issue / Agent 发现 → 去重与调查复现 → 确认项目范围及验收 → 实现 → 检查 → 独立审查与有限返工 → CI → 合并**。分诊在目标 base 的独立临时工作树进行；可以添加复现材料，不把这些改动混入实现分支。观察、命令日志和历史报告保留。重复或被证据否定的问题记为 `skip`，不会自动关闭原 Issue；无法复现、缺少信息或需要决策时记为 `needs_input`，列出具体问题。分诊是 Agent 的判断，交付仍须通过实际验收和独立审查。
+
+`auto_kinds` 可选 `bug`、`feature`、`maintenance`，默认只允许 Bug；`scope` 进一步限定范围。计划父 Issue 始终不能执行。人工添加 `auto:approved` 可明确授权单个范围例外，但不能绕过依赖、阻塞标签或验收。自动模式下要暂停某条任务，请添加 `blocked` / `needs-input` 等配置的阻塞标签；仅移除授权标签不等于撤销项目级自动授权。
+
+在 `status.next_action` 查看待决问题，把决定写入 Issue **正文**，必要时移除阻塞标签；`watch` 会重新分诊，已开始的任务在原实现会话继续。评论暂不作为输入。已确认的任务级阻塞、审查待决和返工预算耗尽只暂停该任务；其他独立任务继续。配置、网络/模型故障、准备环境失败、未知状态、合并结果不确定及合并后验收失败仍停止整个 worker。未完成的 CI 和远端合并队列保持串行等待。
+
+自动队列默认最多调度 20 个阶段（`manual` 项目只计算自动处理的发现任务，`autonomous` 项目计算全部任务）：一次分诊或一次完整开发交付循环各计 1，失败也计入；CI 轮询不重复计费。预算在启动前保存，重启不补满，`--limit` 仍只统计本次成功交付数。达到预算后查看现场，再执行 `devrelay watch --reset-budget` 明确开始新一轮。单任务返工仍受 `codex.max_attempts` 限制。
+
+工程工具模式可由外层 Agent 完成同样的分诊，无需启动内置 Codex：
+
+```bash
+devrelay next                         # 查看 triage_candidates
+devrelay triage 12 --prepare          # 返回 triage.context 内的工作树、prompt 和 schema 所在目录
+# 在该工作树调查，按 result-schema.json 输出结果，原样回填 context_sha256
+devrelay triage 12 --file result.json
+devrelay start 12                     # 分诊 ready 后继续 prepare/check/submit
+```
+
+`triage 12` 直接启动托管分诊；`triage 12 --retry` 显式重新调查并保留旧证据。分诊绑定 Issue 内容、项目范围、准备及验收配置；调查过程中 base 改变会拒收结果。Issue 或策略变更后重新判断，自动验收与审查也绑定实际分诊范围。已有配置默认保持 `manual`，`init` 不会改写已有配置，自动模式也不会自动开启合并。
+
+## 按任务推进
+
+需要 DevRelay 启动实现 Agent 时，用一个入口完成开发与交付：
+
+```bash
+devrelay work 12          # 实现 → 验收 → 审查 → 有限返工 → 交付
+devrelay status           # 查看 next_action、反馈和证据路径
+devrelay work 12          # 继续任务，不增加重试预算
+devrelay work 12 --retry  # 处理阻塞后，明确开启一轮新预算
+devrelay watch --limit 2  # 用同一闭环处理两个任务
+```
+
+`work` 不带 ID 时先恢复待完成任务，再领取已授权任务；GitHub 模式交付 PR，本地模式生成验证提交。`run --submit`、`resume ID --submit`、`watch` 共用这条推进路径；`resume --submit` 是显式重试。基础工具仍供外层 Agent 自主调用，不接管它的会话。
+
+人负责范围、验收及授权。实现 Agent 在原会话修复检查失败、独立审查提出的问题和明确 CI 失败，重跑检查并更新同一 PR；新提交由新的只读会话审查。缺失资源、审查无法完成、GitHub 人工批准、未解决线程、授权问题或预算耗尽会保留现场，通过 `handoff` / `next_action` 说明下一步。自动修复不能弱化验收或替人决定产品范围。
+
+`codex.max_attempts` 限制一个闭环预算内的实现调用总数，包含初次实现和返工，默认 2 次。调用前持久化；重启和 CI 等待不会补充预算，历史证据保留。目标 base 前进时，只自动合并干净的任务分支，随后重新验收、提交和审查；存在编辑或冲突则保留现场。
+
+业务 QA 由项目的 `[[checks]]` 定义，可以调用端到端测试、浏览器验收或项目脚本；只读代码审查不能证明未配置的用户行为已经通过。不同项目只需配置自己的安装与验收命令。
+
+证据按阶段过期：setup 变化影响准备、验收和审查；checks 变化影响验收和审查；模型/profile 变化只影响审查；普通队列与交付策略变化不要求重跑安装或本地检查；自动处理范围或分诊结论变化会重新绑定验收。操作进行中配置变化仍会停止。旧回执只在原完整配置未变时兼容，否则重新生成相应证据。源码、任务要求和 base 仍严格核对。
+
+## Agent 发现新问题
+
+实现和独立审查 Agent 默认收集当前工作中发现的新问题，自动生成后续任务。默认配置如下：
+
+```toml
+[discovery]
+enabled = true
+max_per_task = 3
+auto_triage = true  # 默认：创建后独立分诊，通过才执行
+auto_review = true  # 默认：自动审查该来源的 PR；合并另行配置
+```
+
+之后照常使用 `work/watch`。Agent 在结构化结果的 `discoveries` 中报告本次范围之外、已有证据的独立问题；DevRelay 保存来源任务、观察到的 HEAD/源码树、问题描述、复现或代码证据和验收标准，去重后创建 GitHub Issue。本地模式生成待分诊任务。工作中收集报告默认开启，已有配置省略 `discovery.enabled` 时也生效；显式设置 `enabled = false` 可关闭收集，原有显式关闭配置会保留。它不额外扫描仓库或调用模型，后续自动分诊与 PR 审查会各自启动独立 Agent。默认每个来源任务最多记录 3 个不同问题，跨重试累计，上限可配置为 1–20。
+
+新任务不添加执行授权标签。`discovery.auto_triage = true` 和 `discovery.auto_review = true` 默认生效，包括已有配置未写这两个字段的项目：即使 `queue.mode = "manual"`，也会独立分诊、确认范围后执行，并自动审查其 PR。`delivery.auto_review = false` 不会关闭发现任务的默认审查；显式设置 `discovery.auto_review = false` 可关闭这项来源规则，全项目审查或合并开关仍优先。设置 `discovery.auto_triage = false` 可关闭发现任务的自动授权；若项目仍是 `manual`，需加授权标签或本地执行 `devrelay task approve ID`。发现问题不代表经过独立验证；当前改动引入的回归、失败验收和未完成要求仍属于原任务，不能转成新 Issue 来绕过交付门禁。
+
+外层 Agent 可直接调用同一入口，无需启用托管发现或安装 Codex：
+
+```bash
+devrelay discover 12 --file /path/to/discoveries.json
+devrelay status
+devrelay discover 12  # 重试保存的报告；不重新调用模型
+```
+
+文件是包含 `title`、`description`、`evidence`、`acceptance` 四个非空字符串的 JSON 数组，见 [报告示例](examples/discoveries.json)。来源任务须已有工作树；发布新任务时会重新核对来源任务授权。模型不直接创建 Issue 或授权，控制器负责发布，所有 CLI 写操作仍使用同一个仓库锁。
+
+通过持久化标记和忽略大小写/连续空白的标题去重，已关闭的同名 Issue 也会复用，不自动重开；不同措辞的相同问题仍可能需要人工合并。已有人工 Issue 不会被覆盖或重新授权。来源识别需要本仓库保存的创建记录与对应 Issue 标记；仅复制正文标记、添加标签或用机器人账号创建 Issue，不会获得自动策略。请保留生成的来源标记和本地运行状态；跨机器迁移缺少记录时需显式授权。报告和重复观察保存在来源任务的 `discoveries`，发布失败保存在 `discovery_error`，不改变原任务的验收结论。若 GitHub 创建请求的结果不确定，普通重试只回读，不重复发送；确认远端没有该 Issue 后才用 `devrelay discover 12 --retry-create`。发布失败不阻断原任务交付，需按 `discovery_error.next` 单独恢复。
 
 ## 安装
 
@@ -62,32 +162,31 @@ devrelay --project /path/to/project check 12
 devrelay --project /path/to/project submit 12
 ```
 
-从主 checkout 调用工具，读取 JSON 返回值中的工作树、状态和证据路径。`start` 只领取并创建或恢复工作树；`prepare` 在已领取的工作树中执行配置的全部 setup 命令，不调用模型，每次显式调用都重跑并使旧验收、AI 审查与合并门禁记录失效，历史日志保留，完成后需重新 `check`。准备失败或中断保存现场与日志，修复原因后重试 `prepare`。配置了 setup 时，准备缺失、失败或配置已过期都会阻止验收与交付。`check` 不启动实现 Agent；失败后由外层 Agent 读取证据并修复，再调用 `check`。`submit` 默认交付 draft PR；如果项目明确启用了自动审查或合并，它仍会推进相应策略。
+从主 checkout 调用工具，读取 JSON 返回值中的工作树、状态和证据路径。`start` 只领取并创建或恢复工作树；`prepare` 在已领取的工作树中执行配置的全部 setup 命令，不调用模型，每次显式调用都重跑并使旧验收、AI 审查与合并门禁记录失效，历史日志保留，完成后需重新 `check`。准备失败或中断保存现场与日志，修复原因后重试 `prepare`。配置了 setup 时，准备缺失、失败或配置已过期都会阻止验收与交付。`check` 不启动实现 Agent；失败后由外层 Agent 读取证据并修复，再调用 `check`。`submit` 默认交付 draft PR，并推进适用于该任务的自动审查或合并策略；发现任务默认自动审查。
 
 已有本地提交或未合并 PR 的任务可以重新 `prepare`，再 `check/submit`，继续使用原分支与 PR。对已有 PR 会回读仓库、状态、head 与 base；已关闭、已合并、正在合并或身份不符时拒绝准备，保留现场并转入交付恢复。环境配置改变后，应先把最新目标分支集成到任务分支。`submit` 在提交、推送、PR 发布和回读边界重新比较任务标题、正文、授权、源码、配置与 base；观察到变化即停止，保留已发生的提交、推送及已回读的 PR 身份，重新验收后恢复，不自动回滚。
 
 外层 Agent 的会话、计划、实验预算及工作树编辑期间的独占由外层负责。DevRelay 的单 worker 锁只覆盖工具命令执行，不覆盖两次调用之间的编辑；不要同时为该仓库启动 `watch`。恢复时先查看 `status` 和实际工作树，再继续编辑或重试工具。`resume` 专用于可选的 DevRelay Codex 编排，不能恢复外层 Agent 的会话。
 
-`doctor` 默认检查工程工具，并检查已配置的 AI 交付依赖；启用了 `auto_review` 或 `auto_merge` 时仍要求 Codex。使用可选编排或显式 `review` 前运行 `doctor --with-codex`。完整操作约定见 [Agent 工作流](docs/agent-workflow.md)。
+`doctor` 默认检查工程工具和 AI 交付依赖；GitHub 项目的发现 PR 默认审查也要求 Codex。仅使用外部 Agent 且不需要内置审查时，可关闭 `discovery.auto_review` 与全项目自动交付开关。使用可选编排或显式 `review` 前运行 `doctor --with-codex`。完整操作约定见 [Agent 工作流](docs/agent-workflow.md)。
 
 ### GitHub 标签与 Issue 模板
 
 GitHub 项目首次 `init` 会使用已认证的 `gh` 补齐仓库标签，并生成 `.github/ISSUE_TEMPLATE/devrelay-{bug,task,experiment,plan}.md`。需要对该仓库创建标签的权限；本地模式仍完全离线。标签直接创建在 GitHub，模板写入本地，提交到仓库默认分支后才会出现在新建 Issue 页面。初始化不会替你提交或推送文件。
 
-默认标签沿用 DexLab 的管理规则：
+默认只创建通用任务与队列标签；项目领域标签自行管理：
 
 | 维度 | 标签 |
 |---|---|
 | 主要任务类型 | `bug`、`enhancement`、`documentation`、`experiment`、`infrastructure` |
 | 总体计划 | `scope:plan`（只跟踪子任务，队列拒绝执行） |
-| 相关范围 | `area:backend`、`area:benchmark`、`area:cloth`、`area:contact`、`area:evaluation`、`area:hardware` |
-| 唯一优先级 | `priority:P0`（首要修复）、`priority:P1`（当前核心交付）、`priority:P2`（后续扩展） |
+| 可选优先级（最多一档） | `priority:P0`（首要修复）、`priority:P1`（当前核心交付）、`priority:P2`（后续扩展） |
 | 执行授权 | `auto:approved` |
 | 阻塞 | `blocked`、`needs-input` |
 
 一个 Issue 对应一个可观察、可审查结果。实现该结果所需的代码、配置、测试和文档放在一起；只有具备独立价值或验收标准才拆子项，不仅按文件、层或阶段拆分。维护者在授权前确认粒度，执行与 AI 审查提示词也遵守该规则；队列不自动判断自然语言任务是否应该拆分。
 
-模板包含问题与证据、交付范围、验收与命令、唯一的 `Depends on: none` 声明、资源与恢复条件。Bug、工程任务、实验模板只预设类型标签；总体计划模板预设 `scope:plan` 并在正文写入 `Task kind: plan`，只跟踪子任务。**任何生成的模板都不自动给新 Issue 加 `auto:approved` 或配置的授权标签，也不自动设优先级。** 创建仓库标签本身不授权任何 Issue；维护者确认任务后另行设置一个优先级及授权。依赖、阻塞和验收仍需满足。
+模板包含问题与证据、交付范围、验收与命令、唯一的 `Depends on: none` 声明、资源与恢复条件。Bug、工程任务、实验模板只预设类型标签；总体计划模板预设 `scope:plan` 并在正文写入 `Task kind: plan`，只跟踪子任务。**任何生成的模板都不自动给新 Issue 加 `auto:approved` 或配置的授权标签，也不自动设优先级。** 创建仓库标签本身不授权任何 Issue；维护者确认任务后另行授权；优先级可选。依赖、阻塞和验收仍需满足。
 
 带 `scope:plan` 标签或正文独立行 `Task kind: plan` 的总体计划父任务，即使误加授权也会被队列拒绝；旧模板的 `## Child issues and delivery plan / 子任务与交付计划` 标题也会被识别。该限制同时用于 GitHub／本地任务、自动选取及显式指定 ID 的执行、恢复和提交授权检查。普通子任务的 `Parent: #N` 链接不影响资格；不要把父任务写成必须先完成的依赖，否则子任务会等待父任务。未使用这些标记的自定义计划须由维护者补标记；`init --sync-github` 保留已有模板，不会自动升级它们。
 
@@ -101,7 +200,7 @@ devrelay --project /path/to/project init --sync-github
 
 ## GitHub Issue 队列
 
-Issue 须开放，带 `auto:approved` 和唯一的 `priority:P0/P1/P2`，没有 `blocked` / `needs-input`，且正文包含唯一依赖声明：
+Issue 须开放，已按项目模式获得执行授权，没有 `blocked` / `needs-input`。默认 `manual` 模式要求 `auto:approved`；`autonomous` 模式也接受当前有效且符合范围的 `ready` 分诊。优先级可省略，默认为配置中的第二档（仅一档时使用该档），多个优先级仍拒绝。未填写依赖行表示无依赖；显式声明必须合法且唯一：
 
 ```text
 Depends on: none
@@ -109,7 +208,7 @@ Depends on: none
 Depends on: #12, #27
 ```
 
-依赖须已关闭，关联关闭它的 PR 已合并到目标分支，且合并提交位于最新目标分支祖先链。开放 PR（包括其他分支上明确 Refs 的 PR）和已有工作树会排除重复领取。`next` 返回选择与全部排除原因，不领取任务；它会读取 GitHub 并刷新目标分支。
+依赖须已关闭，关联关闭它的 PR 已合并到目标分支，且合并提交位于最新目标分支祖先链。开放 PR（包括其他分支上明确 Refs 的 PR）和已有工作树会排除重复领取。`next` 返回选择与全部排除原因，不领取任务；它会读取 GitHub 并刷新目标分支。超过 CLI 的 1,000 项窗口时改用游标分页，不再按仓库历史总量拒绝；分页不完整仍会阻断，大仓库的完整快照可能较慢。
 
 ```bash
 devrelay next
@@ -155,12 +254,12 @@ devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
 
 `--interval` 是 `--poll-interval` 的简短别名，例如 `watch --interval 30`；两种写法都要求正整数，默认值均为 60 秒。
 
-`--limit` 是 `--max-tasks` 的简短别名，例如 `watch --limit 2`；两种写法都要求正整数，省略时默认不限制任务数量。
+`--limit` 是 `--max-tasks` 的简短别名，例如 `watch --limit 2`；两种写法都要求正整数，省略时不限制成功交付数量；项目自动模式仍受持久化调度预算限制。
 
 `watch` 按配置的优先级和创建时间串行领取已授权、依赖已交付的 Issue，执行开发、验收、draft PR 和启用的独立只读审查。项目 `.devrelay/config.toml` 的 `[delivery] auto_merge` 明确选择交付模式；默认 `false`，CLI 不会替你开启授权：
 
 - **人工合并**（`auto_merge = false`）：提交 draft PR（及启用的审查）成功后立即领取下一条，不等待合并，不将 draft 标为 ready，已提交任务不会重复开发。
-- **验收通过后自动合并**（`auto_merge = true`）：强制包含独立审查；满足证据、CI、GitHub 审查与分支保护后请求准确 HEAD 合并，等待 GitHub 确认 `MERGED`，重跑合并后 setup/checks 并完成配置的清理，记录 `completed` 后才领取下一条。适用 CI、必需人工批准和保护条件尚未满足时，保留当前任务并按 `--poll-interval` 轮询；不会在等待期间领取其他 Issue。
+- **验收通过后自动合并**（`auto_merge = true`）：强制包含独立审查；满足证据、CI、GitHub 审查与分支保护后请求准确 HEAD 合并，等待 GitHub 确认 `MERGED`，执行项目配置要求的合并后验收与清理，正常交付记录 `completed` 后领取下一条；项目自动模式也允许暂停已知任务级待决后继续独立任务。适用 CI、必需人工批准和保护条件尚未满足时，保留当前任务并按 `--poll-interval` 轮询；不会在等待期间领取其他 Issue。
 
 队列为空时也按 `--poll-interval`（默认 60 秒）检查，新 Issue 获授权后即可被领取。原有授权、阻塞、依赖、重复领取和验收门禁全部保留。自动模式的配置示例见下节；仅修改配置不会启动执行器。
 
@@ -168,7 +267,7 @@ devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
 
 运行期间一直持有单 worker 锁，包括空队列、CI 和合并队列等待时；`status` / `next` 仍可查看状态，其他 DevRelay 写操作需要先停止 `watch`。`Ctrl+C` 或 `SIGTERM` 退出 130 并保留现场。重新启动优先恢复中断的实现、提交和交付；自动模式回读已有 PR、复用仍有效的审查，恢复排队合并、合并后验收及清理。审查进程已成功且完整证据已保存时直接恢复结论；没有完整证据的审查停在 `review_blocked`，需显式 `review ID`，不会默默重复调用审查。人工模式的 PR 留给维护者合并。
 
-验收失败、外部阻塞、审查拒绝、失败/跳过的 CI、未解决审查反馈、冲突、撤销授权、证据过期、网络/API 错误或配置变动会停止领取并保留工作树与日志。尚未出现/完成的 CI 和待满足的保护条件继续等待。检查 `devrelay status`，按 `resume` / `check` / `submit` / `review` / `merge` 明确恢复后，再启动 `watch`；`post_merge_failed` 和 `cleanup_failed` 不会自动重试。新任务从最新目标分支开始；依赖任务仍须关闭且交付关联的 PR 已合并。
+检查失败、可操作的独立审查意见和明确 CI 失败在总预算内自动返工。人工授权任务中，外部阻塞、无法完成的审查、未知 CI 状态、未解决的 GitHub 审查反馈、冲突、撤销授权、网络/API 错误和预算耗尽会停止并保留证据。自动处理的发现任务和项目自动模式会暂停已知的任务级待决和返工耗尽，继续其他任务；未知状态和仓库级故障仍停止。尚未完成的 CI 与保护条件继续等待。查看 `status` 的 `next_action`，处理后执行 `work ID --retry`；合并请求结果不确定时仍需专门的 `merge ID --retry-request`。
 
 ## 自动审查与合并
 
@@ -184,7 +283,7 @@ cleanup_worktrees = true
 cleanup_branches = true
 ```
 
-两个自动开关默认均为 `false`。仅开启 `auto_review` 会审查并保留 draft；开启 `auto_merge` 会自动包含审查，通过门禁后标记 ready 并请求 squash 合并。`required_checks` 防止预期 CI 尚未出现就被忽略；所有已报告检查也必须成功。跳过、中立、失败或运行中的检查不算成功。没有 CI 时默认等待；确实没有 GitHub CI 的项目可明确设置 `allow_no_ci = true`，本地验收与审查仍须通过，指定的必需检查也不会豁免。
+`[delivery]` 的两个全项目开关默认均为 `false`；发现任务的 PR 另外默认启用 `discovery.auto_review`。仅开启 `auto_review` 会审查并保留 draft；开启 `auto_merge` 会自动包含审查，通过门禁后标记 ready 并请求 squash 合并。`required_checks` 防止预期 CI 尚未出现就被忽略；必需检查必须成功，非必需的 SKIPPED 检查可通过。中立、失败或运行中的检查仍不通过。没有 CI 时默认等待；确实没有 GitHub CI 的项目可明确设置 `allow_no_ci = true`，本地验收与审查仍须通过，指定的必需检查也不会豁免。
 
 ```bash
 devrelay submit 12         # 已验收实现 → draft PR → 启用的审查/合并策略
@@ -203,15 +302,15 @@ devrelay resume 12 --submit
 
 审查崩溃恢复只读取本任务直属、实际归属一致且无符号链接的运行目录与证据文件；进程回执必须匹配当前工作树、日志路径及配置的只读审查命令。证据缺失、身份不符或路径越界时保留现场并要求显式 `review ID`，不重用无关 approve、不在任务目录之外写入审查结果。
 
-合并后刷新目标分支，核对合并提交的祖先关系与源码树，再在新的 detached 工作树执行全部 setup 和 checks，通过后记录 `completed`。API 超时会先回读远端，已合并时只恢复验收。合并后树不一致或验收失败保存 `post_merge_failed`，阻止无 ID 自动派发；保留失败工作树与证据。GitHub 的 HEAD 条件不原子锁定 base，因此合并前刷新与合并后树核对都需要；失败后合并已发生，需要维护者处理，DevRelay 不自动回滚。
+合并后始终核对目标分支祖先关系与准确源码树。默认在新 detached 工作树执行全部 setup/checks；项目可设置 `delivery.post_merge_checks = false` 省去这轮命令，不创建验收工作树，但仍核对合并身份与源码树。回执记录 `commands_run`，重新开启该选项会补跑检查。通过配置要求后记录 `completed`。API 超时会先回读远端，已合并时只恢复验收。合并后树不一致或验收失败保存 `post_merge_failed`，阻止无 ID 自动派发；保留失败工作树与证据。GitHub 的 HEAD 条件不原子锁定 base，因此合并前刷新与合并后树核对都需要；失败后合并已发生，需要维护者处理，DevRelay 不自动回滚。
 
-若需要修改 PR，先在保留的任务工作树修复，执行 `check ID`、`submit ID`；新提交会使旧审查失效。配置改动也要求重新验收。Issue 的关闭与依赖交付关联仍由维护者管理；自动合并不扩大 Issue 的关闭范围。
+若需要修改 PR，先在保留的任务工作树修复，执行 `check ID`、`submit ID`；新提交会使旧审查失效。配置改动按受影响的阶段使证据过期，见上文。Issue 的关闭与依赖交付关联仍由维护者管理；自动合并不扩大 Issue 的关闭范围。
 
 ### 合并后清理
 
 `cleanup_worktrees` 和 `cleanup_branches` 默认均为 `false`，在运行任务前按项目开启。前者删除成功任务的实现 worktree；后者删除该任务的本地、远端及本地远端跟踪分支，需要同时开启 worktree 清理。仅开启 `cleanup_worktrees` 可以保留分支。
 
-清理要求远端 PR 已合并、合并提交仍在目标分支中、合并后 setup/checks 已通过。验收失败保留任务分支、实现 worktree 和失败的验收 worktree；即使之后重试成功，旧的失败验收 worktree 也保留，并列在 `retained_worktrees`。成功验收的临时 detached worktree 仍按原行为自动回收。
+清理要求远端 PR 已合并、合并提交仍在目标分支中、配置要求的合并后验收已通过。验收失败保留任务分支、实现 worktree 和失败的验收 worktree；即使之后重试成功，旧的失败验收 worktree 也保留，并列在 `retained_worktrees`。成功验收的临时 detached worktree 仍按原行为自动回收。
 
 清理只针对任务记录的路径和准确提交，不强制删除 worktree，不批量 prune。新的已跟踪/未忽略文件改动、锁定的 worktree、分支推进或被其他 worktree 使用都会停止清理。删除 worktree 会回收其中被忽略的环境、缓存和输出；需要长期保存的文件应放在工作树外。验证、审查、清理日志及任务状态保存在 Git common directory，始终保留。
 
@@ -259,7 +358,7 @@ devrelay submit fix-1 --local
 
 本仓库的 `.devrelay/config.toml` 已配置自维护：经授权的 GitHub Issues 在独立工作树中实现，运行完整测试并创建 draft PR，再进行独立只读 AI 审查。自动合并关闭；合并后的验收与清理可通过 `devrelay merge ID` 执行。
 
-自维护的可选编排执行器和 AI 审查固定使用 `gpt-6.1-sol`，已用 Codex CLI `0.162.1` 验证。若旧 CLI 拒绝此模型，先升级 CLI；修改模型配置后，已有任务需要重新验收与审查。外层 Agent 的模型由其宿主控制。
+自维护的可选编排执行器和 AI 审查固定使用 `gpt-6.1-sol`，已用 Codex CLI `0.162.1` 验证。若旧 CLI 拒绝此模型，先升级 CLI；修改模型配置后需要重新审查，仍有效的环境准备与本地验收可复用。外层 Agent 的模型由其宿主控制。
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v

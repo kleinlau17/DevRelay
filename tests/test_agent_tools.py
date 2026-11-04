@@ -85,6 +85,18 @@ class AgentToolTests(RepositoryTest):
         self.assertTrue(report["codex_required"])
         self.assertFalse(next(item for item in report["checks"] if item["id"] == "codex")["ok"])
 
+    def test_github_default_discovery_review_requires_codex_but_can_be_disabled(self):
+        self.configure(provider="github", executable="/no-such-devrelay-codex")
+        with patch("devrelay.cli.validate_remote"), patch("devrelay.cli.probe", return_value=True):
+            report = doctor(self.config)
+            self.assertTrue(report["codex_required"])
+            self.assertFalse(report["ready"])
+            path = self.root / ".devrelay/config.toml"
+            path.write_text(path.read_text() + "\n[discovery]\nauto_review = false\n")
+            report = doctor(load(self.root))
+            self.assertFalse(report["codex_required"])
+            self.assertNotIn("codex", {item["id"] for item in report["checks"]})
+
     def test_prepare_failure_retains_work_and_can_be_retried(self):
         self.configure(executable="/no-such-devrelay-codex", setup=[[
             sys.executable, "-c", "from pathlib import Path; assert Path('allow-setup').exists()",
