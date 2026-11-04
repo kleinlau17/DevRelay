@@ -186,6 +186,8 @@ The external host owns agent sessions, plans, experiment budgets and exclusive e
 
 `doctor` checks engineering tools and AI delivery dependencies, including default discovery PR review for GitHub projects. External-only workflows without built-in review can disable `discovery.auto_review` and global automatic delivery. Run `doctor --with-codex` before optional orchestration or explicit `review`. See the [agent workflow](docs/agent-workflow.md) for the complete operating agreement.
 
+The GitHub login check uses `gh api --hostname github.com user --silent` to verify API access with the effective credentials, including credentials supplied through environment variables. Expired credentials for inactive accounts do not cause false failures. Authentication failures, network/API errors, an unavailable command or a timeout still produce `github_login=false` and `ready=false`. This check does not establish read/write permissions for the target repository; DevRelay does not switch accounts or change authentication configuration.
+
 ## GitHub queue
 
 ### Labels and issue templates

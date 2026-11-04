@@ -186,6 +186,8 @@ devrelay --project /path/to/project submit 12
 
 `doctor` 默认检查工程工具和 AI 交付依赖；GitHub 项目的发现 PR 默认审查也要求 Codex。仅使用外部 Agent 且不需要内置审查时，可关闭 `discovery.auto_review` 与全项目自动交付开关。使用可选编排或显式 `review` 前运行 `doctor --with-codex`。完整操作约定见 [Agent 工作流](docs/agent-workflow.md)。
 
+GitHub 登录项通过 `gh api --hostname github.com user --silent` 检查当前生效凭据（包括环境变量提供的凭据）的实际 API 访问；未启用旧账号的失效凭据不会导致误报。认证失败、网络/API 错误、命令不可用或超时仍会使 `github_login=false`、`ready=false`。这项检查不代表已具备目标仓库读写权限；DevRelay 不切换账号或更改登录配置。
+
 ### GitHub 标签与 Issue 模板
 
 GitHub 项目首次 `init` 会使用已认证的 `gh` 补齐仓库标签，并生成 `.github/ISSUE_TEMPLATE/devrelay-{bug,task,experiment,plan}.md`。需要对该仓库创建标签的权限；本地模式仍完全离线。标签直接创建在 GitHub，模板写入本地，提交到仓库默认分支后才会出现在新建 Issue 页面。初始化不会替你提交或推送文件。

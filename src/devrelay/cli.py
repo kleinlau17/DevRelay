@@ -128,8 +128,9 @@ def doctor(config, *, with_codex=False):
             matches = True
         except RelayError:
             matches = False
+        # Check the credentials gh actually uses; auth status also checks inactive accounts.
         checks += [{"id": "gh", "ok": shutil.which("gh") is not None},
-                   {"id": "github_login", "ok": probe(["gh", "auth", "status", "--hostname", "github.com"], config.root)},
+                   {"id": "github_login", "ok": probe(["gh", "api", "--hostname", "github.com", "user", "--silent"], config.root)},
                    {"id": "remote_matches_repository", "ok": matches}]
     return {"ready": all(item["ok"] for item in checks), "provider": config.provider,
             "checks": checks, "codex_required": codex_required,
