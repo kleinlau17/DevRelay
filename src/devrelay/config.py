@@ -17,6 +17,29 @@ class Config:
     data: dict
     fingerprint: str
 
+    def stage_fingerprint(self, stage):
+        """Bind receipts only to inputs that affect their stage, not scheduling policy."""
+        inputs = {"project": self.data["project"], "setup": self.data["setup"]}
+        if stage in ("checks", "review", "delivery"):
+            inputs["checks"] = self.data["checks"]
+        if stage in ("review", "delivery"):
+            inputs["reviewer"] = {key: value for key, value in self.data["codex"].items()
+                                  if key not in ("max_attempts", "sandbox")}
+        if stage == "delivery":
+            inputs.update(queue=self.data["queue"], delivery=self.data["delivery"])
+            inputs["discovery_policy"] = {key: self.data["discovery"][key] for key in ("auto_triage", "auto_review")}
+        if stage not in ("setup", "checks", "review", "delivery"):
+            raise ValueError(f"Unknown evidence stage: {stage}")
+        return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+    def matches_evidence(self, record, stage):
+        """Old receipts remain valid only under their original full configuration."""
+        if not record:
+            return False
+        key = stage + "_sha256"
+        return (record[key] == self.stage_fingerprint(stage) if key in record
+                else record.get("config_sha256") == self.fingerprint)
+
     @property
     def provider(self):
         return self.data["project"]["provider"]
@@ -66,7 +89,7 @@ def load(root):
 
 def validate(root, data):
     """Validate explicit configuration without running discovery or writing files."""
-    _keys(data, ("project", "queue", "codex", "delivery", "setup", "checks"), "configuration")
+    _keys(data, ("project", "queue", "codex", "delivery", "discovery", "setup", "checks"), "configuration")
     project = _table(data, "project")
     _keys(project, ("provider", "base_branch", "remote", "branch_prefix", "repository"), "project")
     for key, default in {"provider": "local", "base_branch": "main", "remote": "origin",
@@ -84,7 +107,21 @@ def validate(root, data):
     git(root, "check-ref-format", "--branch", project["base_branch"])
     git(root, "check-ref-format", "--branch", project["branch_prefix"] + "example")
     queue = _table(data, "queue")
-    _keys(queue, ("approval_label", "priorities", "blockers"), "queue")
+    _keys(queue, ("approval_label", "priorities", "blockers", "mode", "auto_kinds", "scope", "max_dispatches"), "queue")
+    queue.setdefault("mode", "manual")
+    queue.setdefault("auto_kinds", ["bug"])
+    queue.setdefault("scope", "Fix confirmed bugs with clear expected behavior and bounded acceptance.")
+    queue.setdefault("max_dispatches", 20)
+    if queue["mode"] not in ("manual", "autonomous"):
+        raise RelayError("queue.mode must be manual or autonomous")
+    kinds = queue["auto_kinds"]
+    if (not isinstance(kinds, list) or not kinds or any(kind not in ("bug", "feature", "maintenance") for kind in kinds)
+            or len(set(kinds)) != len(kinds)):
+        raise RelayError("queue.auto_kinds must contain unique bug/feature/maintenance kinds")
+    if not isinstance(queue["scope"], str) or not queue["scope"].strip() or len(queue["scope"]) > 8000:
+        raise RelayError("queue.scope must be a nonempty string of at most 8000 characters")
+    if type(queue["max_dispatches"]) is not int or not 1 <= queue["max_dispatches"] <= 1000:
+        raise RelayError("queue.max_dispatches must be an integer between 1 and 1000")
     queue.setdefault("approval_label", "auto:approved")
     queue.setdefault("priorities", ["priority:P0", "priority:P1", "priority:P2"])
     queue.setdefault("blockers", ["blocked", "needs-input"])
@@ -95,6 +132,18 @@ def validate(root, data):
             raise RelayError(f"queue.{key} must contain unique nonempty strings")
     if not isinstance(queue["approval_label"], str) or not queue["approval_label"]:
         raise RelayError("queue.approval_label must be a nonempty string")
+    discovery = _table(data, "discovery")
+    _keys(discovery, ("enabled", "max_per_task", "auto_triage", "auto_review"), "discovery")
+    discovery.setdefault("enabled", True)
+    for key in ("auto_triage", "auto_review"):
+        discovery.setdefault(key, True)
+        if type(discovery[key]) is not bool:
+            raise RelayError(f"discovery.{key} must be a boolean")
+    discovery.setdefault("max_per_task", 3)
+    if type(discovery["enabled"]) is not bool:
+        raise RelayError("discovery.enabled must be a boolean")
+    if type(discovery["max_per_task"]) is not int or not 1 <= discovery["max_per_task"] <= 20:
+        raise RelayError("discovery.max_per_task must be an integer between 1 and 20")
     codex = _table(data, "codex")
     _keys(codex, ("executable", "sandbox", "timeout_seconds", "max_attempts", "model", "profile"), "codex")
     codex.setdefault("executable", "codex")
@@ -111,8 +160,9 @@ def validate(root, data):
         if type(value) is not int or value <= 0:
             raise RelayError(f"codex.{key} must be a positive integer")
     delivery = _table(data, "delivery")
-    _keys(delivery, ("auto_review", "auto_merge", "required_checks", "allow_no_ci", "cleanup_branches", "cleanup_worktrees"), "delivery")
-    for key in ("auto_review", "auto_merge", "allow_no_ci", "cleanup_branches", "cleanup_worktrees"):
+    _keys(delivery, ("auto_review", "auto_merge", "required_checks", "allow_no_ci", "cleanup_branches", "cleanup_worktrees", "post_merge_checks"), "delivery")
+    delivery.setdefault("post_merge_checks", True)
+    for key in ("auto_review", "auto_merge", "allow_no_ci", "cleanup_branches", "cleanup_worktrees", "post_merge_checks"):
         delivery.setdefault(key, False)
         if type(delivery[key]) is not bool:
             raise RelayError(f"delivery.{key} must be a boolean")
@@ -187,7 +237,7 @@ def detect(root):
     return setup, checks, notes
 
 
-def initialize(root, provider=None, base=None):
+def initialize(root, provider=None, base=None, *, mode="manual"):
     directory = root / ".devrelay"
     path = directory / "config.toml"
     if path.exists():
@@ -216,13 +266,17 @@ def initialize(root, provider=None, base=None):
              'branch_prefix = "devrelay/task-"']
     if slug:
         lines.append(f"repository = {q(slug)}")
-    lines += ["", "[queue]", 'approval_label = "auto:approved"',
+    lines += ["", "[queue]", f'mode = {q(mode)}', 'auto_kinds = ["bug"]',
+              'scope = "Fix confirmed bugs with clear expected behavior and bounded acceptance."',
+              'max_dispatches = 20', 'approval_label = "auto:approved"',
               'priorities = ["priority:P0", "priority:P1", "priority:P2"]',
               'blockers = ["blocked", "needs-input"]', "", "[codex]",
               'executable = "codex"', 'sandbox = "workspace-write"',
               "timeout_seconds = 1800", "max_attempts = 2", "", "[delivery]",
               "auto_review = false", "auto_merge = false", "required_checks = []", "allow_no_ci = false",
-              "cleanup_branches = false", "cleanup_worktrees = false"]
+              "cleanup_branches = false", "cleanup_worktrees = false", "post_merge_checks = true",
+              "", "[discovery]", "enabled = true",
+              "auto_triage = true", "auto_review = true", "max_per_task = 3"]
     for phase, entries in (("setup", setup), ("checks", checks)):
         for entry in entries:
             lines += ["", f"[[{phase}]]", f"id = {q(entry['id'])}", f"argv = {q(entry['argv'])}", "timeout_seconds = 600"]

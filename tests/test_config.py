@@ -13,6 +13,26 @@ from helpers import RepositoryTest
 
 
 class ConfigurationTests(RepositoryTest):
+    def test_receipts_only_expire_when_their_stage_inputs_change(self):
+        self.configure()
+        original = self.config
+        path = self.root / ".devrelay/config.toml"
+        source = path.read_text()
+        path.write_text(source.replace("max_attempts = 2", "max_attempts = 9"))
+        changed = load(self.root)
+        for stage in ("setup", "checks", "review"):
+            self.assertEqual(original.stage_fingerprint(stage), changed.stage_fingerprint(stage))
+        path.write_text(source.replace("[codex]", '[codex]\nmodel = "different-model"'))
+        changed = load(self.root)
+        for stage in ("setup", "checks"):
+            self.assertEqual(original.stage_fingerprint(stage), changed.stage_fingerprint(stage))
+        self.assertNotEqual(original.stage_fingerprint("review"), changed.stage_fingerprint("review"))
+        path.write_text(source.replace('id = "checks-0"', 'id = "different-check"'))
+        changed = load(self.root)
+        self.assertEqual(original.stage_fingerprint("setup"), changed.stage_fingerprint("setup"))
+        self.assertNotEqual(original.stage_fingerprint("checks"), changed.stage_fingerprint("checks"))
+        self.assertFalse(changed.matches_evidence({"config_sha256": original.fingerprint}, "checks"))
+
     def test_init_preserves_instructions_and_ignore_rules(self):
         (self.root / "AGENTS.md").write_text("Existing project rules")
         before = (self.root / ".gitignore").read_text()
@@ -21,9 +41,12 @@ class ConfigurationTests(RepositoryTest):
         self.assertEqual((self.root / "AGENTS.md").read_text(), "Existing project rules")
         self.assertTrue((self.root / ".gitignore").read_text().startswith(before))
         self.assertEqual(load(self.root).base, "main")
+        self.assertEqual(load(self.root).data["discovery"], {"enabled": True, "auto_triage": True,
+                                                         "auto_review": True, "max_per_task": 3})
         self.assertEqual(load(self.root).data["delivery"], {"auto_review": False, "auto_merge": False,
                                                         "allow_no_ci": False, "required_checks": [],
-                                                        "cleanup_branches": False, "cleanup_worktrees": False})
+                                                        "cleanup_branches": False, "cleanup_worktrees": False,
+                                                        "post_merge_checks": True})
         original = (self.root / ".devrelay/config.toml").read_text()
         with self.assertRaisesRegex(RelayError, "already exists"):
             initialize(self.root)
