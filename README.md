@@ -12,15 +12,17 @@
 
 ### 1. 准备项目（首次使用）
 
-按[安装说明](#安装)安装 DevRelay，并准备好已登录的 GitHub CLI（`gh`）。内置 Codex 执行和 AI 审查还需要已安装、已登录的 Codex CLI；默认的发现任务审查也会用到它。使用虚拟环境安装时，先激活该环境，再运行以下命令。
+按[安装说明](#安装)安装一次 DevRelay，并准备已登录的 GitHub CLI（`gh`）。内置 Codex 执行和 AI 审查还需要已安装、已登录的 Codex CLI。
 
 ```bash
-devrelay init --provider github
-# 打开 .devrelay/config.toml，核对安装命令和验收命令。
-devrelay doctor
+devrelay ui --open
 ```
 
-至少配置一条项目真实的验收命令（`[[checks]]`），并处理 `doctor` 报告的问题，直到 `ready` 为 `true`。将生成的配置、忽略规则和 Issue 模板纳入版本管理；模板推送到 GitHub 默认分支后才会出现在新建 Issue 页面。已接入的项目可跳过 `init`。
+在网页点击 **添加项目**，填写本机仓库路径，检查后确认添加。已有 `.devrelay/config.toml` 原样保留；没有配置时会生成待核对的配置。每个 Git 仓库只登记一个项目，同仓其他工作树沿用已登记的项目入口（controller）。
+
+在“项目验收”核对安装、验收命令，至少配置一条真实验收命令。在“状态”点击 **初始化 GitHub** 补齐标签与 Issue 模板，再运行 **环境检查**，处理所有失败项。登记、初始化和环境检查都不会启动任务或执行项目安装命令。
+
+将项目配置、忽略规则及模板通过项目 PR 纳入版本管理；模板进入 GitHub 默认分支后才显示在新建 Issue 页面。新电脑克隆已有配置的仓库后，仍须添加项目完成本机登记。
 
 ### 2. 在 GitHub 创建 Issue，并添加标签
 
@@ -86,11 +88,11 @@ devrelay next    # 查看哪些 Issue 可执行，以及其他 Issue 被排除�
 
 ## 本地配置网页
 
-在已接入的项目中启动配置台（Python 3.11+，无需额外依赖）：
+从任意目录启动配置台（Python 3.11+，无需额外依赖）：
 
 ```bash
 devrelay ui --open
-# 或指定项目和端口
+# 或临时查看指定项目和端口
 devrelay --project /path/to/project ui --port 8765
 ```
 
@@ -100,29 +102,25 @@ devrelay --project /path/to/project ui --port 8765
 状态页可查看运行版本默认值、已登记任务，按需读取队列排除原因和 `doctor` 结果。
 保存本地配置、查询队列和自检不会执行任务或启动 worker。
 
-管理多个独立项目时，创建项目目录清单，例如 `projects.toml`：
+网页的 **添加项目** 会自动维护用户清单 `~/.config/devrelay/projects.toml`；设置了绝对路径 `XDG_CONFIG_HOME` 时使用 `$XDG_CONFIG_HOME/devrelay/projects.toml`。首次启动可以没有任何项目，无需手工创建清单或项目专用脚本。
 
-```toml
-[[projects]]
-id = "us"
-name = "US"
-path = "/path/to/us-controller"
+检查仓库是只读操作；确认添加后才保留或生成项目配置、补齐 Git 忽略项、登记 controller 并保存清单。配置和清单在检查后变化时必须重新检查。同一仓库的多个工作树按 Git common directory 去重，不会切换到另一个工作树的配置。项目源码、暂存区、任务和历史证据保留。
 
-[[projects]]
-id = "usp"
-name = "USP"
-path = "/path/to/usp-controller"
-runtime = "/path/to/pinned-devrelay/src"
-```
+目录失效时，项目仍显示在列表中，点击 **重新定位** 指向新路径。工具核对仓库身份；不同仓库、被复制且仍在其他目录使用的状态、运行中的 worker、跨仓占用，以及带任务记录的 controller 迁移会被拒绝。存在任务记录时恢复原路径，不通过重新登记绕过恢复流程。旧手工清单应先在原路径添加一次，登记身份后再移动目录。工具只更新入口，不移动磁盘文件。
+
+Agent 和终端可使用同一接入流程：
 
 ```bash
-devrelay ui --catalog /path/to/projects.toml --open
+devrelay projects add /path/to/project --name "My project"
+devrelay projects list
+devrelay projects locate PROJECT_ID /new/path/to/project
 ```
 
-`path` 和可选的 `runtime` 相对清单文件解析。`runtime` 指向包含 `devrelay/` 包的目录；省略时使用启动网页的版本。
-清单是可信的本机配置，指定 runtime 会加载该目录中的 Python 代码。每个项目在隔离进程中使用其 runtime 的校验器、
-默认值、controller 路由和仓库锁；不支持的字段不会显示。缺少 `config.validate` 的旧 runtime 会明确报错，不会静默换用新版。
-清单不会升级 runtime，也不是 `--workspace` 跨仓任务清单。参考 [示例](examples/ui-projects.toml)。
+`projects add` 可重复调用，保留已有配置；已有 controller 时沿用其配置。`init` 仍保留为独立初始化命令。CLI 登记不写 GitHub；GitHub 项目另行执行 `devrelay --project /path/to/project init --sync-github`，或在网页中确认“初始化 GitHub”。
+
+需要独立清单时使用 `devrelay ui --catalog /path/to/projects.toml --open` 或 `devrelay projects --catalog /path/to/projects.toml add /path/to/project`。清单路径相对其所在文件解析；写入采用锁和原子替换，原文件保存在同目录的 `catalog-backups/`。重试登记可以恢复中断后的本地配置，不重置任务。
+
+默认所有项目共用已安装的 DevRelay。仅需固定其他运行版本时，在可信清单条目中显式设置 `runtime`，指向包含 `devrelay/` 包的目录。此项会加载该路径中的 Python 代码；网页配置操作使用该 runtime 的校验器、默认值和仓库锁，不会静默切换版本。登记保留已有 runtime 设置，新项目不创建专用 runtime。清单不负责升级工具，也不是 `--workspace` 跨仓任务清单。高级格式见 [示例](examples/ui-projects.toml)。
 
 保存前先校验并展示 TOML 差异、受影响的验收阶段。普通表单编辑保留无关内容及标量行注释；
 修改命令列表会重写该列表，复杂 TOML 布局可使用源码编辑。确认保存时重新校验文件和 runtime 指纹、获取仓库锁，
@@ -251,6 +249,26 @@ devrelay --workspace /path/workspace.toml run terrain-edit --submit
 
 ## 安装
 
+普通使用采用用户级工具安装。安装好 `uv` 后执行一次：
+
+```bash
+uv tool install git+https://github.com/kleinlau17/DevRelay.git
+devrelay --version
+devrelay ui --open
+```
+
+若终端找不到 `devrelay`，运行 `uv tool update-shell` 并重新打开终端。每个项目使用同一个命令，无需克隆工具源码、创建项目专用虚拟环境或启动脚本。也可用 `pipx install git+https://github.com/kleinlau17/DevRelay.git` 安装。
+
+更新工具用 `uv tool upgrade devrelay`。固定或恢复某个版本时，将下面的 `REVISION` 替换为审核过的提交 SHA：
+
+```bash
+uv tool install --force 'git+https://github.com/kleinlau17/DevRelay.git@REVISION'
+```
+
+安装和更新不会迁移、删除项目清单与任务状态。`doctor` 报告实际包位置、Python 路径及 Git 安装来源的提交号；网页“项目位置与运行版本”可检查当前运行路径。回退旧版本前保留用户清单：不支持 `repository_id` 的旧版网页需使用 `catalog-backups/` 中对应版本的清单，或以 `--project` 打开单个项目。不要为切换版本删除仓库状态。
+
+参与 DevRelay 开发时才使用源码安装：
+
 ```bash
 cd /path/to/DevRelay
 python3 -m venv .venv
@@ -258,14 +276,12 @@ python3 -m venv .venv
 .venv/bin/devrelay --help
 ```
 
-使用 `devrelay --version` 或 `devrelay -V` 查询版本；无需在 Git 仓库内运行，也无需项目配置。
-
-也可使用 `pipx install /path/to/DevRelay` 安装全局命令。工程工具模式不要求 Codex CLI；可选编排与 AI 审查需要安装并登录 Codex CLI。GitHub 队列和 PR 操作需要已认证的 `gh`。DevRelay 使用既有登录，不读取或复制凭据文件。
+工程工具模式不要求 Codex CLI；可选编排与 AI 审查需要安装并登录 Codex CLI。GitHub 队列和 PR 操作需要已认证的 `gh`。DevRelay 使用既有登录，不读取或复制凭据文件。
 
 ## 接入一个项目
 
 ```bash
-devrelay --project /path/to/project init
+devrelay projects add /path/to/project
 # 查看并调整 /path/to/project/.devrelay/config.toml
 devrelay --project /path/to/project doctor
 ```
@@ -290,7 +306,7 @@ id = "test"
 argv = ["python3", "-m", "unittest", "discover", "-s", "tests"]
 ```
 
-将项目配置、必要忽略规则及生成的 Issue 模板纳入项目版本管理，再从主 checkout 使用 DevRelay。新建的空仓库需要先有初始提交。模型默认沿用用户 Codex 配置，可显式设置 `codex.model` / `codex.profile`。
+将项目配置、必要忽略规则及生成的 Issue 模板纳入项目版本管理，再从已登记的 controller checkout 使用 DevRelay。新建的空仓库需要先有初始提交。模型默认沿用用户 Codex 配置，可显式设置 `codex.model` / `codex.profile`。
 
 ## 主要工作流：Agent 驱动
 
@@ -312,6 +328,8 @@ devrelay --project /path/to/project submit 12
 外层 Agent 的会话、计划、实验预算及工作树编辑期间的独占由外层负责。DevRelay 的单 worker 锁只覆盖工具命令执行，不覆盖两次调用之间的编辑；不要同时为该仓库启动 `watch`。恢复时先查看 `status` 和实际工作树，再继续编辑或重试工具。`resume` 专用于可选的 DevRelay Codex 编排，不能恢复外层 Agent 的会话。
 
 `doctor` 默认检查工程工具和 AI 交付依赖；GitHub 项目的发现 PR 默认审查也要求 Codex。仅使用外部 Agent 且不需要内置审查时，可关闭 `discovery.auto_review` 与全项目自动交付开关。使用可选编排或显式 `review` 前运行 `doctor --with-codex`。完整操作约定见 [Agent 工作流](docs/agent-workflow.md)。
+
+`doctor` 还检查 controller 登记；已有配置但未登记时提示使用 `devrelay projects add PATH`，不把该情况报告为接入就绪。
 
 GitHub 登录项通过 `gh api --hostname github.com user --silent` 检查当前生效凭据（包括环境变量提供的凭据）的实际 API 访问；未启用旧账号的失效凭据不会导致误报。认证失败、网络/API 错误、命令不可用或超时仍会使 `github_login=false`、`ready=false`。这项检查不代表已具备目标仓库读写权限；DevRelay 不切换账号或更改登录配置。
 
@@ -515,3 +533,12 @@ git diff --check
 非 UTF-8 文件名端到端测试在支持的文件系统上运行；只有创建无效 UTF-8 名称明确返回 `EILSEQ` 时才报告平台 skip，不代表产品验收通过。Git tree/index 字节路径回归无需检出这些名称，始终运行；权限错误和产品错误仍会使测试失败。
 
 实现说明见 [架构](docs/architecture.md)。Codex 接口依据 [OpenAI 官方非交互执行文档](https://developers.openai.com/codex/noninteractive)。
+
+## 安装流程验收
+
+CI 在 macOS / Linux、Python 3.11 / 3.14 上运行完整测试，并构建 wheel，在新的虚拟环境、独立用户清单和源码目录之外启动真实安装命令。覆盖首次添加、已有配置的新克隆、配置保存、重复登记、路径迁移、错误仓库拒绝、脏工作树/暂存区保留和重装后状态保留。测试只使用临时本地 Git 仓库，不创建远端任务或调用模型。
+
+```bash
+python3 -m pip wheel --no-deps . --wheel-dir dist
+python3 scripts/smoke_install.py dist/devrelay-*.whl
+```

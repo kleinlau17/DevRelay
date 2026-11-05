@@ -159,3 +159,21 @@ dialog::backdrop { background: #10202e66; backdrop-filter: blur(2px); }
   #diff { margin: 0 16px; }
   .actions { gap: 6px; }
 }
+
+.add-project { margin-top: 14px; border-color: #39535d; justify-content: center; }
+.empty-projects { display: grid; place-items: center; min-height: 260px; }
+#register-dialog { max-width: 650px; }
+.register-body { padding: 0 28px 20px; }
+.error.register-body { overflow-wrap: anywhere; }
+#register-form { display: grid; gap: 18px; }
+#register-form .button { justify-self: start; }
+#register-details { margin: 0 0 20px; }
+#register-effect { margin-bottom: 16px; font-size: 13px; }
+#register-warning { margin-bottom: 16px; }
+#register-source { padding: 16px; max-height: 200px; overflow: auto; border: 1px solid var(--border); background: #f8fafb; border-radius: 6px; font: 12px/1.7 ui-monospace, monospace; }
+#unavailable .actions { margin-top: 20px; }
+@media (max-width: 720px) {
+  .sidebar .add-project { margin-top: 12px; width: auto; }
+  .register-body { padding: 0 20px 18px; }
+  .heading-actions { max-width: 45%; }
+}

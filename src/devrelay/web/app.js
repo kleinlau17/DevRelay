@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = {token: "", projects: [], id: null, base: null, source: "", data: {}, explicit: {}, changes: {}, tab: "policy", preview: null, pending: false, backups: {}};
+const state = {token: "", projects: [], id: null, base: null, source: "", data: {}, explicit: {}, changes: {}, tab: "policy", preview: null, pending: false, backups: {}, registrationPlan: null, registrationInput: null, replaceId: null};
 const tabs = {policy: "接单策略", execution: "执行交付", commands: "项目验收", project: "项目", source: "源码", status: "状态"};
 const groups = {
   policy: [["queue", "Issue 接单"], ["discovery", "Agent 新发现"]],
@@ -88,6 +88,7 @@ function refreshButtons() {
   $("save-state").classList.toggle("unsaved", Boolean(changed));
   $("preview").disabled = state.pending || !state.base || !changed;
   $("save").disabled = state.pending || !state.preview?.changed || state.preview?.activity.busy;
+  $("register-confirm").disabled = state.pending || !state.registrationPlan;
 }
 function changed(key, value) {
   const [section, field] = key.split(".");
@@ -98,7 +99,10 @@ function changed(key, value) {
   refreshButtons();
 }
 async function api(operation, payload = {}) {
-  const response = await fetch(`/api/projects/${state.id}/${operation}`, {method: "POST", headers: {"Content-Type": "application/json", "X-DevRelay-Token": state.token}, body: JSON.stringify(payload)});
+  return request(`/api/projects/${state.id}/${operation}`, payload);
+}
+async function request(path, payload = {}) {
+  const response = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-DevRelay-Token": state.token}, body: JSON.stringify(payload)});
   const result = await response.json();
   if (!response.ok) throw new Error(result.error || "请求失败");
   return result;
@@ -108,11 +112,11 @@ async function run(action) {
   state.pending = true;
   const controls = [...document.querySelectorAll("button")].map((el) => [el, el.disabled]);
   controls.forEach(([el]) => { el.disabled = true; });
-  $("workspace").inert = true;
+  $("workspace").inert = true; $("register-form").inert = true;
   try { await action(); } catch (error) { notice(error.message, true); }
   finally {
     controls.forEach(([el, disabled]) => { if (el.isConnected) el.disabled = disabled; });
-    $("workspace").inert = false; state.pending = false; refreshButtons();
+    $("workspace").inert = false; $("register-form").inert = false; state.pending = false; refreshButtons();
     if (state.base && !$("settings").checkValidity()) $("settings").reportValidity();
   }
 }
@@ -125,6 +129,9 @@ async function materialize() {
 }
 async function loadProject(id) {
   state.id = id; state.base = null; state.preview = null; state.changes = {};
+  $("empty-projects").hidden = true; $("reload").hidden = false;
+  $("locate-project").hidden = false;
+  $("locate-project").textContent = state.projects.find((p) => p.id === id).registered ? "重新定位" : "登记项目";
   $("workspace").hidden = true; $("unavailable").hidden = true; $("activity").hidden = true; notice("");
   $("project-name").textContent = state.projects.find((p) => p.id === id).name;
   $("project-description").textContent = "读取中…";
@@ -148,9 +155,8 @@ async function loadProject(id) {
     render();
   } catch (error) {
     $("unavailable").hidden = false;
-    $("unavailable").textContent = error.message;
+    $("unavailable").replaceChildren(node("p", error.message, "error"));
     $("project-description").textContent = "项目不可用";
-    throw error;
   }
 }
 function fieldControl(path) {
@@ -219,6 +225,7 @@ function commandPanel(section) {
   return panel;
 }
 function renderStatus() {
+  $("setup-github").hidden = state.base.data.project?.provider !== "github";
   $("task-list").replaceChildren();
   if (!state.base.tasks.length) $("task-list").append(node("p", "暂无任务", "empty"));
   for (const task of state.base.tasks) {
@@ -227,7 +234,7 @@ function renderStatus() {
     $("task-list").append(row);
   }
   $("locations").replaceChildren();
-  for (const [title, value] of [["版本", `DevRelay ${state.base.runtime.version}`], ["目标分支", state.base.data.project?.base_branch || "—"], ["配置文件", state.base.config_path], ["Controller", state.base.root], ["Runtime", state.base.runtime.path], ["Runtime SHA-256", state.base.runtime.sha256], ["仓库占用状态", state.base.activity.reason], ["上次保存的备份", state.backups[state.id]]]) if (value) $("locations").append(node("dt", title), node("dd", value));
+  for (const [title, value] of [["版本", `DevRelay ${state.base.runtime.version}`], ["目标分支", state.base.data.project?.base_branch || "—"], ["配置文件", state.base.config_path], ["Controller", state.base.root], ["Runtime", state.base.runtime.path], ["Runtime SHA-256", state.base.runtime.sha256], ["Python", state.base.runtime.python], ["项目清单", state.catalog], ["仓库占用状态", state.base.activity.reason], ["上次保存的备份", state.backups[state.id]]]) if (value) $("locations").append(node("dt", title), node("dd", value));
   const defaults = node("details", undefined, "defaults"); defaults.append(node("summary", "运行版本默认值"));
   const values = node("dl");
   for (const [section, entries] of Object.entries(state.base.defaults)) if (entries && !Array.isArray(entries)) {
@@ -309,15 +316,19 @@ for (const operation of ["queue", "doctor"]) $(operation).onclick = () => run(as
       }
     } else {
       const group = node("div", undefined, "diagnostic-group"); group.append(node("h3", result.ready ? "环境自检通过" : "环境需要处理"));
-      for (const item of result.checks) group.append(node("p", `${item.ok ? "✓" : "×"} ${item.id}${item.value ? ` · ${item.value}` : ""}`));
+      const labels = {git: "Git", base: "目标分支", acceptance: "验收命令", git_identity: "Git 提交身份", codex: "Codex", codex_login: "Codex 登录", gh: "GitHub CLI", github_login: "GitHub 登录", remote_matches_repository: "远端仓库", controller: "项目登记"};
+      for (const item of result.checks) group.append(node("p", `${item.ok ? "✓" : "×"} ${labels[item.id] || item.id}${item.value ? ` · ${item.value}` : ""}`));
       output.append(group);
     }
   } catch (error) { output.replaceChildren(node("p", error.message, "error")); }
 });
 window.addEventListener("beforeunload", (event) => { if (dirty()) { event.preventDefault(); event.returnValue = ""; } });
-run(async () => {
-  const response = await fetch("/api/session"); if (!response.ok) throw new Error("请从终端显示的本机地址打开网页。");
-  const session = await response.json(); state.token = session.token; state.projects = session.projects;
+async function loadSession() {
+  const response = await fetch("/api/session");
+  const session = await response.json();
+  if (!response.ok) throw new Error(session.error || "请从终端显示的本机地址打开网页。");
+  state.token = session.token; state.projects = session.projects; state.catalog = session.catalog;
+  $("projects").replaceChildren();
   for (const project of session.projects) {
     const button = node("button", undefined, "project-button"); button.dataset.id = project.id;
     const icon = node("span", project.name.slice(0, 2).toUpperCase(), "project-icon"); icon.setAttribute("aria-hidden", "true");
@@ -325,5 +336,76 @@ run(async () => {
     button.onclick = () => { if (project.id !== state.id && (!dirty() || confirm("切换项目会放弃尚未保存的编辑。继续吗？"))) run(() => loadProject(project.id)); };
     $("projects").append(button);
   }
-  await loadProject(session.projects[0].id);
+  $("add-project").hidden = !session.catalog || !session.projects.length;
+  return session;
+}
+function openRegistration(project = null) {
+  state.replaceId = project?.registered ? project.id : null;
+  state.registrationPlan = null; state.registrationInput = null;
+  $("register-form").reset();
+  $("register-path").value = project?.path || "";
+  $("register-name").value = project?.name || "";
+  $("register-title").textContent = state.replaceId ? "重新定位项目" : "添加项目";
+  $("register-confirm").textContent = state.replaceId ? "保存位置" : "添加项目";
+  $("register-review").hidden = true; $("register-error").hidden = true;
+  refreshButtons(); $("register-dialog").showModal(); $("register-path").focus();
+}
+$("path-help").append(helpButton("仓库路径", "填写运行 DevRelay 的这台电脑上的仓库路径，可使用 ~。选择子目录时会识别仓库根目录。"));
+$("add-project").onclick = () => openRegistration();
+$("first-project").onclick = () => openRegistration();
+$("locate-project").onclick = () => openRegistration(state.projects.find((p) => p.id === state.id));
+$("register-cancel").onclick = () => $("register-dialog").close();
+$("register-dialog").addEventListener("cancel", (event) => { if (state.pending) event.preventDefault(); });
+$("register-form").addEventListener("input", () => {
+  state.registrationPlan = null; $("register-review").hidden = true; $("register-error").hidden = true; refreshButtons();
+});
+$("register-form").onsubmit = (event) => {
+  event.preventDefault();
+  if (!$("register-form").reportValidity()) return;
+  run(async () => {
+    state.registrationPlan = null; $("register-error").hidden = true; $("register-review").hidden = true;
+    try {
+      const input = {path: $("register-path").value, name: $("register-name").value, replace_id: state.replaceId};
+      const plan = await request("/api/projects/probe", input);
+      state.registrationPlan = plan; state.registrationInput = input;
+      const details = $("register-details"); details.replaceChildren();
+      for (const [label, value] of [["仓库", plan.repository || plan.name], ["位置", plan.root], ["目标分支", plan.base], ["配置", plan.existing_config ? "保留现有配置" : "创建项目配置"]]) details.append(node("dt", label), node("dd", value));
+      $("register-source").textContent = plan.source;
+      $("register-effect").textContent = `${plan.existing_config ? "保留配置" : "创建 .devrelay/config.toml"}${plan.ignore_additions.length ? "，补齐 .gitignore" : ""}，登记到本机项目清单。不会启动任务。`;
+      const warnings = [];
+      if (plan.relocating) warnings.push(`项目入口将从 ${plan.previous_controller} 切换到 ${plan.root}。`);
+      if (!plan.checks.length) warnings.push("尚未配置验收命令，添加后请在“项目验收”中填写。");
+      $("register-warning").textContent = warnings.join(" "); $("register-warning").hidden = !warnings.length;
+      $("register-confirm").textContent = plan.relocating ? "确认新位置" : plan.already_added ? "打开项目" : "添加项目";
+      $("register-review").hidden = false;
+    } catch (error) { $("register-error").textContent = error.message; $("register-error").hidden = false; }
+  });
+};
+$("register-confirm").onclick = () => run(async () => {
+  if (dirty() && !confirm("切换项目会放弃尚未保存的编辑。继续吗？")) return;
+  $("register-error").hidden = true;
+  try {
+    const result = await request("/api/projects/add", {...state.registrationInput, revision: state.registrationPlan.revision});
+    await loadSession(); $("register-dialog").close();
+    state.tab = result.needs_acceptance ? "commands" : "status";
+    await loadProject(result.id);
+    notice(result.needs_acceptance ? "项目已添加，请填写验收命令。" : "项目已登记，可以运行环境检查。");
+  } catch (error) {
+    state.registrationPlan = null;
+    $("register-error").textContent = error.message; $("register-error").hidden = false;
+  }
+});
+$("setup-github").onclick = () => run(async () => {
+  if (dirty()) throw new Error("请先保存或放弃配置编辑，再初始化 GitHub。");
+  if (!confirm("将在 GitHub 仓库补齐标签，并在本地创建缺失的 Issue 模板；保留已有内容，不授权或启动任务。继续吗？")) return;
+  const result = await api("setup-github", {revision: state.base.revision});
+  notice(`GitHub 已初始化：新增 ${result.labels.created.length} 个标签、${result.templates.created.length} 个模板。模板需通过项目 PR 提交。`);
+});
+run(async () => {
+  const session = await loadSession();
+  if (session.projects.length) await loadProject(session.projects[0].id);
+  else {
+    $("project-name").textContent = "项目"; $("project-description").textContent = "";
+    $("reload").hidden = true; $("empty-projects").hidden = false;
+  }
 });
