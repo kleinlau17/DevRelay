@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+from socketserver import TCPServer
 import subprocess
 import sys
 from urllib.parse import urlsplit
@@ -57,6 +58,12 @@ class DashboardServer(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), DashboardHandler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
+
+    def server_bind(self):
+        # HTTPServer resolves a hostname here. This loopback-only service must
+        # start without reverse DNS, which can stall on an offline machine.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def refresh_projects(self):
         if self.registry is None:

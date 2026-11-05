@@ -240,7 +240,9 @@ class RegistrationTests(RepositoryTest):
         self.assertEqual(self.state.tasks(), [])
 
     def test_http_empty_catalog_check_add_and_request_protection(self):
-        server = DashboardServer([], registry=self.registry)
+        with patch('socket.getfqdn', side_effect=AssertionError('Local dashboard must not need DNS')):
+            server = DashboardServer([], registry=self.registry)
+        self.assertEqual(server.server_name, '127.0.0.1')
         self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
