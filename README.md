@@ -84,6 +84,55 @@ devrelay next    # 查看哪些 Issue 可执行，以及其他 Issue 被排除�
 
 验收通过后会创建或更新 PR，默认是草稿。**自动合并默认关闭**：在 GitHub 查看改动与检查结果，确认后再合并；开启自动合并需要另行配置。更详细的恢复与交付规则见下文。
 
+## 本地配置网页
+
+在已接入的项目中启动配置台（Python 3.11+，无需额外依赖）：
+
+```bash
+devrelay ui --open
+# 或指定项目和端口
+devrelay --project /path/to/project ui --port 8765
+```
+
+打开终端输出的 `http://127.0.0.1:8765`。`--port 0` 自动选择空闲端口；Ctrl-C 停止网页服务。
+网页提供接单策略、Agent 新发现策略、模型/超时/返工预算、审查与合并、项目基线、准备和验收命令的编辑，
+以及 TOML 源码编辑。表单显示实际生效值，必要帮助可通过 info 按钮查看（支持键盘聚焦与 Escape 关闭）。
+状态页可查看运行版本默认值、已登记任务，按需读取队列排除原因和 `doctor` 结果。
+保存本地配置、查询队列和自检不会执行任务或启动 worker。
+
+管理多个独立项目时，创建项目目录清单，例如 `projects.toml`：
+
+```toml
+[[projects]]
+id = "us"
+name = "US"
+path = "/path/to/us-controller"
+
+[[projects]]
+id = "usp"
+name = "USP"
+path = "/path/to/usp-controller"
+runtime = "/path/to/pinned-devrelay/src"
+```
+
+```bash
+devrelay ui --catalog /path/to/projects.toml --open
+```
+
+`path` 和可选的 `runtime` 相对清单文件解析。`runtime` 指向包含 `devrelay/` 包的目录；省略时使用启动网页的版本。
+清单是可信的本机配置，指定 runtime 会加载该目录中的 Python 代码。每个项目在隔离进程中使用其 runtime 的校验器、
+默认值、controller 路由和仓库锁；不支持的字段不会显示。缺少 `config.validate` 的旧 runtime 会明确报错，不会静默换用新版。
+清单不会升级 runtime，也不是 `--workspace` 跨仓任务清单。参考 [示例](examples/ui-projects.toml)。
+
+保存前先校验并展示 TOML 差异、受影响的验收阶段。普通表单编辑保留无关内容及标量行注释；
+修改命令列表会重写该列表，复杂 TOML 布局可使用源码编辑。确认保存时重新校验文件和 runtime 指纹、获取仓库锁，
+将原文件按内容摘要备份到 Git common directory 下的 `devrelay/ui-backups/`，再原子替换配置；保留暂存区、任务和历史证据。
+本次会话的备份路径可在状态页的项目详情中查看；可将备份内容粘贴到源码编辑器中预览并恢复。若文件被其他编辑者修改，须重新加载，避免覆盖。
+
+网页只监听 `127.0.0.1`，使用同源检查和会话令牌保护写入。运行中的 worker、遗留命令进程或跨仓任务占用会阻止保存。
+无 DevRelay 锁不代表外层 Agent 已停止编辑。配置在下一次命令加载时生效；已有任务继续遵守授权和验收门禁，
+受变更影响的证据可能需要重新生成。不要在配置中填写凭据；继续使用本机已登录的 `gh` / Codex。
+
 ## 项目自动模式
 
 Agent 经 DevRelay 报告并创建的 Issue，默认自动分诊，符合范围后执行，生成的 PR 默认独立审查。人工 Issue 默认仍需逐条授权；将项目设为 `autonomous` 后，人工 Issue 也进入同一分诊流程。自动合并另行配置，默认关闭。

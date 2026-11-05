@@ -31,6 +31,10 @@ def parser():
     locations.add_argument("--workspace", type=Path, help="Explicit multi-repository TOML manifest (draft delivery only)")
     locations.add_argument("--project", type=Path, default=Path.cwd(), help="Project directory (default: current directory)")
     sub = root.add_subparsers(dest="command", required=True)
+    ui = sub.add_parser("ui", help="Open a local configuration dashboard; does not start a worker")
+    ui.add_argument("--catalog", type=Path, help="TOML project catalog (separate from a task workspace manifest)")
+    ui.add_argument("--port", type=int, default=8765, help="Loopback HTTP port (default: 8765; 0 selects a free port)")
+    ui.add_argument("--open", action="store_true", help="Open the dashboard in your default browser")
     init = sub.add_parser("init", help="Create project configuration and initialize GitHub issue management")
     init.add_argument("--provider", choices=("local", "github"))
     init.add_argument("--mode", choices=("manual", "autonomous"), help="Project authorization mode (default: manual)")
@@ -153,6 +157,11 @@ def main(argv=None):
     args = parser().parse_args(argv)
     state = None
     try:
+        if args.command == "ui":
+            if args.workspace:
+                raise RelayError("ui uses --catalog for independent projects, not --workspace")
+            from .ui import serve
+            return serve(args.project, catalog=args.catalog, port=args.port, open_browser=args.open)
         if args.workspace:
             from .workspace import dispatch
             result = dispatch(args)
