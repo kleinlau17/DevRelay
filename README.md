@@ -6,6 +6,75 @@
 
 主要工作流由外层 Agent 驱动，逐步调用 `next/start/prepare/check/submit`；DevRelay 管理工程状态和验收证据。`work/watch` 提供可选的任务闭环，兼容 `run/resume`。项目负责定义安装命令与验收规则。0.4 版支持 macOS / Linux、Python 3.11+ 和 Git；核心没有第三方运行依赖。
 
+## 简明操作指南（GitHub 项目）
+
+日常流程：**写清任务 → 维护者授权 → 交给 Agent 处理 → 查看并合并 PR**。下面用 Issue `#12` 举例，替换成你的实际编号；终端命令都在目标项目的主 checkout（平时使用的仓库目录）执行。
+
+### 1. 准备项目（首次使用）
+
+按[安装说明](#安装)安装 DevRelay，并准备好已登录的 GitHub CLI（`gh`）。内置 Codex 执行和 AI 审查还需要已安装、已登录的 Codex CLI；默认的发现任务审查也会用到它。使用虚拟环境安装时，先激活该环境，再运行以下命令。
+
+```bash
+devrelay init --provider github
+# 打开 .devrelay/config.toml，核对安装命令和验收命令。
+devrelay doctor
+```
+
+至少配置一条项目真实的验收命令（`[[checks]]`），并处理 `doctor` 报告的问题，直到 `ready` 为 `true`。将生成的配置、忽略规则和 Issue 模板纳入版本管理；模板推送到 GitHub 默认分支后才会出现在新建 Issue 页面。已接入的项目可跳过 `init`。
+
+### 2. 在 GitHub 创建 Issue，并添加标签
+
+在项目的 **Issues → New issue** 中写清：现在有什么问题、期望的结果、怎样判断完成。例如“空文件名导致导出崩溃；应提示用户填写文件名，并有测试覆盖”。一个 Issue 对应一个可验收的结果，代码、测试和文档可以放在同一任务中。
+
+默认 `manual` 模式下，你或其他人手动创建的 Issue，都由维护者确认后，在右侧 **Labels** 中添加 `auto:approved`。常用默认标签如下：
+
+| 标签 | 什么时候用 |
+|---|---|
+| `bug` / `enhancement` / `documentation` / `experiment` / `infrastructure` | 分类：修 Bug、功能改进、文档、实验、基础设施；分类本身不授权执行 |
+| `auto:approved` | 维护者同意执行这个任务 |
+| `priority:P0` / `priority:P1` / `priority:P2` | 优先级从高到低，最多选一个；不选按 P1 处理 |
+| `blocked` / `needs-input` | 有阻塞或需要补充信息，暂停处理 |
+| `scope:plan` | 总体计划，只跟踪子任务，不直接执行 |
+
+如果一个目标包含多个可独立交付的任务，可用计划父 Issue 汇总，把具体工作放到子 Issue，分别授权。父 Issue 即使加了 `auto:approved` 也不执行；正文单独写一行 `Task kind: plan` 同样能标记它。普通任务不必为了使用 DevRelay 而拆分。
+
+**标签下拉列表里找不到这些选项？** 在终端运行：
+
+```bash
+devrelay init --sync-github
+```
+
+这会直接在 GitHub 创建缺失标签，并在本地补齐缺失模板，保留已有内容。GitHub 标签是仓库设置，`git push` 不会创建它们；模板文件则需要提交并推送。
+
+以上是人工创建 Issue 的默认流程。[自动模式](#项目自动模式)可让人工 Issue 先调查、符合范围后执行；[Agent 经 DevRelay 发现并创建的任务](#agent-发现新问题)默认也会先调查、再决定是否执行。
+
+### 3. 开始处理
+
+主要方式是让你正在使用的 Agent 调用 DevRelay，可以直接告诉它：
+
+> 请使用 DevRelay 处理 Issue #12：先确认任务可执行，再领取任务、准备环境，在返回的工作树中实现；运行验收，失败时修复后重跑，通过后创建 PR。
+
+Agent 使用的具体命令见[主要工作流](#主要工作流agent-驱动)。如果希望 DevRelay 自己启动 Codex，则先运行 `devrelay doctor --with-codex`，检查通过后选择一种方式：
+
+```bash
+devrelay work 12  # 处理指定任务，并推进到配置允许的交付阶段
+# 或者：
+devrelay watch    # 持续监听队列，按顺序处理可执行的任务
+```
+
+配置或标签不会自行启动执行器。同一仓库只使用一个执行者，不要在外层 Agent 工作时同时启动 `work` / `watch`。
+
+### 4. 查看结果，处理卡住的任务
+
+```bash
+devrelay status  # 查看进度、PR 地址、错误和 next_action（下一步）
+devrelay next    # 查看哪些 Issue 可执行，以及其他 Issue 被排除的原因
+```
+
+没开始处理时，先检查授权标签、阻塞标签和依赖。需要补充信息时，修改 Issue **正文**，不要只写评论；问题解决后移除相应阻塞标签。由 `work/watch` 执行的任务按 `next_action` 恢复，确需开启新一轮重试预算时使用 `devrelay work 12 --retry`；外层 Agent 执行的任务则由原 Agent 继续。
+
+验收通过后会创建或更新 PR，默认是草稿。**自动合并默认关闭**：在 GitHub 查看改动与检查结果，确认后再合并；开启自动合并需要另行配置。更详细的恢复与交付规则见下文。
+
 ## 项目自动模式
 
 Agent 经 DevRelay 报告并创建的 Issue，默认自动分诊，符合范围后执行，生成的 PR 默认独立审查。人工 Issue 默认仍需逐条授权；将项目设为 `autonomous` 后，人工 Issue 也进入同一分诊流程。自动合并另行配置，默认关闭。

@@ -6,6 +6,75 @@ General engineering tools for agents: agents plan, explore and implement, while 
 
 The primary workflow is driven by an external agent calling `next/start/prepare/check/submit`; DevRelay records engineering state and verification evidence. `run/resume/watch` remain optional Codex orchestration. Projects own setup commands and acceptance rules. Version 0.4 supports macOS / Linux, Python 3.11+ and Git, with no third-party runtime dependencies.
 
+## Quick usage guide (GitHub projects)
+
+The everyday flow is: **describe a task → maintainer approves it → an agent implements it → review and merge the PR**. The examples use Issue `#12`; replace it with your issue number. Run terminal commands from the target project's main checkout (your usual repository directory).
+
+### 1. Prepare the project (first use)
+
+Follow [installation](#install-and-onboard) and have GitHub CLI (`gh`) installed and signed in. Built-in Codex execution and AI review also need an installed, signed-in Codex CLI, including the default review of discovered tasks. If you installed DevRelay in a virtual environment, activate it before running these commands.
+
+```bash
+devrelay init --provider github
+# Open .devrelay/config.toml and review setup and acceptance commands.
+devrelay doctor
+```
+
+Configure at least one real project acceptance command (`[[checks]]`) and resolve reported problems until `doctor` returns `ready: true`. Track the generated configuration, ignore rules and Issue templates in Git; templates appear on GitHub's new Issue page after being pushed to the default branch. Already configured projects can skip `init`.
+
+### 2. Create a GitHub Issue and add labels
+
+Open **Issues → New issue** and describe the current problem, the expected result and how to verify completion. For example: “An empty filename crashes export; prompt the user to enter a filename and cover this behavior with a test.” One Issue should describe one verifiable outcome; its code, tests and documentation can stay together.
+
+In the default `manual` mode, Issues manually created by you or anyone else need a maintainer to review them and add `auto:approved` using **Labels** on the right. Common default labels are:
+
+| Label | When to use it |
+|---|---|
+| `bug` / `enhancement` / `documentation` / `experiment` / `infrastructure` | Classify fixes, improvements, documentation, experiments or infrastructure; classification does not authorize execution |
+| `auto:approved` | A maintainer authorizes this task |
+| `priority:P0` / `priority:P1` / `priority:P2` | Highest to lowest priority; select at most one; no label means P1 |
+| `blocked` / `needs-input` | Pause a task with a blocker or missing information |
+| `scope:plan` | Track an overall plan and its children; never execute the parent |
+
+If a goal contains multiple independently deliverable tasks, track them in a plan parent and authorize the concrete child Issues separately. The parent cannot execute even with `auto:approved`; a standalone `Task kind: plan` line in its body also marks it as a plan. Ordinary tasks do not need splitting just to use DevRelay.
+
+**Missing these options in the label dropdown?** Run:
+
+```bash
+devrelay init --sync-github
+```
+
+This creates missing labels directly on GitHub and missing templates locally, preserving existing content. GitHub labels are repository settings; `git push` does not create them. Template files need to be committed and pushed.
+
+This is the default flow for human-created Issues. [Autonomous mode](#autonomous-projects) can investigate them and execute those within scope; [tasks discovered and created through DevRelay](#agent-discovered-follow-ups) also default to investigation before execution.
+
+### 3. Start work
+
+The primary approach is to have your existing agent call DevRelay. You can tell it:
+
+> Use DevRelay to handle Issue #12: first confirm it is eligible, then claim it, prepare the environment and implement in the returned worktree. Run acceptance, repair failures and rerun checks, then create a PR once they pass.
+
+See the [primary workflow](#primary-workflow-agent-driven) for the agent's commands. To have DevRelay launch Codex itself, first run `devrelay doctor --with-codex`; once checks pass, choose one option:
+
+```bash
+devrelay work 12  # Handle this task through the configured delivery stages.
+# Or:
+devrelay watch    # Keep polling the queue and handle eligible tasks in order.
+```
+
+Configuration and labels do not start an executor on their own. Use only one executor per repository; do not start `work` / `watch` while an external agent is working there.
+
+### 4. Check results and resolve blocked work
+
+```bash
+devrelay status  # Read progress, PR URLs, errors and next_action.
+devrelay next    # See eligible Issues and reasons others are excluded.
+```
+
+If work has not started, check authorization, blocker labels and dependencies. Add missing information to the Issue **body**, not just a comment, and remove the relevant blocker labels after resolving the problem. For tasks handled by `work/watch`, follow `next_action`; use `devrelay work 12 --retry` when a fresh attempt budget is needed. Let the original external agent continue tasks it handles.
+
+Passing acceptance leads to a new or updated PR, which defaults to a draft. **Automatic merging is off by default**: inspect the changes and checks on GitHub, then merge when satisfied. Automatic merging requires separate configuration. Detailed recovery and delivery rules follow below.
+
 ## Autonomous projects
 
 Agent discoveries created through DevRelay default to independent triage, implementation when in scope, and automatic PR review. Human Issues still need explicit approval by default; `queue.mode = "autonomous"` extends the same investigation pipeline to them. Automatic merging is a separate opt-in.
