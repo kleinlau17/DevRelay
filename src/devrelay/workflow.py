@@ -9,13 +9,17 @@ from .providers import authorized
 from .runner import (assert_config, base_commit, claimed_task, editable_task,
                      implement_task, prepare, prepared, start, submit, verify)
 from .state import now
-from .triage import automatic, automatic_enabled, authorization_reason, current as current_triage, scope_digest, triage
+from .triage import author_reason, automatic, automatic_enabled, authorization_reason, current as current_triage, scope_digest, triage
 
 
 def guidance(config, task):
     """Read-only local advice; live authorization and evidence are checked on execution."""
     from .delivery import automatic_review
     identifier, status = task["id"], task["status"]
+    reason = author_reason(config, task)
+    if reason and status != "completed":
+        return {"kind": "authorize", "actor": "human", "message": reason,
+                "next": "Check the Issue author and queue.allowed_authors in .devrelay/config.toml"}
     if automatic(config, task) and config.data["queue"]["approval_label"] not in task["labels"]:
         if (task.get("triage") or {}).get("phase") in ("preparing", "failed"):
             return {"kind": "attention", "actor": "human", "message": task["triage"].get("error", "Investigation interrupted"),

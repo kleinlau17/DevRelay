@@ -107,7 +107,14 @@ def validate(root, data):
     git(root, "check-ref-format", "--branch", project["base_branch"])
     git(root, "check-ref-format", "--branch", project["branch_prefix"] + "example")
     queue = _table(data, "queue")
-    _keys(queue, ("approval_label", "priorities", "blockers", "mode", "auto_kinds", "scope", "max_dispatches"), "queue")
+    _keys(queue, ("approval_label", "allowed_authors", "priorities", "blockers", "mode", "auto_kinds", "scope", "max_dispatches"), "queue")
+    queue.setdefault("allowed_authors", [])
+    authors = queue["allowed_authors"]
+    if (not isinstance(authors, list)
+            or any(not isinstance(author, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?", author)
+                   for author in authors)
+            or len({author.casefold() for author in authors}) != len(authors)):
+        raise RelayError("queue.allowed_authors must contain unique GitHub logins (case-insensitive)")
     queue.setdefault("mode", "manual")
     queue.setdefault("auto_kinds", ["bug"])
     queue.setdefault("scope", "Fix confirmed bugs with clear expected behavior and bounded acceptance.")
@@ -266,7 +273,9 @@ def initialize(root, provider=None, base=None, *, mode="manual"):
              'branch_prefix = "devrelay/task-"']
     if slug:
         lines.append(f"repository = {q(slug)}")
-    lines += ["", "[queue]", f'mode = {q(mode)}', 'auto_kinds = ["bug"]',
+    lines += ["", "[queue]", f'mode = {q(mode)}',
+              '# GitHub author allowlist; empty allows any author. Set your and your automation account logins.',
+              'allowed_authors = []', 'auto_kinds = ["bug"]',
               'scope = "Fix confirmed bugs with clear expected behavior and bounded acceptance."',
               'max_dispatches = 20', 'approval_label = "auto:approved"',
               'priorities = ["priority:P0", "priority:P1", "priority:P2"]',

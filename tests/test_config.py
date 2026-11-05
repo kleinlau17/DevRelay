@@ -41,6 +41,7 @@ class ConfigurationTests(RepositoryTest):
         self.assertEqual((self.root / "AGENTS.md").read_text(), "Existing project rules")
         self.assertTrue((self.root / ".gitignore").read_text().startswith(before))
         self.assertEqual(load(self.root).base, "main")
+        self.assertEqual(load(self.root).data["queue"]["allowed_authors"], [])
         self.assertEqual(load(self.root).data["discovery"], {"enabled": True, "auto_triage": True,
                                                          "auto_review": True, "max_per_task": 3})
         self.assertEqual(load(self.root).data["delivery"], {"auto_review": False, "auto_merge": False,
@@ -98,6 +99,19 @@ class ConfigurationTests(RepositoryTest):
         path.write_text(path.read_text().replace("max_attempts = 2", "max_attempt = 2"))
         with self.assertRaisesRegex(RelayError, "Unknown"):
             load(self.root)
+
+    def test_author_allowlist_requires_unique_github_logins(self):
+        self.configure()
+        path = self.root / ".devrelay/config.toml"
+        original = path.read_text()
+        for value in ('"maintainer"', 'true', '[1]', '[""]', '[" user"]',
+                      '["user name"]', '["@user"]', '["user", "USER"]'):
+            with self.subTest(value=value):
+                path.write_text(original + "\n[queue]\nallowed_authors = " + value + "\n")
+                with self.assertRaisesRegex(RelayError, "queue.allowed_authors"):
+                    load(self.root)
+        path.write_text(original + '\n[queue]\nallowed_authors = ["Maintainer", "autodev[bot]"]\n')
+        self.assertEqual(load(self.root).data["queue"]["allowed_authors"], ["Maintainer", "autodev[bot]"])
 
     def test_symlinked_ignore_file_is_not_modified(self):
         original = self.root / ".gitignore"

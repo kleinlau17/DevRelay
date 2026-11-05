@@ -158,7 +158,7 @@ def prepare_task(config, state, identifier):
     """Explicit setup for an external agent; never start a Codex session."""
     task = claimed_task(config, state, identifier)
     fresh = authorized(config, state, identifier)
-    task.update({key: fresh[key] for key in ("body", "title", "labels")})
+    task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
     return prepare(config, state, task)
 
 
@@ -168,7 +168,7 @@ def verify(config, state, identifier):
     task = claimed_task(config, state, identifier)
     require_prepared(config, task)
     fresh = authorized(config, state, identifier)
-    task.update({key: fresh[key] for key in ("body", "title", "labels")})
+    task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
     path = Path(task["worktree"])
     base = base_commit(config)
     if not is_ancestor(path, base, "HEAD"):
@@ -269,7 +269,7 @@ def implement_task(config, state, identifier=None, *, resume=False, allow_pr=Fal
     if task["status"] == "completed":
         raise RelayError(f"Task {identifier} is already {task['status']}; inspect status instead")
     fresh = authorized(config, state, identifier)
-    task.update({key: fresh[key] for key in ("body", "title", "labels")})
+    task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
     if allow_pr:
         editable_task(config, task)
     feedback = feedback if feedback is not None else task.get("error", "")
@@ -279,7 +279,7 @@ def implement_task(config, state, identifier=None, *, resume=False, allow_pr=Fal
             task = prepare(config, state, task)
         for attempt in range(limit):
             fresh = authorized(config, state, identifier)
-            task.update({key: fresh[key] for key in ("body", "title", "labels")})
+            task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
             task.update(status="implementing", attempts=task.get("attempts", 0) + 1, verification=None)
             task.pop("failure", None)
             state.save(task)
@@ -303,7 +303,7 @@ def implement_task(config, state, identifier=None, *, resume=False, allow_pr=Fal
                     raise
                 task = claimed_task(config, state, identifier)
                 fresh = authorized(config, state, identifier)
-                task.update({key: fresh[key] for key in ("body", "title", "labels")})
+                task.update({key: fresh[key] for key in ("body", "title", "labels", "author") if key in fresh})
                 continue
             return task
     except (RelayError, KeyboardInterrupt) as error:

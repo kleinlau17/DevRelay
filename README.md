@@ -26,7 +26,16 @@ devrelay doctor
 
 在项目的 **Issues → New issue** 中写清：现在有什么问题、期望的结果、怎样判断完成。例如“空文件名导致导出崩溃；应提示用户填写文件名，并有测试覆盖”。一个 Issue 对应一个可验收的结果，代码、测试和文档可以放在同一任务中。
 
-默认 `manual` 模式下，你或其他人手动创建的 Issue，都由维护者确认后，在右侧 **Labels** 中添加 `auto:approved`。常用默认标签如下：
+可在 `.devrelay/config.toml` 的 `[queue]` 中设置作者白名单，仅处理你本人或你的 autodev 账号创建的 GitHub Issue：
+
+```toml
+[queue]
+allowed_authors = ["your-github-login", "your-autodev-login"]
+```
+
+填写真实 GitHub 登录名，匹配不区分大小写；autodev 与你共用账号时只填一次。省略或设为 `[]` 保留不限制作者的原有行为，本地任务不受此项影响。本仓库已设为 `["kleinlau17"]`，覆盖本人和共用该账号的 autodev。作者不在名单中或无法读取作者的 Issue 不进入调查、执行或交付；授权标签、自动模式和发现任务来源均不能绕过。`next` 会说明排除原因，恢复和提交也会重新检查，已有工作与证据保留。其他作者的 Issue 仍可作为依赖或去重记录读取。
+
+通过作者限制后，默认 `manual` 模式下，手动创建的 Issue 仍由维护者确认后，在右侧 **Labels** 中添加 `auto:approved`。常用默认标签如下：
 
 | 标签 | 什么时候用 |
 |---|---|

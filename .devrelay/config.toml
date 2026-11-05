@@ -7,6 +7,7 @@ branch_prefix = "devrelay/task-"
 repository = "kleinlau17/DevRelay"
 
 [queue]
+allowed_authors = ["kleinlau17"] # Personal and autodev Issues use the same GitHub account.
 approval_label = "auto:approved"
 priorities = ["priority:P0", "priority:P1", "priority:P2"]
 blockers = ["blocked", "needs-input"]

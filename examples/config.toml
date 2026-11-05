@@ -7,6 +7,7 @@ remote = "origin"
 branch_prefix = "devrelay/task-"
 
 [queue]
+allowed_authors = ["your-github-login", "your-autodev-login"] # Case-insensitive; omit or [] to allow any author.
 mode = "manual" # autonomous: extend automatic triage to human Issues too.
 auto_kinds = ["bug"] # Allowed: bug, feature, maintenance; plans remain non-executable.
 scope = "Fix confirmed bugs with clear expected behavior and bounded acceptance."

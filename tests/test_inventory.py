@@ -15,7 +15,8 @@ class InventoryTests(unittest.TestCase):
     def page(self, kind, numbers, more=False, cursor=None, nested_more=False):
         field = "labels" if kind == "issues" else "closingIssuesReferences"
         return json.dumps({"data": {"repository": {kind: {
-            "nodes": [{"number": number, field: {"nodes": [], "pageInfo": {"hasNextPage": nested_more}}}
+            "nodes": [{"number": number, "author": {"login": "maintainer"},
+                       field: {"nodes": [], "pageInfo": {"hasNextPage": nested_more}}}
                       for number in numbers], "pageInfo": {"hasNextPage": more, "endCursor": cursor}}}}})
 
     def test_connection_walks_beyond_one_thousand_without_search(self):
@@ -30,6 +31,9 @@ class InventoryTests(unittest.TestCase):
                 self.assertNotIn("cursor=", " ".join(command.call_args_list[0].args[0]))
                 self.assertIn("cursor=cursor-9", command.call_args_list[-1].args[0])
                 self.assertIn("--hostname", command.call_args_list[-1].args[0])
+                if kind == "issues":
+                    self.assertIn("author{login}", command.call_args_list[0].args[0][6])
+                    self.assertTrue(all(item["author"]["login"] == "maintainer" for item in result))
 
     def test_truncated_nested_connections_and_pagination_loops_fail_closed(self):
         cases = [[self.page("issues", [1], nested_more=True)],

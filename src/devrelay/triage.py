@@ -35,12 +35,28 @@ def automatic(config, task):
     return autonomous(config) or bool(task.get("discovery_source") and config.data["discovery"]["auto_triage"])
 
 
+def author_reason(config, task):
+    """Only provider-supplied logins can satisfy the optional GitHub author gate."""
+    authors = config.data["queue"]["allowed_authors"]
+    if config.provider != "github" or not authors:
+        return None
+    author = task.get("author")
+    if not isinstance(author, str) or not author:
+        return "Issue author is missing; queue.allowed_authors requires a known GitHub login"
+    if author.casefold() not in {login.casefold() for login in authors}:
+        return f"Issue author {author!r} is not in queue.allowed_authors"
+    return None
+
+
 def identity(config, task):
     policy = {key: config.data["queue"][key] for key in ("mode", "scope", "auto_kinds", "approval_label", "blockers")}
     value = {"project": config.data["project"], "policy": policy,
              "discovery_source": task.get("discovery_source"), "automatic": automatic(config, task),
              "setup": config.data["setup"], "checks": config.data["checks"],
              "id": task["id"], "title": task["title"], "body": task["body"]}
+    if config.provider == "github" and config.data["queue"]["allowed_authors"]:
+        policy["allowed_authors"] = config.data["queue"]["allowed_authors"]
+        value["author"] = task.get("author")
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
@@ -50,6 +66,9 @@ def current(config, task):
 
 
 def authorization_reason(config, task):
+    reason = author_reason(config, task)
+    if reason:
+        return reason
     if config.data["queue"]["approval_label"] in task["labels"]:
         return None
     if not automatic(config, task):
@@ -176,6 +195,8 @@ def prepare(config, state, identifier, *, retry=False):
     from .process import execute
     fresh, view = candidate(config, state, identifier)
     saved = state.get(fresh["id"]) or {**fresh, "status": "queued", "attempts": 0}
+    if config.provider == "github":
+        saved["author"] = fresh.get("author")
     saved.pop("discovery_source", None)
     if fresh.get("discovery_source"):
         saved["discovery_source"] = fresh["discovery_source"]

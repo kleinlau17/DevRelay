@@ -7,7 +7,7 @@ import re
 from .errors import RelayError
 from .git import command, git, is_ancestor, validate_remote, worktrees
 from .state import now
-from .triage import authorization_reason, automatic, automatic_enabled, current as current_triage, identity as triage_identity
+from .triage import author_reason, authorization_reason, automatic, automatic_enabled, current as current_triage, identity as triage_identity
 
 
 ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
@@ -83,7 +83,7 @@ class Snapshot:
 
 def paginated_inventory(config, kind):
     """Walk repository connections, avoiding the CLI search inventory ceiling."""
-    fields = ("number title body state url createdAt labels(first:100){nodes{name} pageInfo{hasNextPage}}"
+    fields = ("number title body state url createdAt author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}}"
               if kind == "issues" else
               "number headRefName state baseRefName mergeCommit{oid} body url "
               "closingIssuesReferences(first:100){nodes{number} pageInfo{hasNextPage}}")
@@ -144,7 +144,7 @@ def snapshot(config, state, *, ignore_state_claim=None):
     validate_remote(config)
     git(config.root, "fetch", config.remote, config.base)
     issues = gh_json(config, "issue", "list", "--state", "all", "--limit", "1000", "--json",
-                     "number,title,body,state,labels,url,createdAt")
+                     "number,title,body,state,labels,url,createdAt,author")
     pulls = gh_json(config, "pr", "list", "--state", "all", "--limit", "1000", "--json",
                     "number,headRefName,state,baseRefName,mergeCommit,closingIssuesReferences,body,url")
     if len(issues) >= 1000:
@@ -162,7 +162,8 @@ def snapshot(config, state, *, ignore_state_claim=None):
             integrated.update(str(item["number"]) for item in pull["closingIssuesReferences"])
     tasks = [{"id": str(item["number"]), "title": item["title"], "body": item["body"] or "",
               "open": item["state"] == "OPEN", "labels": [label["name"] for label in item["labels"]],
-              "created_at": item["createdAt"], "url": item["url"]} for item in issues]
+              "created_at": item["createdAt"], "url": item["url"],
+              "author": (item.get("author") or {}).get("login")} for item in issues]
     saved = {item["id"]: item for item in state.tasks()}
     for task in tasks:
         if saved.get(task["id"], {}).get("triage"):
@@ -200,6 +201,9 @@ def queue_report(config, view, *, exclude_claimed=True, require_authorization=Tr
             continue
         labels = set(task["labels"])
         reasons = []
+        author = author_reason(config, task)
+        if author:
+            reasons.append(author)  # Investigation also enforces authors, before authorization exists.
         if is_tracking_parent(task):
             reasons.append("Tracking plan parents are not executable; authorize independently deliverable child issues")
         reasons.extend(label for label in queue["blockers"] if label in labels)

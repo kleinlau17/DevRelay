@@ -26,7 +26,16 @@ Configure at least one real project acceptance command (`[[checks]]`) and resolv
 
 Open **Issues → New issue** and describe the current problem, the expected result and how to verify completion. For example: “An empty filename crashes export; prompt the user to enter a filename and cover this behavior with a test.” One Issue should describe one verifiable outcome; its code, tests and documentation can stay together.
 
-In the default `manual` mode, Issues manually created by you or anyone else need a maintainer to review them and add `auto:approved` using **Labels** on the right. Common default labels are:
+Set an author allowlist under `[queue]` in `.devrelay/config.toml` to handle only GitHub Issues created by you or your autodev account:
+
+```toml
+[queue]
+allowed_authors = ["your-github-login", "your-autodev-login"]
+```
+
+Use actual GitHub logins; matching is case-insensitive. List the account once if autodev uses your login. Omitting the field or using `[]` preserves unrestricted authors; local tasks are unaffected. This repository uses `["kleinlau17"]` for both its maintainer and autodev sharing that account. Unlisted or unknown authors cannot enter investigation, execution or delivery, even with an approval label, autonomous mode or discovery provenance. `next` explains exclusions; recovery and publication recheck authors while preserving existing work and evidence. Other authors' Issues remain readable for dependencies and deduplication.
+
+After passing the author restriction, manually created Issues in the default `manual` mode still need a maintainer to review them and add `auto:approved` using **Labels** on the right. Common default labels are:
 
 | Label | When to use it |
 |---|---|
