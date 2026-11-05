@@ -34,10 +34,16 @@ def serve(entry, cwd, env):
         if not line:
             raise RuntimeError(process.stderr.read())
         return process, json.loads(line)['url']
-    except BaseException:
-        process.terminate()
-        process.communicate(timeout=10)
-        raise
+    except BaseException as error:
+        # SIGINT retains Python's startup traceback if the installed command hangs.
+        process.send_signal(signal.SIGINT)
+        try:
+            output, errors = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            output, errors = process.communicate()
+        raise RuntimeError(f'{error}\nDashboard exit: {process.returncode}\n'
+                           f'stdout: {output}\nstderr: {errors}') from error
     finally:
         selector.close()
 
