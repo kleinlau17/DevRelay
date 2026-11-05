@@ -8,11 +8,11 @@ import re
 import secrets
 import subprocess
 import sys
-import tomllib
 from urllib.parse import urlsplit
 import webbrowser
 
 from .errors import RelayError
+from .project_registry import Registry, runtime_info, _common
 
 
 @dataclass(frozen=True)
@@ -40,41 +40,44 @@ def projects(root, catalog=None):
     runtime = Path(__file__).resolve().parent.parent
     if catalog is None:
         return [Project("project", Path(root).resolve().name, Path(root).resolve(), runtime)]
-    catalog = catalog.resolve()
-    try:
-        data = tomllib.loads(catalog.read_text())
-    except (OSError, ValueError) as error:
-        raise RelayError(f"Cannot read project catalog: {error}") from error
-    if set(data) != {"projects"} or not isinstance(data["projects"], list) or not data["projects"]:
-        raise RelayError("Catalog must contain one or more [[projects]] entries")
-    result, ids = [], set()
-    for entry in data["projects"]:
-        if not isinstance(entry, dict) or set(entry) - {"id", "name", "path", "runtime"}:
-            raise RelayError("Unknown project catalog fields")
-        identifier = entry.get("id")
-        if not isinstance(identifier, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", identifier) or identifier in ids:
-            raise RelayError("Project IDs must be unique simple names")
-        if not isinstance(entry.get("path"), str) or not entry["path"]:
-            raise RelayError("Every project needs a path")
-        if any(not isinstance(entry[key], str) or not entry[key] for key in ("name", "runtime") if key in entry):
-            raise RelayError("Project name/runtime must be nonempty strings")
-        ids.add(identifier)
-        project_root = (catalog.parent / entry["path"]).resolve()
-        project_runtime = (catalog.parent / entry["runtime"]).resolve() if "runtime" in entry else runtime
-        if not project_root.is_dir() or not (project_runtime / "devrelay/config.py").is_file():
-            raise RelayError(f"Project {identifier}: path or runtime package directory does not exist")
-        result.append(Project(identifier, entry.get("name", identifier), project_root, project_runtime))
-    return result
+    registry = Registry(catalog)
+    _, entries = registry.read()
+    return [Project(entry["id"], entry.get("name", entry["id"]), registry.path_for(entry),
+                    registry.path_for(entry, "runtime") if "runtime" in entry else runtime)
+            for entry in entries]
 
 
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, entries, port=0):
+    def __init__(self, entries, port=0, *, registry=None):
+        self.registry = registry
+        self.initial_projects = entries
         self.projects = {project.id: project for project in entries}
         self.token = secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), DashboardHandler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
+
+    def refresh_projects(self):
+        if self.registry is None:
+            return
+        entries = projects(None, self.registry.path)
+        common = {_common(entry.root) for entry in entries} - {None}
+        ids = {entry.id for entry in entries}
+        for entry in self.initial_projects:
+            if entry.id not in ids and _common(entry.root) not in common:
+                entries.insert(0, entry)
+        self.projects = {project.id: project for project in entries}
+
+    def session(self):
+        self.refresh_projects()
+        registered = {entry["id"] for entry in self.registry.read()[1]} if self.registry else set()
+        return {"token": self.token,
+                "catalog": str(self.registry.path) if self.registry else None,
+                "runtime": runtime_info(),
+                "projects": [{"id": p.id, "name": p.name, "path": str(p.root),
+                              "registered": p.id in registered}
+                             for p in self.projects.values()]}
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -114,8 +117,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/favicon.ico":
             return self.respond(204, b"")
         if path == "/api/session":
-            return self.respond(200, {"token": self.server.token,
-                                      "projects": [{"id": p.id, "name": p.name} for p in self.server.projects.values()]})
+            try:
+                return self.respond(200, self.server.session())
+            except (RelayError, OSError, ValueError) as error:
+                return self.respond(400, {"error": str(error)})
         assets = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
                   "/style.css": ("style.css", "text/css")}
         if path in assets:
@@ -126,8 +131,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.trusted(write=True):
             return self.respond(403, {"error": "Reload the local dashboard before making changes"})
-        match = re.fullmatch(r"/api/projects/([a-zA-Z0-9_-]+)/(inspect|preview|save|queue|doctor)", self.path)
-        if not match or match[1] not in self.server.projects:
+        registration = self.path in ("/api/projects/probe", "/api/projects/add")
+        match = re.fullmatch(r"/api/projects/([a-zA-Z0-9_-]+)/(inspect|preview|save|queue|doctor|setup-github)", self.path)
+        if not registration and (not match or match[1] not in self.server.projects):
             return self.respond(404, {"error": "Unknown project or operation"})
         if self.headers.get("Content-Type") != "application/json":
             return self.respond(415, {"error": "Expected application/json"})
@@ -136,19 +142,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not 0 < length <= 1_048_576:
                 return self.respond(413, {"error": "Request body must be between 1 byte and 1 MiB"})
             payload = json.loads(self.rfile.read(length))
-            if not isinstance(payload, dict) or set(payload) - {"revision", "source", "changes", "preview_sha256"}:
-                raise ValueError("Invalid request fields")
-            result = self.server.projects[match[1]].call(match[2], **payload)
-        except (RelayError, ValueError, UnicodeError) as error:
+            if registration:
+                if self.server.registry is None:
+                    raise ValueError("Project registration is unavailable in this server")
+                allowed = {"path", "name", "replace_id", "revision"}
+                if not isinstance(payload, dict) or set(payload) - allowed or "path" not in payload:
+                    raise ValueError("Invalid registration fields")
+                if self.path.endswith("/probe"):
+                    if "revision" in payload:
+                        raise ValueError("Check the project before adding it")
+                    result = self.server.registry.plan(**payload)
+                else:
+                    if not isinstance(payload.get("revision"), str) or not payload["revision"]:
+                        raise ValueError("Check the project before adding it / 请先检查项目")
+                    result = self.server.registry.add(**payload)
+                    self.server.refresh_projects()
+            else:
+                if not isinstance(payload, dict) or set(payload) - {"revision", "source", "changes", "preview_sha256"}:
+                    raise ValueError("Invalid request fields")
+                result = self.server.projects[match[1]].call(match[2], **payload)
+        except (RelayError, ValueError, OSError) as error:
             return self.respond(400, {"error": str(error)})
         return self.respond(200, result)
 
 
-def serve(root, *, catalog=None, port=8765, open_browser=False):
+def serve(root=None, *, catalog=None, port=8765, open_browser=False):
     if not 0 <= port <= 65535:
         raise RelayError("UI port must be between 0 and 65535")
     try:
-        server = DashboardServer(projects(root, catalog), port)
+        registry = Registry(catalog)
+        entries = projects(root) if root is not None else []
+        server = DashboardServer(entries, port, registry=registry)
+        server.refresh_projects()
     except OSError as error:
         raise RelayError(f"Cannot start local dashboard: {error}") from error
     print(json.dumps({"url": server.origin, "message": "Local configuration dashboard; no worker started"}), flush=True)

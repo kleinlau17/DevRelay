@@ -244,13 +244,8 @@ def detect(root):
     return setup, checks, notes
 
 
-def initialize(root, provider=None, base=None, *, mode="manual"):
-    directory = root / ".devrelay"
-    path = directory / "config.toml"
-    if path.exists():
-        raise RelayError(f"Configuration already exists: {path}; left unchanged")
-    if directory.is_symlink() or (root / ".gitignore").is_symlink():
-        raise RelayError("Configuration directory or .gitignore is a symlink; left unchanged")
+def initial_configuration(root, provider=None, base=None, *, mode="manual"):
+    """Discover and render a proposal without creating files or executing setup."""
     try:
         slug = github_slug(git(root, "remote", "get-url", "origin"))
     except RelayError:
@@ -292,15 +287,40 @@ def initialize(root, provider=None, base=None, *, mode="manual"):
     if not checks:
         lines += ["", "# Add your project acceptance, for example:", '# [[checks]]',
                   '# id = "test"', '# argv = ["python3", "-m", "unittest", "discover", "-s", "tests"]']
-    directory.mkdir(exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n", {"provider": provider, "checks": len(checks), "notes": notes}
+
+
+def ignore_additions(root):
     ignore = root / ".gitignore"
+    if ignore.is_symlink() or ignore.exists() and not ignore.is_file():
+        raise RelayError(".gitignore is a symlink or not a regular file; left unchanged")
     text = ignore.read_text() if ignore.exists() else ""
     rules = ["/.devrelay/worktrees/", "/.devrelay/runtime/"]
     if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
         rules += ["/.venv/", "__pycache__/", "*.py[cod]", "*.egg-info/"]
-    additions = [line for line in rules if line not in text.splitlines()]
+    return text, [line for line in rules if line not in text.splitlines()]
+
+
+def ensure_ignores(root):
+    text, additions = ignore_additions(root)
     if additions:
-        with ignore.open("a") as stream:
+        with (root / ".gitignore").open("a") as stream:
             stream.write(("\n" if text and not text.endswith("\n") else "") + "\n".join(additions) + "\n")
-    return {"config": str(path), "provider": provider, "checks": len(checks), "notes": notes}
+
+
+def initialize(root, provider=None, base=None, *, mode="manual", expected_source=None):
+    directory = root / ".devrelay"
+    path = directory / "config.toml"
+    if path.exists() or path.is_symlink():
+        raise RelayError(f"Configuration already exists: {path}; left unchanged")
+    if directory.is_symlink():
+        raise RelayError("Configuration directory is a symlink; left unchanged")
+    ignore_additions(root)
+    source, result = initial_configuration(root, provider, base, mode=mode)
+    if expected_source is not None and source != expected_source:
+        raise RelayError("Project inputs changed; check the project again before creating configuration")
+    directory.mkdir(exist_ok=True)
+    with path.open("x") as stream:
+        stream.write(source)
+    ensure_ignores(root)
+    return {"config": str(path), **result}

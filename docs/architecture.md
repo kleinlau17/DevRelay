@@ -184,3 +184,11 @@ is introduced.
 - Process markers detect remaining foreground groups after controller crashes. Commands must not daemonize or escape the group. There is a brief spawn-to-marker crash window; this is cooperative recovery, not an OS isolation guarantee.
 
 默认单仓库、单 worker、有限重试并停在 draft PR；项目可明确开启审查与合并。`watch` 持续串行调度，空队列等待期间也保留 worker 锁，人工模式在 draft 交付后继续；明确开启 `auto_merge=true` 后等待 CI、保护条件及合并队列，合并后验收和清理完成才继续。人工授权的人提任务遇到失败或人工处理状态会停止调度；自动发现任务和项目自动模式可以暂停已知任务级待决，继续其他独立任务。审查绑定准确提交与 base；CI、GitHub 审查意见和保护条件另行核验。默认合并后在独立工作树重跑 setup/checks；可由项目配置省去这轮命令，但仍核对合并身份与源码树；失败保留远端已合并的事实和本地证据。后台服务安装、远端执行、多仓库事务与发布留给后续适配。项目命令负责业务环境。进程组恢复要求命令不脱离前台进程组；进程启动与标记之间仍有短暂中断窗口，不能宣称操作系统级隔离。
+
+## User project registration
+
+`project_registry` owns the optional user catalog, separate from repository configuration and task/workspace authorization. The dashboard and `projects add/locate` use the same registration logic. Read-only proposals bind repository/controller identity, configuration, ignore rules, saved state and catalog contents. Writes take the catalog lock then the repository worker lock; retries preserve any completed configuration and metadata writes. Catalog replacement is atomic with a byte-for-byte backup. A failed catalog write may leave local registration complete; repeat the operation without deleting state.
+
+Repository identities are retained in Git-common-directory metadata and catalog entries. Existing worktrees deduplicate to the registered controller. Missing paths remain visible for explicit relocation. Live identity copies, identity changes and controller relocation with task history fail closed. Initialization never runs setup commands, tasks or models; GitHub label/template setup is a separate revision-checked, locked action. Installation diagnostics expose the actual runtime and reject missing controller registration as not ready.
+
+The wheel smoke test uses the public installed CLI and loopback API from outside the source tree, with two local repositories, an isolated catalog, no `PYTHONPATH`, and a reinstall. CI runs it on supported POSIX platforms and minimum/current tested Python versions.

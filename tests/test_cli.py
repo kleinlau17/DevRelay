@@ -132,6 +132,7 @@ class CliTests(RepositoryTest):
 
     def test_doctor_checks_current_github_credentials_despite_inactive_account_failure(self):
         self.configure(provider="github", executable=self.fake_codex())
+        self.state.set_metadata("controller_root", str(self.root))
         self.git("remote", "add", "origin", "https://github.com/example/project.git")
         self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         run, which = subprocess.run, shutil.which

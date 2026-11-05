@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from devrelay.cli import doctor, main, probe
 from devrelay.config import load
+from devrelay.project_registry import Registry
 
 from helpers import RepositoryTest
 
@@ -31,6 +32,7 @@ class AgentToolTests(RepositoryTest):
             sys.executable, "-c",
             "from pathlib import Path; p=Path('.devrelay/runtime/environment'); p.parent.mkdir(parents=True); p.write_text('ready')",
         ]])
+        Registry(Path(self.temporary.name) / "projects.toml").add(str(self.root))
         self.add_task()
         (self.root / "user-work.txt").write_text("Keep controller work")
         with patch("devrelay.runner.codex.implement", side_effect=AssertionError("Unexpected implementation agent")):
@@ -64,6 +66,7 @@ class AgentToolTests(RepositoryTest):
 
     def test_doctor_checks_codex_only_when_requested(self):
         self.configure(executable="/no-such-devrelay-codex")
+        Registry(Path(self.temporary.name) / "projects.toml").add(str(self.root))
         with patch("devrelay.cli.probe", wraps=probe) as calls:
             code, report = self.invoke("doctor")
             self.assertEqual(code, 0, report)

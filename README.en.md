@@ -10,17 +10,19 @@ The primary workflow is driven by an external agent calling `next/start/prepare/
 
 The everyday flow is: **describe a task → maintainer approves it → an agent implements it → review and merge the PR**. The examples use Issue `#12`; replace it with your issue number. Run terminal commands from the target project's main checkout (your usual repository directory).
 
-### 1. Prepare the project (first use)
+### 1. Set up the project
 
-Follow [installation](#install-and-onboard) and have GitHub CLI (`gh`) installed and signed in. Built-in Codex execution and AI review also need an installed, signed-in Codex CLI, including the default review of discovered tasks. If you installed DevRelay in a virtual environment, activate it before running these commands.
+Follow [installation](#install-and-onboard) once and sign in to GitHub CLI (`gh`). Built-in Codex orchestration and AI review also require an installed, signed-in Codex CLI.
 
 ```bash
-devrelay init --provider github
-# Open .devrelay/config.toml and review setup and acceptance commands.
-devrelay doctor
+devrelay ui --open
 ```
 
-Configure at least one real project acceptance command (`[[checks]]`) and resolve reported problems until `doctor` returns `ready: true`. Track the generated configuration, ignore rules and Issue templates in Git; templates appear on GitHub's new Issue page after being pushed to the default branch. Already configured projects can skip `init`.
+Choose **添加项目** (Add project), enter a local repository path, check it and confirm. Existing `.devrelay/config.toml` files are preserved; missing configuration is generated for review. One Git repository has one registered controller; its other worktrees share that entry.
+
+Review setup and acceptance under **项目验收**, including at least one real acceptance command. Under **状态**, explicitly initialize GitHub labels/templates and run the environment check. Registration, GitHub initialization and diagnostics do not start tasks or run project setup commands.
+
+Commit configuration, ignore rules and templates through the project's PR process. Templates appear on GitHub after reaching its default branch. A fresh clone with existing configuration still needs local project registration on the new machine.
 
 ### 2. Create a GitHub Issue and add labels
 
@@ -86,7 +88,7 @@ Passing acceptance leads to a new or updated PR, which defaults to a draft. **Au
 
 ## Local configuration dashboard
 
-Start the dashboard from an onboarded project (Python 3.11+, no extra dependencies):
+Start the dashboard from any directory (Python 3.11+, no extra dependencies):
 
 ```bash
 devrelay ui --open
@@ -101,30 +103,25 @@ info buttons provide contextual help with keyboard focus and Escape dismissal. T
 registered tasks, and on-demand queue exclusion reasons and `doctor` results.
 Saving configuration and querying status do not execute tasks or start a worker.
 
-To manage independent projects together, create a catalog such as `projects.toml`:
+**Add project** automatically maintains `~/.config/devrelay/projects.toml`, or `$XDG_CONFIG_HOME/devrelay/projects.toml` when `XDG_CONFIG_HOME` is absolute. An empty dashboard is supported; no hand-written catalog, project wrapper or dedicated runtime is needed.
 
-```toml
-[[projects]]
-id = "us"
-name = "US"
-path = "/path/to/us-controller"
+Checking a repository is read-only. Confirmation preserves or creates configuration, adds missing Git ignores, registers the controller and saves the catalog. Changed configuration/catalog revisions require another check. Worktrees are deduplicated by Git common directory and use the existing controller's configuration. Source files, indexes, tasks and evidence are preserved.
 
-[[projects]]
-id = "usp"
-name = "USP"
-path = "/path/to/usp-controller"
-runtime = "/path/to/pinned-devrelay/src"
-```
+Missing directories remain visible. Use **重新定位** (Relocate) to select the new path; repository identity is checked. A different repository, copied state still used elsewhere, active workers, workspace reservations and controller moves with saved tasks are rejected. Restore the original path when task history exists. Register a legacy hand-written entry at its original path before moving it so its identity is recorded. Relocation updates registration; it does not move files.
+
+Agents and terminal users share this workflow:
 
 ```bash
-devrelay ui --catalog /path/to/projects.toml --open
+devrelay projects add /path/to/project --name "My project"
+devrelay projects list
+devrelay projects locate PROJECT_ID /new/path/to/project
 ```
 
-`path` and optional `runtime` resolve relative to the catalog. `runtime` is the directory containing the `devrelay/` Python
-package; omit it to use the dashboard's version. Catalogs are trusted local configuration: selecting a runtime loads its
-Python code. Each project uses its own runtime's validator, defaults, controller routing and repository lock in an isolated
-process. Unsupported fields are hidden; runtimes without `config.validate` fail explicitly instead of silently using a
-different version. The catalog neither upgrades runtimes nor defines a `--workspace` task. See the [example](examples/ui-projects.toml).
+`projects add` is repeatable, preserves existing configuration and reuses an established controller. `init` remains available separately. Registration does not write to GitHub; use `devrelay --project /path/to/project init --sync-github` or explicitly initialize GitHub in the dashboard.
+
+For a separate catalog, use `devrelay ui --catalog /path/to/projects.toml --open` or `devrelay projects --catalog /path/to/projects.toml add /path/to/project`. Paths resolve relative to the catalog. Writes use a lock, atomic replacement and exact-file backups under adjacent `catalog-backups/`. Retrying registration recovers partially completed local setup without resetting tasks.
+
+Projects share the installed runtime by default. An advanced trusted catalog may set `runtime` to the directory containing a different `devrelay/` package; this loads Python code from that path. Configuration operations use that runtime's validation, defaults and locks without silently falling back. Registration preserves existing runtime overrides; it does not create per-project runtimes. The catalog neither upgrades the tool nor defines a `--workspace` task. See the [advanced example](examples/ui-projects.toml).
 
 Preview validates changes and displays the TOML diff and affected evidence stages. Ordinary field edits preserve unrelated
 content and scalar-line comments; editing a command list rewrites that list. Use the source editor for complex TOML layouts.
@@ -261,6 +258,26 @@ devrelay --workspace /path/workspace.toml run terrain-edit --submit
 
 ## Install and onboard
 
+Install one user-level command. With `uv` installed:
+
+```bash
+uv tool install git+https://github.com/kleinlau17/DevRelay.git
+devrelay --version
+devrelay ui --open
+```
+
+If `devrelay` is not found, run `uv tool update-shell` and reopen the terminal. All projects use this command; no source checkout, project-specific virtual environment or wrapper is required. `pipx install git+https://github.com/kleinlau17/DevRelay.git` is an alternative.
+
+Update with `uv tool upgrade devrelay`. To pin or restore a reviewed commit, replace `REVISION` with its SHA:
+
+```bash
+uv tool install --force 'git+https://github.com/kleinlau17/DevRelay.git@REVISION'
+```
+
+Installation and updates do not migrate or delete catalogs or task state. `doctor` reports the actual package path, Python executable and commit ID for Git installs; the dashboard also exposes runtime paths. Preserve the catalog before downgrading: old dashboards without `repository_id` support need a matching catalog from `catalog-backups/`, or `--project` to open a single project. Do not delete repository state to switch versions.
+
+Editable source installation is for DevRelay development:
+
 ```bash
 cd /path/to/DevRelay
 python3 -m venv .venv
@@ -268,17 +285,17 @@ python3 -m venv .venv
 .venv/bin/devrelay --help
 ```
 
-Use `devrelay --version` or `devrelay -V` to print the version; neither a Git repository nor project configuration is required.
+Engineering tools do not require Codex CLI; optional orchestration and AI review require an installed, signed-in Codex CLI. GitHub tasks and PR submission require authenticated `gh`. Existing authentication is reused; credential files are not copied.
 
-Alternatively, use `pipx install /path/to/DevRelay` for a global command. Engineering tools do not require Codex CLI; optional orchestration and AI review require an installed, signed-in Codex CLI. GitHub tasks and PR submission require authenticated `gh`. Existing authentication is reused; credential files are not read or copied.
+For terminal onboarding:
 
 ```bash
-devrelay --project /path/to/project init
+devrelay projects add /path/to/project
 # Review /path/to/project/.devrelay/config.toml
 devrelay --project /path/to/project doctor
 ```
 
-Initialization detects GitHub origin, the default branch, Node package managers and common scripts, Python installation, Cargo and Go checks. It creates TOML configuration and appends runtime ignores (including Python environments and installation artifacts) without overwriting existing configuration or AGENTS.md. It does not install packages or call a model. Review watch modes, service requirements and actual business acceptance. Python test frameworks are not guessed; configure the real runner.
+`init` detects GitHub origin, the default branch, Node package managers and common scripts, Python installation, Cargo and Go checks. It creates TOML configuration and appends runtime ignores (including Python environments and installation artifacts) without overwriting existing configuration or AGENTS.md. It does not install packages or call a model. Review watch modes, service requirements and actual business acceptance. Python test frameworks are not guessed; configure the real runner.
 
 Commands use argument arrays, with no shell expansion. Setup runs in the task worktree. At least one acceptance command is required before run/check/submit. Commit the project configuration, ignore rules and generated issue templates. Empty repositories need an initial commit. Codex uses the user's default model unless `codex.model` or `codex.profile` is set. See [configuration](examples/config.toml).
 
@@ -525,3 +542,12 @@ git diff --check
 Tests use real temporary Git repositories and a fake Codex CLI. Delivery tests push and squash-merge in temporary repositories, run fresh post-merge checks, and mock GitHub review/CI APIs and timeout recovery. They do not call models or push public repositories. Real target projects still require their own acceptance. See [architecture](docs/architecture.md) and [official Codex non-interactive documentation](https://developers.openai.com/codex/noninteractive).
 
 Non-UTF-8 filename end-to-end cases run on supporting filesystems. Only fixture creation that explicitly rejects an invalid UTF-8 name with `EILSEQ` reports a platform skip, which is not successful product acceptance. Git tree/index byte-path regressions run without checking out these names on every platform; permission and product errors remain test failures.
+
+## Installed-flow validation
+
+CI runs the full suite on macOS/Linux and Python 3.11/3.14, builds a wheel, and exercises the installed CLI in a fresh virtual environment with an isolated user catalog outside the source checkout. It covers first registration, a fresh clone with existing configuration, configuration saves, duplicates, relocation, wrong-repository rejection, dirty files/index preservation and state retention after reinstallation. Only temporary local Git repositories are used; no remote tasks or models are invoked.
+
+```bash
+python3 -m pip wheel --no-deps . --wheel-dir dist
+python3 scripts/smoke_install.py dist/devrelay-*.whl
+```

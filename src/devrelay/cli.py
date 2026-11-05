@@ -29,12 +29,22 @@ def parser():
     root.add_argument("-V", "--version", action="version", version=__version__)
     locations = root.add_mutually_exclusive_group()
     locations.add_argument("--workspace", type=Path, help="Explicit multi-repository TOML manifest (draft delivery only)")
-    locations.add_argument("--project", type=Path, default=Path.cwd(), help="Project directory (default: current directory)")
+    locations.add_argument("--project", type=Path, help="Project directory (task commands default to current directory)")
     sub = root.add_subparsers(dest="command", required=True)
     ui = sub.add_parser("ui", help="Open a local configuration dashboard; does not start a worker")
     ui.add_argument("--catalog", type=Path, help="TOML project catalog (separate from a task workspace manifest)")
     ui.add_argument("--port", type=int, default=8765, help="Loopback HTTP port (default: 8765; 0 selects a free port)")
     ui.add_argument("--open", action="store_true", help="Open the dashboard in your default browser")
+    catalog = sub.add_parser("projects", help="Register local repositories for the dashboard; does not start tasks")
+    catalog.add_argument("--catalog", type=Path, help="Override the user project catalog")
+    project_commands = catalog.add_subparsers(dest="project_command", required=True)
+    project_commands.add_parser("list", help="List registered repositories")
+    add_project = project_commands.add_parser("add", help="Keep or create project configuration and register its controller")
+    add_project.add_argument("path", type=Path)
+    add_project.add_argument("--name", default="", help="Project display name")
+    relocate = project_commands.add_parser("locate", help="Relocate an existing project after checking repository identity")
+    relocate.add_argument("id")
+    relocate.add_argument("path", type=Path)
     init = sub.add_parser("init", help="Create project configuration and initialize GitHub issue management")
     init.add_argument("--provider", choices=("local", "github"))
     init.add_argument("--mode", choices=("manual", "autonomous"), help="Project authorization mode (default: manual)")
@@ -136,7 +146,11 @@ def doctor(config, *, with_codex=False):
         checks += [{"id": "gh", "ok": shutil.which("gh") is not None},
                    {"id": "github_login", "ok": probe(["gh", "api", "--hostname", "github.com", "user", "--silent"], config.root)},
                    {"id": "remote_matches_repository", "ok": matches}]
-    return {"ready": all(item["ok"] for item in checks), "provider": config.provider,
+    from .project_registry import registered_controller, runtime_info
+    registered = registered_controller(config.root)
+    checks.append({"id": "controller", "ok": registered == config.root.resolve(),
+                   "value": str(registered) if registered else "Run devrelay projects add PATH to register this checkout"})
+    return {"runtime": runtime_info(), "ready": all(item["ok"] for item in checks), "provider": config.provider,
             "checks": checks, "codex_required": codex_required,
             "notes": ["Use doctor --with-codex before optional run/resume/watch or explicit AI review.",
                       "Login checks do not call a model or verify model access.",
@@ -162,6 +176,18 @@ def main(argv=None):
                 raise RelayError("ui uses --catalog for independent projects, not --workspace")
             from .ui import serve
             return serve(args.project, catalog=args.catalog, port=args.port, open_browser=args.open)
+        if args.command == "projects":
+            if args.workspace or args.project:
+                raise RelayError("projects takes its own repository path; omit --workspace and --project")
+            from .project_registry import Registry
+            registry = Registry(args.catalog)
+            if args.project_command == "list":
+                result = {"catalog": str(registry.path), "projects": registry.read()[1]}
+            else:
+                result = registry.add(str(args.path), name=getattr(args, "name", ""),
+                                      replace_id=args.id if args.project_command == "locate" else None)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
         if args.workspace:
             from .workspace import dispatch
             result = dispatch(args)
@@ -169,7 +195,7 @@ def main(argv=None):
             return 1 if result.get("status") in ("failed", "blocked", "needs_attention") or result.get("ready") is False else 0
         if args.command == "task" and args.task_command == "revoke":
             raise RelayError("task revoke requires --workspace")
-        root = repository_root(args.project)
+        root = repository_root(args.project or Path.cwd())
         state = State(root)
         root = controller(root, state)
         if args.command == "init":

@@ -1,7 +1,8 @@
 """Isolated dashboard adapter, executed with the selected runtime on sys.path.
 
-Only explicit catalog entries select code. HTTP requests cannot select paths or
-executables. The selected runtime owns validation, controller routing and locks.
+The server selects this adapter's project and runtime; configuration requests
+cannot override either. Registration manages repository paths separately. The
+selected runtime owns validation, controller routing and locks.
 """
 
 import difflib
@@ -103,8 +104,17 @@ def main(request, root, runtime):
             return {"source": source, "revision": revision(raw), "data": config.data if config else {},
                     "explicit": explicit, "defaults": defaults, "supported": supported,
                     "errors": errors, "root": str(root), "config_path": str(path),
-                    "runtime": {"version": devrelay.__version__, "path": str(package), "sha256": runtime_sha},
+                    "runtime": {"version": devrelay.__version__, "path": str(package), "sha256": runtime_sha, "python": sys.executable},
                     "activity": status, "tasks": tasks}
+
+        if operation == "setup-github":
+            if request.get("revision") != revision(raw):
+                raise ValueError("Configuration changed; reload before initializing GitHub")
+            from devrelay.onboarding import setup_github
+            with state.lock():
+                if read() != raw:
+                    raise ValueError("Configuration changed; reload before initializing GitHub")
+                return setup_github(validate(source))
 
         if operation in ("queue", "doctor"):
             config = validate(source)
