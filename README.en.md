@@ -84,6 +84,61 @@ If work has not started, check authorization, blocker labels and dependencies. A
 
 Passing acceptance leads to a new or updated PR, which defaults to a draft. **Automatic merging is off by default**: inspect the changes and checks on GitHub, then merge when satisfied. Automatic merging requires separate configuration. Detailed recovery and delivery rules follow below.
 
+## Local configuration dashboard
+
+Start the dashboard from an onboarded project (Python 3.11+, no extra dependencies):
+
+```bash
+devrelay ui --open
+# Or select a project and port
+devrelay --project /path/to/project ui --port 8765
+```
+
+Open the printed `http://127.0.0.1:8765` address. Use `--port 0` for an available port; Ctrl-C stops the server.
+The dashboard currently has a Chinese interface. Edit issue intake, agent-discovery policy, model/timeouts/attempt budgets,
+review and merge policy, project identity, setup and acceptance commands, or the TOML source. Forms show effective values;
+info buttons provide contextual help with keyboard focus and Escape dismissal. The status page includes runtime defaults,
+registered tasks, and on-demand queue exclusion reasons and `doctor` results.
+Saving configuration and querying status do not execute tasks or start a worker.
+
+To manage independent projects together, create a catalog such as `projects.toml`:
+
+```toml
+[[projects]]
+id = "us"
+name = "US"
+path = "/path/to/us-controller"
+
+[[projects]]
+id = "usp"
+name = "USP"
+path = "/path/to/usp-controller"
+runtime = "/path/to/pinned-devrelay/src"
+```
+
+```bash
+devrelay ui --catalog /path/to/projects.toml --open
+```
+
+`path` and optional `runtime` resolve relative to the catalog. `runtime` is the directory containing the `devrelay/` Python
+package; omit it to use the dashboard's version. Catalogs are trusted local configuration: selecting a runtime loads its
+Python code. Each project uses its own runtime's validator, defaults, controller routing and repository lock in an isolated
+process. Unsupported fields are hidden; runtimes without `config.validate` fail explicitly instead of silently using a
+different version. The catalog neither upgrades runtimes nor defines a `--workspace` task. See the [example](examples/ui-projects.toml).
+
+Preview validates changes and displays the TOML diff and affected evidence stages. Ordinary field edits preserve unrelated
+content and scalar-line comments; editing a command list rewrites that list. Use the source editor for complex TOML layouts.
+Saving rechecks file/runtime revisions, takes the repository lock, backs up the exact original under the Git common
+directory's `devrelay/ui-backups/` using its content hash, and atomically replaces the configuration. The index, tasks and
+historical evidence remain intact. The current session's backup path is available in the status page's project details; paste a backup into the source editor to preview
+and restore it. Concurrent file changes require a reload instead of being overwritten.
+
+The server binds only to `127.0.0.1` and protects writes with same-origin checks and a session token. Active workers,
+surviving command processes and workspace reservations block saves. An available DevRelay lock does not establish that an
+external agent has stopped editing. The next command loads the saved configuration; existing tasks still pass authorization
+and delivery gates, and affected evidence may need regeneration. Keep credentials out of configuration and use existing
+local `gh` / Codex logins.
+
 ## Autonomous projects
 
 Agent discoveries created through DevRelay default to independent triage, implementation when in scope, and automatic PR review. Human Issues still need explicit approval by default; `queue.mode = "autonomous"` extends the same investigation pipeline to them. Automatic merging is a separate opt-in.
