@@ -35,13 +35,13 @@ class WatchArgumentTests(unittest.TestCase):
 
     def test_max_tasks_alias_uses_same_destination_and_default(self):
         self.assertIsNone(parser().parse_args(["watch"]).max_tasks)
-        for option in ("--max-tasks", "--limit"):
+        for option in ("--max-tasks", "--limit", "-n"):
             with self.subTest(option=option):
                 args = parser().parse_args(["watch", option, "2"])
                 self.assertEqual(args.max_tasks, 2)
 
     def test_max_tasks_alias_rejects_non_positive_integers(self):
-        for option in ("--max-tasks", "--limit"):
+        for option in ("--max-tasks", "--limit", "-n"):
             for value in ("0", "-1", "1.5", "invalid"):
                 with self.subTest(option=option, value=value):
                     with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as raised:
@@ -59,6 +59,7 @@ class WatchArgumentTests(unittest.TestCase):
             self.assertIn("--interval", out.getvalue())
             self.assertIn("--max-tasks", out.getvalue())
             self.assertIn("--limit", out.getvalue())
+            self.assertIn("-n MAX_TASKS", out.getvalue())
             repository_root.assert_not_called()
             watch.assert_not_called()
             subprocess_run.assert_not_called()

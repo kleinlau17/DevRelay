@@ -461,7 +461,7 @@ devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
 
 `--interval` is a shorter alias for `--poll-interval`, for example `watch --interval 30`; both accept positive integers and default to 60 seconds.
 
-`--limit` is a shorter alias for `--max-tasks`, for example `watch --limit 2`; both accept positive integers, with no delivery-count limit when omitted; autonomous projects still have a persistent dispatch budget.
+`--limit` and `-n` are aliases for `--max-tasks`, for example `devrelay watch -n 2`; all three accept positive integers, with no delivery-count limit when omitted; autonomous projects still have a persistent dispatch budget.
 
 `watch` serially claims authorized issues with integrated dependencies, ordered by configured priority and creation time. It implements, verifies, submits a draft PR and runs enabled independent read-only review. `[delivery] auto_merge` in the project's `.devrelay/config.toml` explicitly selects the delivery mode; it defaults to `false`, and the CLI does not enable authorization:
 

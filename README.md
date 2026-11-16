@@ -456,7 +456,7 @@ devrelay --project /path/to/project watch --poll-interval 30 --max-tasks 2
 
 `--interval` 是 `--poll-interval` 的简短别名，例如 `watch --interval 30`；两种写法都要求正整数，默认值均为 60 秒。
 
-`--limit` 是 `--max-tasks` 的简短别名，例如 `watch --limit 2`；两种写法都要求正整数，省略时不限制成功交付数量；项目自动模式仍受持久化调度预算限制。
+`--limit` 和 `-n` 是 `--max-tasks` 的别名，例如 `devrelay watch -n 2`；三种写法都要求正整数，省略时不限制成功交付数量；项目自动模式仍受持久化调度预算限制。
 
 `watch` 按配置的优先级和创建时间串行领取已授权、依赖已交付的 Issue，执行开发、验收、draft PR 和启用的独立只读审查。项目 `.devrelay/config.toml` 的 `[delivery] auto_merge` 明确选择交付模式；默认 `false`，CLI 不会替你开启授权：
 
