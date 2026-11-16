@@ -143,8 +143,19 @@ class Installation:
 
     @contextmanager
     def lock(self):
-        self.directory.mkdir(parents=True, exist_ok=True)
-        if self.directory.is_symlink() or self.directory.stat().st_uid != os.geteuid() or self.directory.stat().st_mode & 0o022:
+        # The directory mode must not depend on the caller's umask: with the
+        # common umask 002, the default mkdir mode is 0775 (group-writable)
+        # and the check below would reject the directory this method just
+        # created. 0o700 has no group/other bits, so no umask can widen it.
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.directory.is_symlink() or self.directory.stat().st_uid != os.geteuid():
+            raise RelayError("Dashboard system directory must be owned by the installer and not writable by other users")
+        # A directory left behind by an earlier install (or created before
+        # this fix) may still be group-writable; tighten our own directory
+        # instead of refusing an installation we can make safe.
+        if self.directory.stat().st_mode & 0o077:
+            os.chmod(self.directory, 0o700)
+        if self.directory.stat().st_mode & 0o022:
             raise RelayError("Dashboard system directory must be owned by the installer and not writable by other users")
         fd = os.open(self.directory / "install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "a") as stream:

@@ -67,6 +67,25 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(self.installation.state.exists())
         self.assertFalse(self.installation.apply('uninstall', self.settings)['installed'])
 
+    def test_install_succeeds_with_group_writable_umask(self):
+        # Regression test: with umask 002 (the Ubuntu default, including
+        # GitHub-hosted Ubuntu runners) mkdir creates mode 0775. The install
+        # must not reject the system directory it just created.
+        previous = os.umask(0o002)
+        try:
+            result = self.install()
+        finally:
+            os.umask(previous)
+        self.assertTrue(result['healthy'])
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+
+    def test_install_tightens_preexisting_group_writable_directory(self):
+        self.installation.directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.installation.directory, 0o775)
+        result = self.install()
+        self.assertTrue(result['healthy'])
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+
     def test_hosts_without_final_newline_round_trip(self):
         self.installation.hosts.write_bytes(b'127.0.0.1 localhost')
         self.install()
