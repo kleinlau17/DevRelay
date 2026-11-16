@@ -16,7 +16,7 @@ from unittest.mock import patch
 from devrelay.cli import main
 from devrelay.errors import RelayError
 from devrelay.ui import DashboardServer, activated_socket
-from devrelay.ui_service import BLOCK, Installation, hosts_content, health, unit_quote
+from devrelay.ui_service import BLOCK, Installation, hosts_content, health, unit_quote, manage
 
 
 class ServiceTests(unittest.TestCase):
@@ -29,6 +29,10 @@ class ServiceTests(unittest.TestCase):
         self.original = b'127.0.0.1 localhost\n# preserve aliases\n10.0.0.2 internal\n'
         self.installation.hosts.write_bytes(self.original)
         self.installation.services[0].parent.mkdir(parents=True)
+        # Model protected system parents independently of the suite caller umask.
+        (self.root / "Library").chmod(0o755)
+        self.installation.directory.parent.mkdir(mode=0o755)
+        self.installation.directory.parent.chmod(0o755)
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             port = probe.getsockname()[1]
@@ -85,6 +89,123 @@ class ServiceTests(unittest.TestCase):
         result = self.install()
         self.assertTrue(result['healthy'])
         self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+
+    def test_install_succeeds_with_extreme_and_standard_umasks(self):
+        for mask in (0o777, 0o022):
+            with self.subTest(mask=oct(mask)):
+                previous = os.umask(mask)
+                try:
+                    self.assertTrue(self.install()['healthy'])
+                finally:
+                    os.umask(previous)
+                self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+                self.installation.apply('uninstall', self.settings)
+                (self.installation.directory / 'install.lock').unlink()
+                self.installation.directory.rmdir()
+
+    def test_untrusted_journal_is_preserved_and_never_recovered_on_retries(self):
+        self.installation.directory.mkdir(parents=True)
+        self.installation.directory.chmod(0o775)
+        malicious = dict(phase='installing', settings=self.settings, files=['attacker-new'],
+                         previous=dict(phase='ready', settings=self.settings, files=['attacker-old']),
+                         hosts_before=self.original.decode(), hosts_after=self.original.decode())
+        payload = json.dumps(malicious)
+        self.installation.state.write_text(payload)
+        for action in ('install', 'uninstall', 'install'):
+            with self.subTest(action=action), self.assertRaisesRegex(RelayError, 'Untrusted dashboard record') as caught:
+                self.installation.apply(action, self.settings)
+            message = str(caught.exception)
+            self.assertIn('sudo launchctl bootout system/org.devrelay.dashboard', message)
+            self.assertIn('administrator-only quarantine', message)
+            self.assertIn('Do not merely chmod', message)
+            self.assertEqual(self.installation.state.read_text(), payload)
+            self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o775)
+            self.assertFalse(self.installation.services[0].exists())
+            self.assertEqual(self.installation.hosts.read_bytes(), self.original)
+        self.start.assert_not_called()
+        self.stop.assert_not_called()
+        # Follow the documented path after independent inspection of service files.
+        self.installation.state.rename(self.root / 'quarantined.json')
+        self.assertFalse(self.installation.apply('uninstall', self.settings)['installed'])
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+
+    def test_record_planted_during_tightening_remains_untrusted_on_retry(self):
+        self.installation.directory.mkdir(parents=True)
+        self.installation.directory.chmod(0o775)
+        real_chmod = os.fchmod
+        payload = json.dumps(dict(phase='installing', settings=self.settings, files=['attacker'],
+                                  previous=dict(files=['attacker-old']),
+                                  hosts_before='', hosts_after=''))
+        def plant(fd, mode):
+            self.installation.state.write_text(payload)
+            real_chmod(fd, mode)
+        with patch('devrelay.ui_service.os.fchmod', side_effect=plant):
+            with self.assertRaisesRegex(RelayError, 'Untrusted dashboard record'):
+                self.install()
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+        with self.assertRaisesRegex(RelayError, 'Untrusted dashboard record'):
+            self.installation.apply('uninstall', self.settings)
+        self.assertEqual(self.installation.state.read_text(), payload)
+        self.start.assert_not_called()
+        self.stop.assert_not_called()
+        self.installation.state.rename(self.root / 'quarantined.json')
+        self.assertFalse(self.installation.apply('uninstall', self.settings)['installed'])
+
+    def test_unreadable_installation_status_and_uninstall_preview(self):
+        self.install()
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        for path in (self.installation.directory, self.installation.state):
+            original_mode = path.stat().st_mode & 0o777
+            path.chmod(0)
+            try:
+                status = manage('status')
+                self.assertTrue(status['installed'])
+                self.assertFalse(status['readable'])
+                self.assertFalse(status['healthy'])
+                self.assertIn('unreadable', status['message'])
+                with self.assertRaisesRegex(RelayError, 'unreadable'):
+                    manage('uninstall', dry_run=True)
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(['ui', 'status']), 1)
+                self.assertFalse(json.loads(output.getvalue())['readable'])
+                with redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(main(['ui', 'uninstall', '--dry-run']), 1)
+                self.assertIn('unreadable', error.getvalue())
+            finally:
+                path.chmod(original_mode)
+
+    def test_status_as_other_uid_is_inaccessible(self):
+        self.install()
+        owner_uid = self.installation.directory.stat().st_uid
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        with patch('devrelay.ui_service.os.geteuid', return_value=owner_uid + 1):
+            status = manage('status')
+        self.assertTrue(status['installed'])
+        self.assertFalse(status['readable'])
+        self.assertEqual(status['owner_uid'], owner_uid)
+        self.assertIn('another user', status['message'])
+
+    def test_inspection_permission_error_is_not_absence(self):
+        self.install()
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        with patch.object(self.installation, 'read', side_effect=PermissionError('denied')):
+            self.assertFalse(manage('status')['readable'])
+            with self.assertRaisesRegex(RelayError, 'unreadable'):
+                manage('uninstall', dry_run=True)
+
+    def test_unsafe_parent_is_refused(self):
+        parent = self.installation.directory.parent
+        parent.mkdir(exist_ok=True)
+        parent.chmod(0o777)
+        with self.assertRaisesRegex(RelayError, 'Unsafe dashboard parent'):
+            self.install()
+        parent.chmod(0o700)
+        target = parent.with_name('safe-parent')
+        parent.rename(target)
+        parent.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(RelayError, 'symlink'):
+            self.install()
+        self.start.assert_not_called()
 
     def test_hosts_without_final_newline_round_trip(self):
         self.installation.hosts.write_bytes(b'127.0.0.1 localhost')

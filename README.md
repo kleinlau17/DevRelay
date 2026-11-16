@@ -112,6 +112,8 @@ devrelay ui install --dry-run    # 只预览系统设置，不修改电脑
 devrelay ui uninstall            # 移除自己的服务及 hosts 记录，保留项目、清单和任务证据
 ```
 
+安装目录或记录不可读时，`ui status` 会报告已安装但不可读，并以非零状态退出；`ui uninstall --dry-run` 会报错，不会使用当前用户的默认设置。可请管理员运行 `sudo devrelay ui status` 检查。若宽权限目录中已有记录，安装和卸载都会拒绝信任它，并提供手工停服、检查及隔离记录的步骤；不要只修改权限后重试。
+
 先卸载网页服务，再执行 `uv tool uninstall devrelay`（或 `pipx uninstall devrelay`）。
 升级工具后重新运行 `devrelay ui install`，让后台服务加载新版本；使用了自定义 `--catalog`
 或 `--port` 时，重新安装时也应传入这些选项。
