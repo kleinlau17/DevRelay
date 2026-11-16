@@ -108,7 +108,7 @@ def parser():
     worker = sub.add_parser("watch", help="Optional orchestration: serial Codex tasks through configured delivery policy")
     worker.add_argument("--poll-interval", "--interval", type=positive_integer, default=60,
                         help="Seconds between empty-queue and merge-gate polls (default: 60)")
-    worker.add_argument("--max-tasks", "--limit", type=positive_integer,
+    worker.add_argument("--max-tasks", "--limit", "-n", type=positive_integer,
                         help="Stop after this many deliveries (post-merge acceptance in auto mode; default: keep watching)")
     worker.add_argument("--reset-budget", action="store_true",
                         help="Explicitly renew autonomous dispatch budget; ordinary restarts retain usage")
