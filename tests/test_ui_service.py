@@ -81,14 +81,14 @@ class ServiceTests(unittest.TestCase):
         finally:
             os.umask(previous)
         self.assertTrue(result['healthy'])
-        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
 
     def test_install_tightens_preexisting_group_writable_directory(self):
         self.installation.directory.mkdir(parents=True, exist_ok=True)
         os.chmod(self.installation.directory, 0o775)
         result = self.install()
         self.assertTrue(result['healthy'])
-        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
 
     def test_install_succeeds_with_extreme_and_standard_umasks(self):
         for mask in (0o777, 0o022):
@@ -98,7 +98,7 @@ class ServiceTests(unittest.TestCase):
                     self.assertTrue(self.install()['healthy'])
                 finally:
                     os.umask(previous)
-                self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
                 self.installation.apply('uninstall', self.settings)
                 (self.installation.directory / 'install.lock').unlink()
                 self.installation.directory.rmdir()
@@ -127,7 +127,7 @@ class ServiceTests(unittest.TestCase):
         # Follow the documented path after independent inspection of service files.
         self.installation.state.rename(self.root / 'quarantined.json')
         self.assertFalse(self.installation.apply('uninstall', self.settings)['installed'])
-        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
 
     def test_record_planted_during_tightening_remains_untrusted_on_retry(self):
         self.installation.directory.mkdir(parents=True)
@@ -142,7 +142,7 @@ class ServiceTests(unittest.TestCase):
         with patch('devrelay.ui_service.os.fchmod', side_effect=plant):
             with self.assertRaisesRegex(RelayError, 'Untrusted dashboard record'):
                 self.install()
-        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
         with self.assertRaisesRegex(RelayError, 'Untrusted dashboard record'):
             self.installation.apply('uninstall', self.settings)
         self.assertEqual(self.installation.state.read_text(), payload)
@@ -178,12 +178,95 @@ class ServiceTests(unittest.TestCase):
         self.install()
         owner_uid = self.installation.directory.stat().st_uid
         self.patch('devrelay.ui_service.Installation', return_value=self.installation)
-        with patch('devrelay.ui_service.os.geteuid', return_value=owner_uid + 1):
+        with patch('devrelay.ui_service.os.geteuid', return_value=owner_uid + 1), \
+                patch('devrelay.ui_service.os.getegid', return_value=-1), \
+                patch('devrelay.ui_service.os.getgroups', return_value=[]):
             status = manage('status')
         self.assertTrue(status['installed'])
         self.assertFalse(status['readable'])
         self.assertEqual(status['owner_uid'], owner_uid)
         self.assertIn('another user', status['message'])
+
+    def test_sudo_install_uses_validated_account_group(self):
+        from devrelay.ui_service import privileged_main
+        from types import SimpleNamespace
+        account = SimpleNamespace(pw_gid=self.settings['gid'], pw_name=self.settings['user'],
+                                  pw_dir=self.settings['home'])
+        with patch('devrelay.ui_service.os.geteuid', return_value=0), \
+                patch.dict(os.environ, SUDO_UID=str(self.settings['uid']), SUDO_GID='9999'), \
+                patch('devrelay.ui_service.pwd.getpwuid', return_value=account) as lookup, \
+                patch('devrelay.ui_service.sys.argv', ['ui_service.py', 'install']), \
+                patch('devrelay.ui_service.sys.stdin', io.StringIO(json.dumps(self.settings))), \
+                patch('devrelay.ui_service.Installation', return_value=self.installation), \
+                patch.object(self.installation, 'apply', return_value={}) as apply, \
+                redirect_stdout(io.StringIO()):
+            privileged_main()
+        lookup.assert_called_once_with(self.settings['uid'])
+        apply.assert_called_once_with('install', self.settings)
+
+    def test_lock_sets_and_verifies_installer_group(self):
+        self.installation.directory.mkdir(parents=True)
+        self.installation.directory.chmod(0o700)
+        inode = self.installation.directory.stat().st_ino
+        group = [os.getegid()]
+        requested = group[0] + 1
+        real_stat = os.fstat
+        def metadata(fd):
+            result = real_stat(fd)
+            if result.st_ino == inode:
+                fields = list(result)
+                fields[5] = group[0]
+                return os.stat_result(fields)
+            return result
+        def chown(fd, uid, gid):
+            self.assertEqual(real_stat(fd).st_ino, inode)
+            self.assertEqual(uid, -1)
+            group[0] = gid
+        with patch('devrelay.ui_service.os.fstat', side_effect=metadata), \
+                patch('devrelay.ui_service.os.fchown', side_effect=chown) as change:
+            for _ in range(2):
+                with self.installation.lock(gid=requested):
+                    self.assertEqual(group[0], requested)
+                    self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+            change.assert_called_once()
+
+    def test_group_member_status_is_healthy_without_sudo(self):
+        self.install()
+        owner_uid = self.installation.directory.stat().st_uid
+        gid = self.installation.directory.stat().st_gid
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        for primary in (True, False):
+            with self.subTest(primary=primary), \
+                    patch('devrelay.ui_service.os.geteuid', return_value=owner_uid + 1), \
+                    patch('devrelay.ui_service.os.getegid', return_value=gid if primary else -1), \
+                    patch('devrelay.ui_service.os.getgroups', return_value=[] if primary else [gid]), \
+                    patch('devrelay.ui_service.health', return_value=True), \
+                    patch('devrelay.ui_service.subprocess.run') as run:
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(['ui', 'status']), 0)
+                self.assertTrue(json.loads(output.getvalue())['healthy'])
+                run.assert_not_called()
+
+    def test_legacy_private_directory_can_upgrade_with_existing_record(self):
+        self.install()
+        self.installation.directory.chmod(0o700)
+        installation_id = self.installation.read()['settings']['installation_id']
+        self.assertTrue(self.install()['healthy'])
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+        self.assertEqual(self.installation.read()['settings']['installation_id'], installation_id)
+
+    def test_inspect_rejects_installation_directory_symlink(self):
+        self.install()
+        target = self.installation.directory.with_name('original')
+        self.installation.directory.rename(target)
+        self.installation.directory.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(RelayError, 'directory is a symlink'):
+            self.installation.inspect()
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        with redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(main(['ui', 'status']), 1)
+        self.assertIn('directory is a symlink', error.getvalue())
+        self.assertTrue((target / 'dashboard.json').exists())
 
     def test_inspection_permission_error_is_not_absence(self):
         self.install()

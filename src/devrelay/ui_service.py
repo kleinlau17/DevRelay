@@ -149,10 +149,14 @@ class Installation:
         """Distinguish absence from a directory or record we cannot read."""
         metadata = None
         try:
-            metadata = self.directory.stat()
+            metadata = self.directory.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RelayError("Installation directory is a symlink; preserved")
             # Also deterministic for privileged callers inspecting missing mode bits.
-            if (metadata.st_mode & 0o500 != 0o500
-                    or metadata.st_uid != os.geteuid() and metadata.st_mode & 0o055 != 0o055):
+            groups = {*os.getgroups(), os.getegid()}
+            required = (0o500 if metadata.st_uid == os.geteuid() else
+                        0o050 if metadata.st_gid in groups else 0o005)
+            if metadata.st_mode & required != required:
                 raise PermissionError("Installation directory is inaccessible")
             try:
                 record = self.state.lstat()
@@ -187,10 +191,15 @@ class Installation:
             "to re-initialise the empty directory. Do not merely chmod the directory and retry.")
 
     @contextmanager
-    def lock(self):
+    def lock(self, *, gid=None):
         # Walk from the filesystem root with pinned descriptors. Trusted owners
         # (root and the installer) can still rename their own directories; they
         # are inside this trust boundary. Sticky shared parents are safe here.
+        # The privileged entry point validates settings against SUDO_UID's
+        # passwd account (including its primary gid), rather than trusting a
+        # payload or SUDO_GID alone. Root retains write ownership; 0750 grants
+        # that installer's group read/traverse only, so status needs no sudo.
+        gid = os.getegid() if gid is None else gid
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         fd = os.open("/", flags)
         parent_fd = None
@@ -210,7 +219,8 @@ class Installation:
                 # before O_RDONLY can open it. Its verified parent prevents swaps
                 # by untrusted users; chmod never follows a symlink.
                 if created:
-                    os.chmod(component, 0o700, dir_fd=fd, follow_symlinks=False)
+                    os.chmod(component, 0o700 if index == len(self.directory.parts) - 1 else 0o755,
+                             dir_fd=fd, follow_symlinks=False)
                 try:
                     child = os.open(component, flags, dir_fd=fd)
                 except OSError as error:
@@ -230,7 +240,10 @@ class Installation:
                 marked = True
             except FileNotFoundError:
                 marked = False
-            tightening = stat.S_IMODE(metadata.st_mode) != 0o700
+            # Both legacy 0700 and our read-only-group 0750 protect records
+            # from planting. Accept 0750 on repeat installs without treating
+            # its existing record as untrusted; all other modes fail closed.
+            tightening = stat.S_IMODE(metadata.st_mode) not in (0o700, 0o750)
             if tightening or marked:
                 try:
                     os.stat("dashboard.json", dir_fd=fd, follow_symlinks=False)
@@ -244,11 +257,13 @@ class Installation:
                 marker_fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
                 os.close(marker_fd)
                 os.fsync(parent_fd)
-            # mkdir's explicit 0700 cannot be widened by umask; force exactly
-            # 0700 after creation because umask can strip owner bits as well.
-            os.fchmod(fd, 0o700)
+            # Set group before the final mode, independently of the caller umask.
+            if metadata.st_gid != gid:
+                os.fchown(fd, -1, gid)
+            os.fchmod(fd, 0o750)
             metadata = os.fstat(fd)
-            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+            if (metadata.st_uid != os.geteuid() or metadata.st_gid != gid
+                    or stat.S_IMODE(metadata.st_mode) != 0o750):
                 raise RelayError("Cannot secure dashboard system directory")
             if tightening or marked:
                 # Catch records planted between the first check and fchmod.
@@ -335,7 +350,7 @@ class Installation:
                      expected=self.state.read_bytes() if self.state.exists() else None)
 
     def apply(self, action, settings):
-        with self.lock():
+        with self.lock(gid=settings["gid"] if os.geteuid() == 0 else os.getegid()):
             saved = self.read()
             if saved and saved["settings"]["uid"] != settings["uid"]:
                 raise RelayError("The machine dashboard belongs to another user; ask that user to uninstall it first")
