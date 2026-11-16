@@ -3,9 +3,11 @@
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import re
 import secrets
+import socket
 from socketserver import TCPServer
 import subprocess
 import sys
@@ -51,13 +53,35 @@ def projects(root, catalog=None):
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, entries, port=0, *, registry=None):
+    def __init__(self, entries, port=0, *, registry=None, hostname="127.0.0.1", listener=None,
+                 installation_id=None):
+        if hostname not in ("127.0.0.1", "devrelay", "devrelay.localhost"):
+            raise RelayError("Unsupported local dashboard hostname")
         self.registry = registry
+        self.installation_id = installation_id
         self.initial_projects = entries
         self.projects = {project.id: project for project in entries}
         self.token = secrets.token_urlsafe(32)
-        super().__init__(("127.0.0.1", port), DashboardHandler)
-        self.origin = f"http://127.0.0.1:{self.server_port}"
+        if listener is None:
+            super().__init__(("127.0.0.1", port), DashboardHandler)
+        else:
+            if (listener.family != socket.AF_INET or listener.type != socket.SOCK_STREAM
+                    or listener.getsockname() != ("127.0.0.1", port)):
+                listener.close()
+                raise RelayError("Dashboard activation requires the expected listening IPv4 loopback socket")
+            try:
+                # SO_ACCEPTCONN is unavailable on some macOS releases. listen
+                # also rejects connected sockets without acquiring another port.
+                listener.listen(self.request_queue_size)
+            except OSError:
+                listener.close()
+                raise
+            super().__init__(("127.0.0.1", port), DashboardHandler, bind_and_activate=False)
+            self.socket.close()
+            self.socket = listener
+            self.server_address = listener.getsockname()
+            self.server_name, self.server_port = self.server_address
+        self.origin = f"http://{hostname}" + (f":{self.server_port}" if self.server_port != 80 else "")
 
     def server_bind(self):
         # HTTPServer resolves a hostname here. This loopback-only service must
@@ -121,6 +145,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self.trusted():
             return self.respond(403, {"error": "Only same-origin loopback requests are allowed"})
         path = urlsplit(self.path).path
+        if path == "/api/health":
+            return self.respond(200, {"service": "devrelay", "installation_id": self.server.installation_id})
         if path == "/favicon.ico":
             return self.respond(204, b"")
         if path == "/api/session":
@@ -173,13 +199,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return self.respond(200, result)
 
 
-def serve(root=None, *, catalog=None, port=8765, open_browser=False):
+def activated_socket(manager):
+    """Adopt an OS-owned listener; never give the dashboard privileged execution."""
+    if manager == "systemd":
+        if os.environ.pop("LISTEN_PID", "") != str(os.getpid()) or os.environ.pop("LISTEN_FDS", "") != "1":
+            raise RelayError("Expected exactly one systemd activation socket")
+        os.environ.pop("LISTEN_FDNAMES", None)
+        fd = 3
+    elif manager == "launchd":
+        import ctypes
+        library = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        descriptors = ctypes.POINTER(ctypes.c_int)()
+        count = ctypes.c_size_t()
+        library.launch_activate_socket.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),
+                                                   ctypes.POINTER(ctypes.c_size_t)]
+        library.launch_activate_socket.restype = ctypes.c_int
+        error = library.launch_activate_socket(b"Dashboard", ctypes.byref(descriptors), ctypes.byref(count))
+        if error:
+            raise RelayError(f"Cannot activate launchd dashboard socket: {os.strerror(error)}")
+        try:
+            if count.value != 1:
+                for index in range(count.value):
+                    os.close(descriptors[index])
+                raise RelayError("Expected exactly one launchd activation socket")
+            fd = descriptors[0]
+        finally:
+            library.free.argtypes = [ctypes.c_void_p]
+            library.free(descriptors)
+    else:
+        raise RelayError("Unknown socket activation manager")
+    os.set_inheritable(fd, False)
+    listener = socket.socket(fileno=fd)
+    listener.setblocking(True)
+    return listener
+
+
+def serve(root=None, *, catalog=None, port=8765, open_browser=False, hostname="127.0.0.1",
+          socket_activation=None, installation_id=None):
     if not 0 <= port <= 65535:
         raise RelayError("UI port must be between 0 and 65535")
     try:
         registry = Registry(catalog)
         entries = projects(root) if root is not None else []
-        server = DashboardServer(entries, port, registry=registry)
+        listener = activated_socket(socket_activation) if socket_activation else None
+        server = DashboardServer(entries, port, registry=registry, hostname=hostname, listener=listener,
+                                 installation_id=installation_id)
         server.refresh_projects()
     except OSError as error:
         raise RelayError(f"Cannot start local dashboard: {error}") from error

@@ -88,6 +88,34 @@ devrelay next    # 查看哪些 Issue 可执行，以及其他 Issue 被排除�
 
 ## 本地配置网页
 
+需要固定地址和后台服务时，安装一次：
+
+```bash
+devrelay ui install --open       # 管理员授权一次，打开 http://devrelay
+devrelay ui status               # 查看安装状态和服务健康情况
+devrelay ui install --dry-run    # 只预览系统设置，不修改电脑
+```
+
+支持 macOS（launchd）和使用 systemd 的 Linux。安装会添加本机 `devrelay` 名称，
+由系统提供仅监听 `127.0.0.1` 的 80 端口，并以安装者的普通用户身份运行网页。
+系统启动后入口自动可用，访问时唤起服务，不需要保留终端；它不会启动 worker。
+同一电脑只安装一个入口，使用安装者的项目清单。不要用 `sudo devrelay ...` 启动整个工具；
+命令只在修改系统设置时请求 sudo 授权。后台服务不复制终端中的凭据环境变量；
+网页中的 GitHub 操作仍需该用户可用的本机登录。
+
+端口被占用时安装会失败并保留其他服务，可用 `devrelay ui install --port 8765 --open`
+安装为 `http://devrelay:8765`，或用下方临时网页命令。已有的同名 hosts 记录或被手动修改的
+服务文件会阻止覆盖。重复安装会更新并重启自己的服务；失败会尝试恢复此前设置，
+中断后可运行 `devrelay ui uninstall` 恢复并清理，再重新安装。
+
+```bash
+devrelay ui uninstall            # 移除自己的服务及 hosts 记录，保留项目、清单和任务证据
+```
+
+先卸载网页服务，再执行 `uv tool uninstall devrelay`（或 `pipx uninstall devrelay`）。
+升级工具后重新运行 `devrelay ui install`，让后台服务加载新版本；使用了自定义 `--catalog`
+或 `--port` 时，重新安装时也应传入这些选项。
+
 从任意目录启动配置台（Python 3.11+，无需额外依赖）：
 
 ```bash
@@ -249,7 +277,18 @@ devrelay --workspace /path/workspace.toml run terrain-edit --submit
 
 ## 安装
 
-普通使用采用用户级工具安装。安装好 `uv` 后执行一次：
+要把工具安装和本机网页设置一并完成，安装好 Python 3.11+、Git 和 `uv` 后，在本仓库运行：
+
+```bash
+python3 scripts/install.py
+```
+
+该脚本先安装用户级 DevRelay，再请求管理员授权配置 `http://devrelay`，成功后自动打开浏览器。
+不要用 sudo 运行安装脚本。`--without-ui` 只安装工具；`--no-open` 不自动打开浏览器；
+`--port 8765` 使用备用端口。默认安装当前仓库，也可用 `--source` 指定审核过的 Git 提交 URL
+或本地 wheel。网页配置失败时工具安装会保留，解决原因后重试 `devrelay ui install`。
+
+只安装命令行工具、暂不设置系统服务时：
 
 ```bash
 uv tool install git+https://github.com/kleinlau17/DevRelay.git

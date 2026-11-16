@@ -88,6 +88,36 @@ Passing acceptance leads to a new or updated PR, which defaults to a draft. **Au
 
 ## Local configuration dashboard
 
+Install a persistent address and background service once:
+
+```bash
+devrelay ui install --open       # One administrator authorization; opens http://devrelay
+devrelay ui status               # Installation and service health
+devrelay ui install --dry-run    # Preview system settings without changing the machine
+```
+
+Supported on macOS (launchd) and Linux with systemd. Setup adds the local `devrelay` name and lets the
+OS own a port-80 socket bound only to `127.0.0.1`. The dashboard runs as the installing user, never root.
+The entry is available after system startup and activates the service on access; no terminal must stay
+open and no worker starts. One machine has one installed entry, using its owner's catalog.
+Run the command as your normal user; it requests sudo only for system setup. The background service
+does not copy credential environment variables from your shell; GitHub actions still require usable
+local authentication for that user.
+
+If the port is occupied, installation fails without stopping the other service. Use
+`devrelay ui install --port 8765 --open` for `http://devrelay:8765`, or the temporary server below.
+Unmanaged hosts entries and manually edited service files block replacement. Reinstallation updates
+and restarts only this service. Failed setup attempts restore previous settings; after an interruption,
+run `devrelay ui uninstall` to recover and clean up before reinstalling.
+
+```bash
+devrelay ui uninstall            # Remove owned service/hosts entry; retain projects, catalogs and task evidence
+```
+
+Remove the dashboard before `uv tool uninstall devrelay` (or `pipx uninstall devrelay`). After upgrading
+the tool, rerun `devrelay ui install` so the service loads the new version. Repeat custom `--catalog` or
+`--port` options when reinstalling.
+
 Start the dashboard from any directory (Python 3.11+, no extra dependencies):
 
 ```bash
@@ -258,7 +288,20 @@ devrelay --workspace /path/workspace.toml run terrain-edit --submit
 
 ## Install and onboard
 
-Install one user-level command. With `uv` installed:
+To install the tool and configure its local web entry in one flow, install Python 3.11+, Git and `uv`,
+then run from this checkout:
+
+```bash
+python3 scripts/install.py
+```
+
+The script installs the user-level tool, requests administrator authorization for `http://devrelay`,
+and opens the browser on success. Run it without sudo. Use `--without-ui` to install only the tool,
+`--no-open` to skip opening the browser, or `--port 8765` for an alternative port. It installs this
+checkout by default; `--source` can select a reviewed Git commit URL or local wheel. If dashboard setup
+fails, the installed tool remains available; resolve the cause and retry `devrelay ui install`.
+
+To install only the command without setting up a system service:
 
 ```bash
 uv tool install git+https://github.com/kleinlau17/DevRelay.git

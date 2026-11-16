@@ -32,9 +32,16 @@ def parser():
     locations.add_argument("--project", type=Path, help="Project directory (task commands default to current directory)")
     sub = root.add_subparsers(dest="command", required=True)
     ui = sub.add_parser("ui", help="Open a local configuration dashboard; does not start a worker")
+    ui.add_argument("ui_action", nargs="?", choices=("serve", "install", "uninstall", "status"), default="serve",
+                    help="Install/remove/check the persistent http://devrelay entry (default: serve in terminal)")
     ui.add_argument("--catalog", type=Path, help="TOML project catalog (separate from a task workspace manifest)")
-    ui.add_argument("--port", type=int, default=8765, help="Loopback HTTP port (default: 8765; 0 selects a free port)")
+    ui.add_argument("--port", type=int, help="Loopback port (serve: 8765, install: 80; serve --port 0 selects a free port)")
     ui.add_argument("--open", action="store_true", help="Open the dashboard in your default browser")
+    ui.add_argument("--hostname", choices=("127.0.0.1", "devrelay", "devrelay.localhost"), default="127.0.0.1",
+                    help="Browser hostname; always listens only on IPv4 loopback")
+    ui.add_argument("--dry-run", action="store_true", help="Preview install/uninstall without changing system settings")
+    ui.add_argument("--socket-activation", choices=("launchd", "systemd"), help=argparse.SUPPRESS)
+    ui.add_argument("--installation-id", help=argparse.SUPPRESS)
     catalog = sub.add_parser("projects", help="Register local repositories for the dashboard; does not start tasks")
     catalog.add_argument("--catalog", type=Path, help="Override the user project catalog")
     project_commands = catalog.add_subparsers(dest="project_command", required=True)
@@ -174,8 +181,22 @@ def main(argv=None):
         if args.command == "ui":
             if args.workspace:
                 raise RelayError("ui uses --catalog for independent projects, not --workspace")
+            if args.ui_action != "serve":
+                if args.project or args.socket_activation or args.installation_id or args.hostname != "127.0.0.1":
+                    raise RelayError("ui install/uninstall/status manages the user catalog, without project or server-only options")
+                if args.ui_action != "install" and (args.catalog or args.port is not None or args.open):
+                    raise RelayError("--catalog, --port and --open apply only to ui serve/install")
+                from .ui_service import manage
+                result = manage(args.ui_action, catalog=args.catalog, port=args.port,
+                                dry_run=args.dry_run, open_browser=args.open)
+                print(json.dumps(result, ensure_ascii=False))
+                return 1 if args.ui_action == "status" and not result.get("healthy") else 0
+            if args.dry_run:
+                raise RelayError("--dry-run applies to ui install/uninstall")
             from .ui import serve
-            return serve(args.project, catalog=args.catalog, port=args.port, open_browser=args.open)
+            return serve(args.project, catalog=args.catalog, port=8765 if args.port is None else args.port,
+                         open_browser=args.open, hostname=args.hostname, socket_activation=args.socket_activation,
+                         installation_id=args.installation_id)
         if args.command == "projects":
             if args.workspace or args.project:
                 raise RelayError("projects takes its own repository path; omit --workspace and --project")
