@@ -85,6 +85,17 @@ def unit_quote(value, *, expand_environment=False):
     return '"' + (value.replace("$", "$$") if expand_environment else value) + '"'
 
 
+def unit_path(value):
+    # WorkingDirectory resolves specifiers but does not unquote/unescape words.
+    if not value.startswith("/") or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise RelayError("Service working directory must be an absolute path without control characters")
+    # Keep trailing whitespace from being stripped, or a backslash from joining
+    # the next line. A trailing slash preserves directory lookup semantics.
+    if value.endswith((" ", "\\")):
+        value += "/"
+    return value.replace("%", "%%")
+
+
 def health(settings):
     connection = http.client.HTTPConnection("127.0.0.1", settings["port"], timeout=1)
     try:
@@ -191,7 +202,7 @@ class Installation:
             "to re-initialise the empty directory. Do not merely chmod the directory and retry.")
 
     @contextmanager
-    def lock(self, *, gid=None):
+    def lock(self, *, gid=None, uid=None):
         # Walk from the filesystem root with pinned descriptors. Trusted owners
         # (root and the installer) can still rename their own directories; they
         # are inside this trust boundary. Sticky shared parents are safe here.
@@ -253,6 +264,12 @@ class Installation:
                     # Refuse BEFORE chmod: retries must not turn a planted record
                     # into a trusted record just because we tightened its directory.
                     raise self.untrusted_record_error()
+            # Only read a record after the trust checks above. Reject another
+            # installer before chown/chmod or even creating/chmodding the lock.
+            if uid is not None:
+                saved = self.read()
+                if saved and saved["settings"]["uid"] != uid:
+                    raise RelayError("The machine dashboard belongs to another user; ask that user to uninstall it first")
             if tightening and not marked:
                 marker_fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
                 os.close(marker_fd)
@@ -306,7 +323,7 @@ class Installation:
                        f"ListenStream=127.0.0.1:{settings['port']}\n\n[Install]\nWantedBy=sockets.target\n")
         service = (f"[Unit]\nDescription=DevRelay local dashboard\nRequires={UNIT}.socket\nAfter={UNIT}.socket\n\n"
                    f"[Service]\nUser={settings['uid']}\nGroup={settings['gid']}\n"
-                   f"WorkingDirectory={unit_quote(settings['home'])}\n"
+                   f"WorkingDirectory={unit_path(settings['home'])}\n"
                    + "".join(f"Environment={unit_quote(key + '=' + value)}\n" for key, value in environment.items())
                    + "ExecStart=" + " ".join(unit_quote(arg, expand_environment=True) for arg in argv)
                    + "\nRestart=on-failure\nNoNewPrivileges=yes\nUMask=0077\n")
@@ -350,7 +367,7 @@ class Installation:
                      expected=self.state.read_bytes() if self.state.exists() else None)
 
     def apply(self, action, settings):
-        with self.lock(gid=settings["gid"] if os.geteuid() == 0 else os.getegid()):
+        with self.lock(gid=settings["gid"] if os.geteuid() == 0 else os.getegid(), uid=settings["uid"]):
             saved = self.read()
             if saved and saved["settings"]["uid"] != settings["uid"]:
                 raise RelayError("The machine dashboard belongs to another user; ask that user to uninstall it first")

@@ -363,6 +363,52 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(RelayError, 'another user'):
             self.installation.apply('install', {**self.settings, 'uid': 502})
 
+    def test_rejected_second_user_preserves_directory_metadata(self):
+        self.install()
+        real_fstat = os.fstat
+
+        def root_owned(fd):
+            fields = list(real_fstat(fd))
+            fields[4] = 0
+            return os.stat_result(fields)
+
+        for mode in (0o700, 0o750):
+            for action in ('install', 'uninstall'):
+                with self.subTest(mode=oct(mode), action=action):
+                    self.installation.directory.chmod(mode)
+                    before = self.installation.directory.stat()
+                    record = self.installation.state.read_bytes()
+                    lock = (self.installation.directory / 'install.lock').stat()
+                    with patch('devrelay.ui_service.os.geteuid', return_value=0), \
+                            patch('devrelay.ui_service.os.fstat', side_effect=root_owned), \
+                            patch('devrelay.ui_service.os.fchown') as chown, \
+                            patch('devrelay.ui_service.os.fchmod') as chmod:
+                        with self.assertRaisesRegex(RelayError, 'another user'):
+                            self.installation.apply(action, {**self.settings, 'uid': 502,
+                                                            'gid': before.st_gid + 1})
+                        chown.assert_not_called()
+                        chmod.assert_not_called()
+                    self.assertEqual(self.installation.directory.stat(), before)
+                    self.assertEqual(self.installation.directory.stat().st_ctime_ns, before.st_ctime_ns)
+                    self.assertEqual((self.installation.directory / 'install.lock').stat(), lock)
+                    self.assertEqual(self.installation.state.read_bytes(), record)
+
+    def test_systemd_working_directory_is_a_literal_absolute_path(self):
+        linux = Installation('linux', self.root)
+        for home, expected in (
+                ('/home/owner', '/home/owner'),
+                ('/home/space $HOME %h "name"', '/home/space $HOME %%h "name"'),
+                ('/home/back\\slash', '/home/back\\slash'),
+                ('/home/trailing\\', '/home/trailing\\/'),
+                ('/home/trailing ', '/home/trailing /')):
+            with self.subTest(home=home):
+                service = linux.definitions({**self.settings, 'home': home})[1]
+                line = next(line for line in service.splitlines() if line.startswith('WorkingDirectory='))
+                self.assertEqual(line, 'WorkingDirectory=' + expected)
+        for home in ('relative/home', '~/owner', '/home/owner\nUser=0', '/home/\x00owner', '/home/\x7fowner'):
+            with self.subTest(home=home), self.assertRaises(RelayError):
+                linux.definitions({**self.settings, 'home': home})
+
     def test_hosts_conflicts_and_symlinks_are_preserved(self):
         for source in ('127.0.0.1 devrelay\n', '10.0.0.2 DEVRELAY.\n', BLOCK.replace('127.0.0.1', '10.0.0.2')):
             with self.subTest(source=source), self.assertRaises(RelayError):
