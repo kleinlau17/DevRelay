@@ -105,12 +105,17 @@ devrelay ui install --dry-run    # 只预览系统设置，不修改电脑
 
 端口被占用时安装会失败并保留其他服务，可用 `devrelay ui install --port 8765 --open`
 安装为 `http://devrelay:8765`，或用下方临时网页命令。已有的同名 hosts 记录或被手动修改的
-服务文件会阻止覆盖。重复安装会更新并重启自己的服务；失败会尝试恢复此前设置，
+服务文件会阻止覆盖。重复安装会更新并重启自己的服务。macOS 在原端口重装时，由 launchd 重新绑定端口并由 DevRelay 验证重启后的服务。
+失败会尝试恢复此前设置，
 中断后可运行 `devrelay ui uninstall` 恢复并清理，再重新安装。
 
 ```bash
 devrelay ui uninstall            # 移除自己的服务及 hosts 记录，保留项目、清单和任务证据
 ```
+
+安装目录由 root 持有，权限为 0750，所属组为安装者的主组；安装者可直接运行 `ui status`，无需再次 sudo。目录软链接会被拒绝。其他用户的安装或卸载请求会在修改安装目录属组、权限或锁文件之前被拒绝。Linux 服务的工作目录按绝对路径写入，保留空格和字面量 `%`。
+
+安装目录或记录不可读时，`ui status` 会报告已安装但不可读，并以非零状态退出；`ui uninstall --dry-run` 会报错，不会使用当前用户的默认设置。可请管理员运行 `sudo devrelay ui status` 检查。若宽权限目录中已有记录，安装和卸载都会拒绝信任它，并提供手工停服、检查及隔离记录的步骤；不要只修改权限后重试。
 
 先卸载网页服务，再执行 `uv tool uninstall devrelay`（或 `pipx uninstall devrelay`）。
 升级工具后重新运行 `devrelay ui install`，让后台服务加载新版本；使用了自定义 `--catalog`

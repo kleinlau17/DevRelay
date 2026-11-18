@@ -107,12 +107,17 @@ local authentication for that user.
 If the port is occupied, installation fails without stopping the other service. Use
 `devrelay ui install --port 8765 --open` for `http://devrelay:8765`, or the temporary server below.
 Unmanaged hosts entries and manually edited service files block replacement. Reinstallation updates
-and restarts only this service. Failed setup attempts restore previous settings; after an interruption,
+and restarts only this service. On macOS, launchd rebinds the same port during reinstallation and DevRelay
+checks the restarted service. Failed setup attempts restore previous settings; after an interruption,
 run `devrelay ui uninstall` to recover and clean up before reinstalling.
 
 ```bash
 devrelay ui uninstall            # Remove owned service/hosts entry; retain projects, catalogs and task evidence
 ```
+
+The installation directory is root-owned with mode 0750 and the installing user’s primary group, allowing that user to run `ui status` without sudo. Installation directory symlinks are rejected. Install or uninstall requests from another user are rejected before changing the directory group, permissions or lock file. Linux service working directories are written as absolute paths, preserving spaces and literal `%` characters.
+
+When the installation directory or record is unreadable, `ui status` reports an installed but unreadable dashboard and exits nonzero; `ui uninstall --dry-run` fails instead of using the current user’s defaults. Ask an administrator to inspect it with `sudo devrelay ui status`. A record in a directory needing permission tightening blocks installation and removal, with instructions for manually stopping the service, inspecting files and quarantining the record; do not simply chmod the directory and retry.
 
 Remove the dashboard before `uv tool uninstall devrelay` (or `pipx uninstall devrelay`). After upgrading
 the tool, rerun `devrelay ui install` so the service loads the new version. Repeat custom `--catalog` or

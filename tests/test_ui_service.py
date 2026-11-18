@@ -1,3 +1,4 @@
+import errno
 import http.client
 import io
 import json
@@ -16,7 +17,7 @@ from unittest.mock import patch
 from devrelay.cli import main
 from devrelay.errors import RelayError
 from devrelay.ui import DashboardServer, activated_socket
-from devrelay.ui_service import BLOCK, Installation, hosts_content, health, unit_quote
+from devrelay.ui_service import BLOCK, Installation, hosts_content, health, unit_quote, manage
 
 
 class ServiceTests(unittest.TestCase):
@@ -29,6 +30,10 @@ class ServiceTests(unittest.TestCase):
         self.original = b'127.0.0.1 localhost\n# preserve aliases\n10.0.0.2 internal\n'
         self.installation.hosts.write_bytes(self.original)
         self.installation.services[0].parent.mkdir(parents=True)
+        # Model protected system parents independently of the suite caller umask.
+        (self.root / "Library").chmod(0o755)
+        self.installation.directory.parent.mkdir(mode=0o755)
+        self.installation.directory.parent.chmod(0o755)
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             port = probe.getsockname()[1]
@@ -67,6 +72,225 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(self.installation.state.exists())
         self.assertFalse(self.installation.apply('uninstall', self.settings)['installed'])
 
+    def test_install_succeeds_with_group_writable_umask(self):
+        # Regression test: with umask 002 (the Ubuntu default, including
+        # GitHub-hosted Ubuntu runners) mkdir creates mode 0775. The install
+        # must not reject the system directory it just created.
+        previous = os.umask(0o002)
+        try:
+            result = self.install()
+        finally:
+            os.umask(previous)
+        self.assertTrue(result['healthy'])
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+
+    def test_install_tightens_preexisting_group_writable_directory(self):
+        self.installation.directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.installation.directory, 0o775)
+        result = self.install()
+        self.assertTrue(result['healthy'])
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+
+    def test_install_succeeds_with_extreme_and_standard_umasks(self):
+        for mask in (0o777, 0o022):
+            with self.subTest(mask=oct(mask)):
+                previous = os.umask(mask)
+                try:
+                    self.assertTrue(self.install()['healthy'])
+                finally:
+                    os.umask(previous)
+                self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+                self.installation.apply('uninstall', self.settings)
+                (self.installation.directory / 'install.lock').unlink()
+                self.installation.directory.rmdir()
+
+    def test_untrusted_journal_is_preserved_and_never_recovered_on_retries(self):
+        self.installation.directory.mkdir(parents=True)
+        self.installation.directory.chmod(0o775)
+        malicious = dict(phase='installing', settings=self.settings, files=['attacker-new'],
+                         previous=dict(phase='ready', settings=self.settings, files=['attacker-old']),
+                         hosts_before=self.original.decode(), hosts_after=self.original.decode())
+        payload = json.dumps(malicious)
+        self.installation.state.write_text(payload)
+        for action in ('install', 'uninstall', 'install'):
+            with self.subTest(action=action), self.assertRaisesRegex(RelayError, 'Untrusted dashboard record') as caught:
+                self.installation.apply(action, self.settings)
+            message = str(caught.exception)
+            self.assertIn('sudo launchctl bootout system/org.devrelay.dashboard', message)
+            self.assertIn('administrator-only quarantine', message)
+            self.assertIn('Do not merely chmod', message)
+            self.assertEqual(self.installation.state.read_text(), payload)
+            self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o775)
+            self.assertFalse(self.installation.services[0].exists())
+            self.assertEqual(self.installation.hosts.read_bytes(), self.original)
+        self.start.assert_not_called()
+        self.stop.assert_not_called()
+        # Follow the documented path after independent inspection of service files.
+        self.installation.state.rename(self.root / 'quarantined.json')
+        self.assertFalse(self.installation.apply('uninstall', self.settings)['installed'])
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+
+    def test_record_planted_during_tightening_remains_untrusted_on_retry(self):
+        self.installation.directory.mkdir(parents=True)
+        self.installation.directory.chmod(0o775)
+        real_chmod = os.fchmod
+        payload = json.dumps(dict(phase='installing', settings=self.settings, files=['attacker'],
+                                  previous=dict(files=['attacker-old']),
+                                  hosts_before='', hosts_after=''))
+        def plant(fd, mode):
+            self.installation.state.write_text(payload)
+            real_chmod(fd, mode)
+        with patch('devrelay.ui_service.os.fchmod', side_effect=plant):
+            with self.assertRaisesRegex(RelayError, 'Untrusted dashboard record'):
+                self.install()
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+        with self.assertRaisesRegex(RelayError, 'Untrusted dashboard record'):
+            self.installation.apply('uninstall', self.settings)
+        self.assertEqual(self.installation.state.read_text(), payload)
+        self.start.assert_not_called()
+        self.stop.assert_not_called()
+        self.installation.state.rename(self.root / 'quarantined.json')
+        self.assertFalse(self.installation.apply('uninstall', self.settings)['installed'])
+
+    def test_unreadable_installation_status_and_uninstall_preview(self):
+        self.install()
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        for path in (self.installation.directory, self.installation.state):
+            original_mode = path.stat().st_mode & 0o777
+            path.chmod(0)
+            try:
+                status = manage('status')
+                self.assertTrue(status['installed'])
+                self.assertFalse(status['readable'])
+                self.assertFalse(status['healthy'])
+                self.assertIn('unreadable', status['message'])
+                with self.assertRaisesRegex(RelayError, 'unreadable'):
+                    manage('uninstall', dry_run=True)
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(['ui', 'status']), 1)
+                self.assertFalse(json.loads(output.getvalue())['readable'])
+                with redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(main(['ui', 'uninstall', '--dry-run']), 1)
+                self.assertIn('unreadable', error.getvalue())
+            finally:
+                path.chmod(original_mode)
+
+    def test_status_as_other_uid_is_inaccessible(self):
+        self.install()
+        owner_uid = self.installation.directory.stat().st_uid
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        with patch('devrelay.ui_service.os.geteuid', return_value=owner_uid + 1), \
+                patch('devrelay.ui_service.os.getegid', return_value=-1), \
+                patch('devrelay.ui_service.os.getgroups', return_value=[]):
+            status = manage('status')
+        self.assertTrue(status['installed'])
+        self.assertFalse(status['readable'])
+        self.assertEqual(status['owner_uid'], owner_uid)
+        self.assertIn('another user', status['message'])
+
+    def test_sudo_install_uses_validated_account_group(self):
+        from devrelay.ui_service import privileged_main
+        from types import SimpleNamespace
+        account = SimpleNamespace(pw_gid=self.settings['gid'], pw_name=self.settings['user'],
+                                  pw_dir=self.settings['home'])
+        with patch('devrelay.ui_service.os.geteuid', return_value=0), \
+                patch.dict(os.environ, SUDO_UID=str(self.settings['uid']), SUDO_GID='9999'), \
+                patch('devrelay.ui_service.pwd.getpwuid', return_value=account) as lookup, \
+                patch('devrelay.ui_service.sys.argv', ['ui_service.py', 'install']), \
+                patch('devrelay.ui_service.sys.stdin', io.StringIO(json.dumps(self.settings))), \
+                patch('devrelay.ui_service.Installation', return_value=self.installation), \
+                patch.object(self.installation, 'apply', return_value={}) as apply, \
+                redirect_stdout(io.StringIO()):
+            privileged_main()
+        lookup.assert_called_once_with(self.settings['uid'])
+        apply.assert_called_once_with('install', self.settings)
+
+    def test_lock_sets_and_verifies_installer_group(self):
+        self.installation.directory.mkdir(parents=True)
+        self.installation.directory.chmod(0o700)
+        inode = self.installation.directory.stat().st_ino
+        group = [os.getegid()]
+        requested = group[0] + 1
+        real_stat = os.fstat
+        def metadata(fd):
+            result = real_stat(fd)
+            if result.st_ino == inode:
+                fields = list(result)
+                fields[5] = group[0]
+                return os.stat_result(fields)
+            return result
+        def chown(fd, uid, gid):
+            self.assertEqual(real_stat(fd).st_ino, inode)
+            self.assertEqual(uid, -1)
+            group[0] = gid
+        with patch('devrelay.ui_service.os.fstat', side_effect=metadata), \
+                patch('devrelay.ui_service.os.fchown', side_effect=chown) as change:
+            for _ in range(2):
+                with self.installation.lock(gid=requested):
+                    self.assertEqual(group[0], requested)
+                    self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+            change.assert_called_once()
+
+    def test_group_member_status_is_healthy_without_sudo(self):
+        self.install()
+        owner_uid = self.installation.directory.stat().st_uid
+        gid = self.installation.directory.stat().st_gid
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        for primary in (True, False):
+            with self.subTest(primary=primary), \
+                    patch('devrelay.ui_service.os.geteuid', return_value=owner_uid + 1), \
+                    patch('devrelay.ui_service.os.getegid', return_value=gid if primary else -1), \
+                    patch('devrelay.ui_service.os.getgroups', return_value=[] if primary else [gid]), \
+                    patch('devrelay.ui_service.health', return_value=True), \
+                    patch('devrelay.ui_service.subprocess.run') as run:
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(main(['ui', 'status']), 0)
+                self.assertTrue(json.loads(output.getvalue())['healthy'])
+                run.assert_not_called()
+
+    def test_legacy_private_directory_can_upgrade_with_existing_record(self):
+        self.install()
+        self.installation.directory.chmod(0o700)
+        installation_id = self.installation.read()['settings']['installation_id']
+        self.assertTrue(self.install()['healthy'])
+        self.assertEqual(self.installation.directory.stat().st_mode & 0o777, 0o750)
+        self.assertEqual(self.installation.read()['settings']['installation_id'], installation_id)
+
+    def test_inspect_rejects_installation_directory_symlink(self):
+        self.install()
+        target = self.installation.directory.with_name('original')
+        self.installation.directory.rename(target)
+        self.installation.directory.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(RelayError, 'directory is a symlink'):
+            self.installation.inspect()
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        with redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(main(['ui', 'status']), 1)
+        self.assertIn('directory is a symlink', error.getvalue())
+        self.assertTrue((target / 'dashboard.json').exists())
+
+    def test_inspection_permission_error_is_not_absence(self):
+        self.install()
+        self.patch('devrelay.ui_service.Installation', return_value=self.installation)
+        with patch.object(self.installation, 'read', side_effect=PermissionError('denied')):
+            self.assertFalse(manage('status')['readable'])
+            with self.assertRaisesRegex(RelayError, 'unreadable'):
+                manage('uninstall', dry_run=True)
+
+    def test_unsafe_parent_is_refused(self):
+        parent = self.installation.directory.parent
+        parent.mkdir(exist_ok=True)
+        parent.chmod(0o777)
+        with self.assertRaisesRegex(RelayError, 'Unsafe dashboard parent'):
+            self.install()
+        parent.chmod(0o700)
+        target = parent.with_name('safe-parent')
+        parent.rename(target)
+        parent.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(RelayError, 'symlink'):
+            self.install()
+        self.start.assert_not_called()
+
     def test_hosts_without_final_newline_round_trip(self):
         self.installation.hosts.write_bytes(b'127.0.0.1 localhost')
         self.install()
@@ -85,6 +309,36 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(self.installation.state.exists())
         self.start.assert_not_called()
         self.stop.assert_not_called()
+
+    def test_macos_reinstall_lets_launchd_rebind_the_same_port(self):
+        self.install()
+        self.running.return_value = True
+        self.start.reset_mock()
+        self.wait.reset_mock()
+        self.settings['python'] = '/home/owner/new tool/bin/python'
+        with patch('devrelay.ui_service.socket.socket') as probe:
+            probe.return_value.__enter__.return_value.bind.side_effect = OSError(errno.EADDRINUSE, 'TIME_WAIT')
+            self.assertTrue(self.install()['healthy'])
+        probe.assert_not_called()
+        self.stop.assert_called_once_with()
+        self.start.assert_called_once_with()
+        self.wait.assert_called_once()
+        self.assertEqual(self.installation.read()['settings'], self.settings)
+
+    def test_macos_reinstall_rejects_a_different_busy_port(self):
+        self.install()
+        self.running.return_value = True
+        self.start.reset_mock()
+        original = self.installation.read()
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            self.settings['port'] = listener.getsockname()[1]
+            with self.assertRaisesRegex(RelayError, 'unavailable'):
+                self.install()
+        self.assertEqual(self.installation.read(), original)
+        self.stop.assert_called_once_with()
+        self.start.assert_called_once_with()
 
     def test_failed_start_restores_fresh_install_and_prior_install(self):
         self.wait.side_effect = RelayError('health failure')
@@ -139,6 +393,52 @@ class ServiceTests(unittest.TestCase):
         self.install()
         with self.assertRaisesRegex(RelayError, 'another user'):
             self.installation.apply('install', {**self.settings, 'uid': 502})
+
+    def test_rejected_second_user_preserves_directory_metadata(self):
+        self.install()
+        real_fstat = os.fstat
+
+        def root_owned(fd):
+            fields = list(real_fstat(fd))
+            fields[4] = 0
+            return os.stat_result(fields)
+
+        for mode in (0o700, 0o750):
+            for action in ('install', 'uninstall'):
+                with self.subTest(mode=oct(mode), action=action):
+                    self.installation.directory.chmod(mode)
+                    before = self.installation.directory.stat()
+                    record = self.installation.state.read_bytes()
+                    lock = (self.installation.directory / 'install.lock').stat()
+                    with patch('devrelay.ui_service.os.geteuid', return_value=0), \
+                            patch('devrelay.ui_service.os.fstat', side_effect=root_owned), \
+                            patch('devrelay.ui_service.os.fchown') as chown, \
+                            patch('devrelay.ui_service.os.fchmod') as chmod:
+                        with self.assertRaisesRegex(RelayError, 'another user'):
+                            self.installation.apply(action, {**self.settings, 'uid': 502,
+                                                            'gid': before.st_gid + 1})
+                        chown.assert_not_called()
+                        chmod.assert_not_called()
+                    self.assertEqual(self.installation.directory.stat(), before)
+                    self.assertEqual(self.installation.directory.stat().st_ctime_ns, before.st_ctime_ns)
+                    self.assertEqual((self.installation.directory / 'install.lock').stat(), lock)
+                    self.assertEqual(self.installation.state.read_bytes(), record)
+
+    def test_systemd_working_directory_is_a_literal_absolute_path(self):
+        linux = Installation('linux', self.root)
+        for home, expected in (
+                ('/home/owner', '/home/owner'),
+                ('/home/space $HOME %h "name"', '/home/space $HOME %%h "name"'),
+                ('/home/back\\slash', '/home/back\\slash'),
+                ('/home/trailing\\', '/home/trailing\\/'),
+                ('/home/trailing ', '/home/trailing /')):
+            with self.subTest(home=home):
+                service = linux.definitions({**self.settings, 'home': home})[1]
+                line = next(line for line in service.splitlines() if line.startswith('WorkingDirectory='))
+                self.assertEqual(line, 'WorkingDirectory=' + expected)
+        for home in ('relative/home', '~/owner', '/home/owner\nUser=0', '/home/\x00owner', '/home/\x7fowner'):
+            with self.subTest(home=home), self.assertRaises(RelayError):
+                linux.definitions({**self.settings, 'home': home})
 
     def test_hosts_conflicts_and_symlinks_are_preserved(self):
         for source in ('127.0.0.1 devrelay\n', '10.0.0.2 DEVRELAY.\n', BLOCK.replace('127.0.0.1', '10.0.0.2')):

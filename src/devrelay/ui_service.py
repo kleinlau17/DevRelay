@@ -13,6 +13,7 @@ import plistlib
 import pwd
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -84,6 +85,17 @@ def unit_quote(value, *, expand_environment=False):
     return '"' + (value.replace("$", "$$") if expand_environment else value) + '"'
 
 
+def unit_path(value):
+    # WorkingDirectory resolves specifiers but does not unquote/unescape words.
+    if not value.startswith("/") or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise RelayError("Service working directory must be an absolute path without control characters")
+    # Keep trailing whitespace from being stripped, or a backslash from joining
+    # the next line. A trailing slash preserves directory lookup semantics.
+    if value.endswith((" ", "\\")):
+        value += "/"
+    return value.replace("%", "%%")
+
+
 def health(settings):
     connection = http.client.HTTPConnection("127.0.0.1", settings["port"], timeout=1)
     try:
@@ -113,6 +125,7 @@ class Installation:
         self.platform = platform or sys.platform
         if self.platform not in ("darwin", "linux"):
             raise RelayError("Dashboard installation supports macOS and Linux with systemd. " + FALLBACK)
+        root = root.resolve()
         self.root = root
         self.directory = root / ("Library/Application Support/DevRelay" if self.platform == "darwin" else "var/lib/devrelay")
         self.state = self.directory / "dashboard.json"
@@ -124,9 +137,11 @@ class Installation:
         if self.state.is_symlink():
             raise RelayError("Installation record is a symlink; preserved")
         try:
-            if not self.state.exists():
+            try:
+                content = self.state.read_text()
+            except FileNotFoundError:
                 return None
-            saved = json.loads(self.state.read_text())
+            saved = json.loads(content)
             if (saved["phase"] not in ("ready", "installing", "removing")
                     or len(saved["files"]) != len(self.services)
                     or not all(isinstance(item, str) for item in saved["files"])
@@ -141,18 +156,156 @@ class Installation:
         except (ValueError, KeyError, TypeError) as error:
             raise RelayError("Invalid dashboard installation record; preserved") from error
 
-    @contextmanager
-    def lock(self):
-        self.directory.mkdir(parents=True, exist_ok=True)
-        if self.directory.is_symlink() or self.directory.stat().st_uid != os.geteuid() or self.directory.stat().st_mode & 0o022:
-            raise RelayError("Dashboard system directory must be owned by the installer and not writable by other users")
-        fd = os.open(self.directory / "install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "a") as stream:
+    def inspect(self):
+        """Distinguish absence from a directory or record we cannot read."""
+        metadata = None
+        try:
+            metadata = self.directory.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RelayError("Installation directory is a symlink; preserved")
+            # Also deterministic for privileged callers inspecting missing mode bits.
+            groups = {*os.getgroups(), os.getegid()}
+            required = (0o500 if metadata.st_uid == os.geteuid() else
+                        0o050 if metadata.st_gid in groups else 0o005)
+            if metadata.st_mode & required != required:
+                raise PermissionError("Installation directory is inaccessible")
             try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise RelayError("Another dashboard installation is in progress") from error
-            yield
+                record = self.state.lstat()
+            except FileNotFoundError:
+                return None, None
+            if not record.st_mode & 0o444:
+                raise PermissionError("Installation record is unreadable")
+            return self.read(), None
+        except FileNotFoundError:
+            return None, None
+        except OSError as error:
+            owner = metadata.st_uid if metadata else None
+            return None, {"installed": True, "readable": False, "healthy": False,
+                          "owner_uid": owner,
+                          "message": f"Dashboard installation is unreadable (directory owner uid {owner}); "
+                          "it may be installed by another user. Ask the administrator to run "
+                          "sudo devrelay ui status; ask the installing user to run devrelay ui uninstall. "
+                          f"Details: {error}"}
+
+    def untrusted_record_error(self):
+        stop = (f"sudo launchctl bootout system/{LABEL}" if self.platform == "darwin" else
+                f"sudo systemctl disable --now {UNIT}.socket {UNIT}.service")
+        return RelayError(
+            f"Untrusted dashboard record: {self.state}; directory required permission tightening. "
+            "Record preserved; automatic install/uninstall and recovery refused. "
+            f"Administrator recovery: stop the service with `{stop}` (if loaded); "
+            "independently inspect and remove only confirmed DevRelay service files: "
+            + ", ".join(str(path) for path in self.services)
+            + f"; remove only the exact DevRelay dashboard block from {self.hosts}; "
+            f"move {self.state} to an administrator-only quarantine outside {self.directory} "
+            "without executing or restoring its contents; then run devrelay ui uninstall "
+            "to re-initialise the empty directory. Do not merely chmod the directory and retry.")
+
+    @contextmanager
+    def lock(self, *, gid=None, uid=None):
+        # Walk from the filesystem root with pinned descriptors. Trusted owners
+        # (root and the installer) can still rename their own directories; they
+        # are inside this trust boundary. Sticky shared parents are safe here.
+        # The privileged entry point validates settings against SUDO_UID's
+        # passwd account (including its primary gid), rather than trusting a
+        # payload or SUDO_GID alone. Root retains write ownership; 0750 grants
+        # that installer's group read/traverse only, so status needs no sudo.
+        gid = os.getegid() if gid is None else gid
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open("/", flags)
+        parent_fd = None
+        try:
+            for index, component in enumerate(self.directory.parts[1:], 1):
+                parent = os.fstat(fd)
+                if (parent.st_uid not in (0, os.geteuid())
+                        or parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX):
+                    raise RelayError("Unsafe dashboard parent directory: untrusted owner or writable without sticky bit")
+                created = False
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                    created = True
+                except FileExistsError:
+                    pass
+                # A newly created mode 000 directory needs owner permissions
+                # before O_RDONLY can open it. Its verified parent prevents swaps
+                # by untrusted users; chmod never follows a symlink.
+                if created:
+                    os.chmod(component, 0o700 if index == len(self.directory.parts) - 1 else 0o755,
+                             dir_fd=fd, follow_symlinks=False)
+                try:
+                    child = os.open(component, flags, dir_fd=fd)
+                except OSError as error:
+                    raise RelayError(f"Cannot safely open dashboard directory (symlink or inaccessible): {component}") from error
+                if index == len(self.directory.parts) - 1:
+                    parent_fd = os.dup(fd)
+                os.close(fd)
+                fd = child
+            metadata = os.fstat(fd)
+            if metadata.st_uid != os.geteuid():
+                raise RelayError("Dashboard system directory must be owned by the installer")
+            # Keep the marker in the verified parent: users who could write
+            # the loose installation directory must not be able to unlink it.
+            marker = f".{self.directory.name}.directory-untrusted"
+            try:
+                os.stat(marker, dir_fd=parent_fd, follow_symlinks=False)
+                marked = True
+            except FileNotFoundError:
+                marked = False
+            # Both legacy 0700 and our read-only-group 0750 protect records
+            # from planting. Accept 0750 on repeat installs without treating
+            # its existing record as untrusted; all other modes fail closed.
+            tightening = stat.S_IMODE(metadata.st_mode) not in (0o700, 0o750)
+            if tightening or marked:
+                try:
+                    os.stat("dashboard.json", dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    # Refuse BEFORE chmod: retries must not turn a planted record
+                    # into a trusted record just because we tightened its directory.
+                    raise self.untrusted_record_error()
+            # Only read a record after the trust checks above. Reject another
+            # installer before chown/chmod or even creating/chmodding the lock.
+            if uid is not None:
+                saved = self.read()
+                if saved and saved["settings"]["uid"] != uid:
+                    raise RelayError("The machine dashboard belongs to another user; ask that user to uninstall it first")
+            if tightening and not marked:
+                marker_fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+                os.close(marker_fd)
+                os.fsync(parent_fd)
+            # Set group before the final mode, independently of the caller umask.
+            if metadata.st_gid != gid:
+                os.fchown(fd, -1, gid)
+            os.fchmod(fd, 0o750)
+            metadata = os.fstat(fd)
+            if (metadata.st_uid != os.geteuid() or metadata.st_gid != gid
+                    or stat.S_IMODE(metadata.st_mode) != 0o750):
+                raise RelayError("Cannot secure dashboard system directory")
+            if tightening or marked:
+                # Catch records planted between the first check and fchmod.
+                # The durable marker keeps a crash/retry fail-closed as well.
+                try:
+                    os.stat("dashboard.json", dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.unlink(marker, dir_fd=parent_fd)
+                else:
+                    raise self.untrusted_record_error()
+            lock_fd = os.open("install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
+            with os.fdopen(lock_fd, "a") as stream:
+                lock_metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(lock_metadata.st_mode) or lock_metadata.st_uid != os.geteuid() or lock_metadata.st_nlink != 1:
+                    raise RelayError("Unsafe dashboard installation lock; preserved")
+                os.fchmod(stream.fileno(), 0o600)
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise RelayError("Another dashboard installation is in progress") from error
+                yield
+        finally:
+            os.close(fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     def definitions(self, settings):
         manager = "launchd" if self.platform == "darwin" else "systemd"
@@ -170,7 +323,7 @@ class Installation:
                        f"ListenStream=127.0.0.1:{settings['port']}\n\n[Install]\nWantedBy=sockets.target\n")
         service = (f"[Unit]\nDescription=DevRelay local dashboard\nRequires={UNIT}.socket\nAfter={UNIT}.socket\n\n"
                    f"[Service]\nUser={settings['uid']}\nGroup={settings['gid']}\n"
-                   f"WorkingDirectory={unit_quote(settings['home'])}\n"
+                   f"WorkingDirectory={unit_path(settings['home'])}\n"
                    + "".join(f"Environment={unit_quote(key + '=' + value)}\n" for key, value in environment.items())
                    + "ExecStart=" + " ".join(unit_quote(arg, expand_environment=True) for arg in argv)
                    + "\nRestart=on-failure\nNoNewPrivileges=yes\nUMask=0077\n")
@@ -214,7 +367,7 @@ class Installation:
                      expected=self.state.read_bytes() if self.state.exists() else None)
 
     def apply(self, action, settings):
-        with self.lock():
+        with self.lock(gid=settings["gid"] if os.geteuid() == 0 else os.getegid(), uid=settings["uid"]):
             saved = self.read()
             if saved and saved["settings"]["uid"] != settings["uid"]:
                 raise RelayError("The machine dashboard belongs to another user; ask that user to uninstall it first")
@@ -239,15 +392,20 @@ class Installation:
             new = {"settings": settings, "files": self.definitions(settings), "phase": "installing",
                    "hosts_prefix": saved.get("hosts_prefix", False) if saved else bool(source and not source.endswith(b"\n"))}
             was_running = self.running() if saved else False
+            reuse_launchd_port = (self.platform == "darwin" and was_running
+                                  and saved["settings"]["port"] == settings["port"])
             if saved:
                 self.stop()
             try:
-                with socket.socket() as probe:
-                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    try:
-                        probe.bind(("127.0.0.1", settings["port"]))
-                    except OSError as error:
-                        raise RelayError(f"Port {settings['port']} is unavailable; no other service was stopped. {FALLBACK}") from error
+                # After bootout, old TCP connections can still be in TIME_WAIT.
+                # launchd can rebind its socket even when this bind probe fails.
+                if not reuse_launchd_port:
+                    with socket.socket() as probe:
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        try:
+                            probe.bind(("127.0.0.1", settings["port"]))
+                        except OSError as error:
+                            raise RelayError(f"Port {settings['port']} is unavailable; no other service was stopped. {FALLBACK}") from error
                 # Persist recovery information before the first configuration mutation.
                 new["previous"] = saved
                 new["hosts_before"] = source.decode()
@@ -325,7 +483,9 @@ def url(settings):
 def manage(action, *, catalog=None, port=None, dry_run=False, open_browser=False):
     installation = Installation()
     if action == "status":
-        saved = installation.read()
+        saved, inaccessible = installation.inspect()
+        if inaccessible:
+            return inaccessible
         return ({"installed": True, "phase": saved["phase"], "url": url(saved["settings"]),
                  "user": saved["settings"]["user"], "healthy": saved["phase"] == "ready" and health(saved["settings"])}
                 if saved else {"installed": False})
@@ -340,7 +500,9 @@ def manage(action, *, catalog=None, port=None, dry_run=False, open_browser=False
     if not 1 <= settings["port"] <= 65535:
         raise RelayError("Installed dashboard port must be between 1 and 65535")
     if dry_run:
-        saved = installation.read() if action == "uninstall" else None
+        saved, inaccessible = installation.inspect() if action == "uninstall" else (None, None)
+        if inaccessible:
+            raise RelayError(inaccessible["message"])
         if saved:
             settings = saved["settings"]
         return {"action": action, "url": url(settings), "user": account.pw_name, "requires_admin": True,
