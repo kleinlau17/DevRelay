@@ -392,15 +392,20 @@ class Installation:
             new = {"settings": settings, "files": self.definitions(settings), "phase": "installing",
                    "hosts_prefix": saved.get("hosts_prefix", False) if saved else bool(source and not source.endswith(b"\n"))}
             was_running = self.running() if saved else False
+            reuse_launchd_port = (self.platform == "darwin" and was_running
+                                  and saved["settings"]["port"] == settings["port"])
             if saved:
                 self.stop()
             try:
-                with socket.socket() as probe:
-                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    try:
-                        probe.bind(("127.0.0.1", settings["port"]))
-                    except OSError as error:
-                        raise RelayError(f"Port {settings['port']} is unavailable; no other service was stopped. {FALLBACK}") from error
+                # After bootout, old TCP connections can still be in TIME_WAIT.
+                # launchd can rebind its socket even when this bind probe fails.
+                if not reuse_launchd_port:
+                    with socket.socket() as probe:
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        try:
+                            probe.bind(("127.0.0.1", settings["port"]))
+                        except OSError as error:
+                            raise RelayError(f"Port {settings['port']} is unavailable; no other service was stopped. {FALLBACK}") from error
                 # Persist recovery information before the first configuration mutation.
                 new["previous"] = saved
                 new["hosts_before"] = source.decode()

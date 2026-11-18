@@ -105,7 +105,8 @@ devrelay ui install --dry-run    # 只预览系统设置，不修改电脑
 
 端口被占用时安装会失败并保留其他服务，可用 `devrelay ui install --port 8765 --open`
 安装为 `http://devrelay:8765`，或用下方临时网页命令。已有的同名 hosts 记录或被手动修改的
-服务文件会阻止覆盖。重复安装会更新并重启自己的服务；失败会尝试恢复此前设置，
+服务文件会阻止覆盖。重复安装会更新并重启自己的服务。macOS 在原端口重装时，由 launchd 重新绑定端口并由 DevRelay 验证重启后的服务。
+失败会尝试恢复此前设置，
 中断后可运行 `devrelay ui uninstall` 恢复并清理，再重新安装。
 
 ```bash

@@ -107,7 +107,8 @@ local authentication for that user.
 If the port is occupied, installation fails without stopping the other service. Use
 `devrelay ui install --port 8765 --open` for `http://devrelay:8765`, or the temporary server below.
 Unmanaged hosts entries and manually edited service files block replacement. Reinstallation updates
-and restarts only this service. Failed setup attempts restore previous settings; after an interruption,
+and restarts only this service. On macOS, launchd rebinds the same port during reinstallation and DevRelay
+checks the restarted service. Failed setup attempts restore previous settings; after an interruption,
 run `devrelay ui uninstall` to recover and clean up before reinstalling.
 
 ```bash

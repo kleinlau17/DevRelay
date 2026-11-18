@@ -1,3 +1,4 @@
+import errno
 import http.client
 import io
 import json
@@ -308,6 +309,36 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(self.installation.state.exists())
         self.start.assert_not_called()
         self.stop.assert_not_called()
+
+    def test_macos_reinstall_lets_launchd_rebind_the_same_port(self):
+        self.install()
+        self.running.return_value = True
+        self.start.reset_mock()
+        self.wait.reset_mock()
+        self.settings['python'] = '/home/owner/new tool/bin/python'
+        with patch('devrelay.ui_service.socket.socket') as probe:
+            probe.return_value.__enter__.return_value.bind.side_effect = OSError(errno.EADDRINUSE, 'TIME_WAIT')
+            self.assertTrue(self.install()['healthy'])
+        probe.assert_not_called()
+        self.stop.assert_called_once_with()
+        self.start.assert_called_once_with()
+        self.wait.assert_called_once()
+        self.assertEqual(self.installation.read()['settings'], self.settings)
+
+    def test_macos_reinstall_rejects_a_different_busy_port(self):
+        self.install()
+        self.running.return_value = True
+        self.start.reset_mock()
+        original = self.installation.read()
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            self.settings['port'] = listener.getsockname()[1]
+            with self.assertRaisesRegex(RelayError, 'unavailable'):
+                self.install()
+        self.assertEqual(self.installation.read(), original)
+        self.stop.assert_called_once_with()
+        self.start.assert_called_once_with()
 
     def test_failed_start_restores_fresh_install_and_prior_install(self):
         self.wait.side_effect = RelayError('health failure')
